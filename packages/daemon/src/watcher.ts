@@ -4,6 +4,7 @@ import chokidar, { type FSWatcher } from "chokidar";
 import { claudeProjectsDir, parseSessionJsonl } from "@sojourn/adapter-claude";
 import type { IngestDeps } from "./ingest.js";
 import { ingestBatch } from "./ingest.js";
+import { runSerialized } from "./serialize.js";
 
 const DEBOUNCE_MS = 300;
 
@@ -34,7 +35,13 @@ export function startWatcher(deps: IngestDeps, dir: string = claudeProjectsDir()
       const raw = await fs.readFile(filePath, "utf8");
       const batch = parseSessionJsonl(filePath, raw);
       if (batch === null) return;
-      await ingestBatch(deps, batch);
+      // Route every ingestBatch call through the per-project serializer:
+      // the debounce above only dedupes the TIMER per file, not an
+      // in-flight scan, so without this a debounced watcher scan could
+      // overlap a hook-triggered rescan (wire.ts) for the same project and
+      // race on that project's single ShadowSnapshotter.
+      const key = path.resolve(batch.project.root);
+      await runSerialized(key, () => ingestBatch(deps, batch));
     } catch (err) {
       console.error(`[sojourn] watcher: failed to scan ${filePath}:`, err);
     }

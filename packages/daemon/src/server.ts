@@ -1,7 +1,7 @@
 import path from "node:path";
 import fs from "node:fs";
 import { createRequire } from "node:module";
-import express, { type Express, type Request, type Response } from "express";
+import express, { type Express, type NextFunction, type Request, type Response } from "express";
 import type {
   ChronoNode,
   FlagEngine,
@@ -370,6 +370,16 @@ export function createApp(deps: ServerDeps): Express {
   const webDist = resolveWebDist();
   if (webDist) {
     app.use(express.static(webDist));
+  }
+
+  // JSON 404 for any unmatched /api/* route — must come before the SPA
+  // fallback below so unknown API routes never fall through to index.html
+  // (and never hit Express's default HTML 404 page).
+  app.use("/api", (_req: Request, res: Response) => {
+    res.status(404).json({ error: `Not found: ${_req.originalUrl}` });
+  });
+
+  if (webDist) {
     app.get("*", (req: Request, res: Response, next) => {
       if (req.path.startsWith("/api/") || req.path === "/ws") {
         next();
@@ -378,6 +388,25 @@ export function createApp(deps: ServerDeps): Express {
       res.sendFile(path.join(webDist, "index.html"));
     });
   }
+
+  // Final error-handling middleware (4-arg signature is what makes Express
+  // treat this as an error handler rather than a normal middleware).
+  // Catches body-parser SyntaxError (malformed JSON) as well as any
+  // uncaught throw from a route handler — capture must never leak an HTML
+  // error page; every API error is JSON `{ error: string }`.
+  app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+    const status =
+      err && typeof err === "object" && "status" in err && typeof err.status === "number"
+        ? err.status
+        : err && typeof err === "object" && "statusCode" in err && typeof err.statusCode === "number"
+          ? err.statusCode
+          : 500;
+    const message = err instanceof Error ? err.message : "Internal error";
+    if (status >= 500) {
+      console.error("[sojourn] unhandled error in request pipeline:", err);
+    }
+    res.status(status).json({ error: message });
+  });
 
   return app;
 }
@@ -402,12 +431,28 @@ function findParentSnapshotRef(
 function handleRestoreError(err: unknown, nodeId: string, res: Response): void {
   if (err instanceof SojournRestoreError) {
     const message = err.message;
-    if (message.includes("not found")) {
-      res.status(404).json({ error: message });
-      return;
+    switch (err.code) {
+      case "not_found":
+        res.status(404).json({ error: message });
+        return;
+      case "invalid_tree":
+        res.status(400).json({ error: message });
+        return;
+      case "dest_exhausted":
+        console.error(`[sojourn] restore-related route failed for node ${nodeId}:`, err);
+        res.status(500).json({ error: message });
+        return;
+      default:
+        // Fallback for safety in case a future SojournRestoreError is
+        // constructed without going through the typed `code` sites above
+        // (or an older/mismatched core build is linked).
+        if (message.includes("not found")) {
+          res.status(404).json({ error: message });
+          return;
+        }
+        res.status(400).json({ error: message });
+        return;
     }
-    res.status(400).json({ error: message });
-    return;
   }
   console.error(`[sojourn] restore-related route failed for node ${nodeId}:`, err);
   res.status(500).json({ error: "Internal error" });

@@ -10,6 +10,7 @@ import {
   ShadowSnapshotter,
   FlagEngine,
   RestoreEngine,
+  SojournRestoreError,
 } from "@sojourn/core";
 import type { ChronoNode, FetchJson, IngestBatch, Project, SnapshotterLike } from "@sojourn/core";
 import { parseSessionJsonl } from "@sojourn/adapter-claude";
@@ -480,6 +481,37 @@ describe("daemon HTTP API", () => {
         .send();
       expect(res.status).toBe(404);
     });
+
+    it("maps a SojournRestoreError with code 'dest_exhausted' to a 500 JSON error", async () => {
+      const failingRestoreEngine = {
+        preflight: vi.fn(),
+        async restore() {
+          throw new SojournRestoreError(
+            "Could not claim a unique worktree directory after 5 attempts.",
+            "dest_exhausted",
+          );
+        },
+      } as unknown as RestoreEngine;
+
+      const deps: ServerDeps = {
+        store,
+        snapshotterFor,
+        flagEngine,
+        restoreEngine: failingRestoreEngine,
+        events: sink,
+        version: "test-version",
+        fetchJson,
+      };
+      const failingApp = createApp(deps);
+
+      const res = await request(failingApp)
+        .post(`/api/nodes/${encodeURIComponent("claude:whatever")}/restore`)
+        .send();
+
+      expect(res.status).toBe(500);
+      expect(typeof res.body.error).toBe("string");
+      expect(res.headers["content-type"]).toMatch(/json/);
+    });
   });
 
   describe("POST /api/hooks/claude", () => {
@@ -520,6 +552,58 @@ describe("daemon HTTP API", () => {
       const res = await request(app).post("/api/hooks/opencode").send({ sessionId: "abc" });
       expect(res.status).toBe(200);
       expect(res.body).toEqual({ ok: true });
+    });
+  });
+
+  describe("error handling (no HTML leakage)", () => {
+    it("returns 400 JSON (not Express's HTML error page) for a malformed JSON body", async () => {
+      const res = await request(app)
+        .post("/api/mark")
+        .set("Content-Type", "application/json")
+        .send("{not valid json");
+
+      expect(res.status).toBe(400);
+      expect(res.headers["content-type"]).toMatch(/json/);
+      expect(typeof res.body.error).toBe("string");
+      expect(res.body.error.length).toBeGreaterThan(0);
+      // Must not be Express's default HTML error page.
+      expect(res.text).not.toMatch(/<html/i);
+    });
+
+    it("returns 404 JSON for an unknown /api/* route", async () => {
+      const res = await request(app).get("/api/this-route-does-not-exist");
+      expect(res.status).toBe(404);
+      expect(res.headers["content-type"]).toMatch(/json/);
+      expect(typeof res.body.error).toBe("string");
+      expect(res.text).not.toMatch(/<html/i);
+    });
+
+    it("returns 500 JSON (not an HTML page) when a synchronous route handler throws (e.g. /api/mark's unguarded store calls)", async () => {
+      const throwingStore = {
+        ...store,
+        latestNode: () => {
+          throw new Error("store exploded");
+        },
+      };
+      const deps: ServerDeps = {
+        store: throwingStore as unknown as typeof store,
+        snapshotterFor,
+        flagEngine,
+        restoreEngine,
+        events: sink,
+        version: "test-version",
+        fetchJson,
+      };
+      const throwingApp = createApp(deps);
+
+      const res = await request(throwingApp)
+        .post("/api/mark")
+        .send({ sessionId: "s1", label: "x", kind: "decision" });
+
+      expect(res.status).toBe(500);
+      expect(res.headers["content-type"]).toMatch(/json/);
+      expect(typeof res.body.error).toBe("string");
+      expect(res.text).not.toMatch(/<html/i);
     });
   });
 });

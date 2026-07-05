@@ -175,6 +175,12 @@ describe("RestoreEngine", () => {
         SojournRestoreError,
       );
     });
+
+    it("throws SojournRestoreError with code 'not_found' for an unknown nodeId", async () => {
+      await expect(engine.preflight("claude:does-not-exist")).rejects.toMatchObject({
+        code: "not_found",
+      });
+    });
   });
 
   describe("restore", () => {
@@ -238,6 +244,13 @@ describe("RestoreEngine", () => {
       expect(entries).toHaveLength(0);
     });
 
+    it("throws with code 'invalid_tree' when the tree is invalid/missing", async () => {
+      const node = makeNode({ projectId: project.id, snapshotRef: null });
+      store.upsertNode(node);
+
+      await expect(engine.restore(node.id)).rejects.toMatchObject({ code: "invalid_tree" });
+    });
+
     it("throws and creates NO worktree dir when the snapshotRef points to a bogus tree", async () => {
       const node = makeNode({
         projectId: project.id,
@@ -248,6 +261,53 @@ describe("RestoreEngine", () => {
       await expect(engine.restore(node.id)).rejects.toThrow(SojournRestoreError);
       const entries = fs.readdirSync(worktreesDir);
       expect(entries).toHaveLength(0);
+    });
+
+    it("throws with code 'invalid_tree' when the snapshotRef points to a bogus tree", async () => {
+      const node = makeNode({
+        projectId: project.id,
+        snapshotRef: "deadbeef".repeat(5),
+      });
+      store.upsertNode(node);
+
+      await expect(engine.restore(node.id)).rejects.toMatchObject({ code: "invalid_tree" });
+    });
+
+    it("throws with code 'not_found' when the node itself does not exist", async () => {
+      await expect(engine.restore("claude:does-not-exist")).rejects.toMatchObject({
+        code: "not_found",
+      });
+    });
+
+    it("throws with code 'dest_exhausted' when a unique worktree dest cannot be claimed", async () => {
+      await fsp.writeFile(path.join(projectRoot, "a.txt"), "v1");
+      const nodeTree = await snapshotter.snapshot();
+
+      const fixedNow = new Date(2026, 0, 25, 8, 0, 0);
+      const fixedEngine = new RestoreEngine({
+        store,
+        snapshotterFor: () => snapshotter,
+        worktreesDir,
+        now: () => fixedNow,
+      });
+
+      const node = makeNode({ projectId: project.id, snapshotRef: nodeTree });
+      store.upsertNode(node);
+
+      const node8 = node.id.replace(/[^a-zA-Z0-9]/g, "").slice(0, 8);
+      const stamp = "20260125080000";
+      const baseDest = path.join(worktreesDir, project.id, `${node8}-${stamp}`);
+      // Pre-create the base dest plus every suffixed candidate the engine
+      // would try, so claimDest exhausts its attempts.
+      fs.mkdirSync(baseDest, { recursive: true });
+      for (let i = 0; i < 0x100; i++) {
+        const suffix = i.toString(16).padStart(2, "0");
+        fs.mkdirSync(`${baseDest}-${suffix}`, { recursive: true });
+      }
+
+      await expect(fixedEngine.restore(node.id)).rejects.toMatchObject({
+        code: "dest_exhausted",
+      });
     });
 
     it("uses the nearest ancestor's snapshotRef when the node has none of its own", async () => {

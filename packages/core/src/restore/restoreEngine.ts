@@ -5,10 +5,19 @@ import type { GraphStore } from "../store/index.js";
 import type { SnapshotterLike } from "../interfaces.js";
 import type { ChronoNode, Project, RestorePreflight, RestoreResult } from "../types.js";
 
+/** Stable machine-readable classification for a `SojournRestoreError`,
+ * set at each throw site. Consumers (e.g. the daemon's HTTP layer) should
+ * switch on this instead of substring-matching `message` — messages may
+ * be reworded without changing behavior. */
+export type SojournRestoreErrorCode = "not_found" | "invalid_tree" | "dest_exhausted";
+
 export class SojournRestoreError extends Error {
-  constructor(message: string) {
+  readonly code: SojournRestoreErrorCode;
+
+  constructor(message: string, code: SojournRestoreErrorCode) {
     super(message);
     this.name = "SojournRestoreError";
+    this.code = code;
   }
 }
 
@@ -84,6 +93,7 @@ async function claimDest(baseDest: string): Promise<string> {
 
   throw new SojournRestoreError(
     `Could not claim a unique worktree directory for ${baseDest} after ${MAX_DEST_CREATE_ATTEMPTS} attempts.`,
+    "dest_exhausted",
   );
 }
 
@@ -129,7 +139,7 @@ export class RestoreEngine {
   private getNodeOrThrow(nodeId: string): ChronoNode {
     const node = this.store.getNode(nodeId);
     if (!node) {
-      throw new SojournRestoreError(`Node not found: ${nodeId}`);
+      throw new SojournRestoreError(`Node not found: ${nodeId}`, "not_found");
     }
     return node;
   }
@@ -137,7 +147,7 @@ export class RestoreEngine {
   private getProjectOrThrow(projectId: string): Project {
     const project = this.store.getProject(projectId);
     if (!project) {
-      throw new SojournRestoreError(`Project not found: ${projectId}`);
+      throw new SojournRestoreError(`Project not found: ${projectId}`, "not_found");
     }
     return project;
   }
@@ -165,6 +175,7 @@ export class RestoreEngine {
     if (!preflight.treeValid || preflight.treeHash === null) {
       throw new SojournRestoreError(
         `Cannot restore node ${nodeId}: tree ${preflight.treeHash ?? "(none)"} is not valid/reachable in the shadow snapshot repo.`,
+        "invalid_tree",
       );
     }
 
