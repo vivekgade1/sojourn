@@ -1,11 +1,12 @@
 import { useState } from "react";
 import { api } from "../api";
-import type { ChronoNode, RestorePreflight, RestoreResult, StoredFlag } from "../types";
+import type { Annotation, ChronoNode, RestorePreflight, RestoreResult, StoredFlag } from "../types";
 import { DiffView } from "./DiffView";
 
 export interface InspectorProps {
   node: ChronoNode | null;
   onFlagDismissed: (nodeId: string, flagId: number) => void;
+  onAnnotationAdded: (nodeId: string, annotation: Annotation) => void;
 }
 
 function FlagRow({
@@ -45,18 +46,89 @@ function FlagRow({
   );
 }
 
+function AnnotationsSection({
+  node,
+  onAnnotationAdded,
+}: {
+  node: ChronoNode;
+  onAnnotationAdded: (nodeId: string, annotation: Annotation) => void;
+}) {
+  const [text, setText] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const annotations = node.annotations ?? [];
+
+  async function handleAdd() {
+    const trimmed = text.trim();
+    if (!trimmed || submitting) return;
+    setSubmitting(true);
+    setError(null);
+    try {
+      const annotation = await api.addAnnotation(node.id, trimmed);
+      onAnnotationAdded(node.id, annotation);
+      setText("");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <div className="inspector-section">
+      <h3>Annotations{annotations.length > 0 ? ` (${annotations.length})` : ""}</h3>
+      {annotations.length === 0 && <div className="inspector-meta">No annotations yet.</div>}
+      {annotations.map((a) => (
+        <div className="annotation-row" key={a.id}>
+          <div className="annotation-text">{a.text}</div>
+          <div className="inspector-meta">{new Date(a.createdAt).toLocaleString()}</div>
+        </div>
+      ))}
+      {error && <div className="flag-evidence">{error}</div>}
+      <div className="annotation-input-row">
+        <input
+          type="text"
+          className="annotation-input"
+          placeholder="Add an annotation…"
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") handleAdd();
+          }}
+        />
+        <button
+          className="primary-btn"
+          onClick={handleAdd}
+          disabled={submitting || text.trim().length === 0}
+        >
+          {submitting ? "Adding…" : "Add"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function RestoreFlow({ node }: { node: ChronoNode }) {
   const [preflight, setPreflight] = useState<RestorePreflight | null>(null);
+  // The node id captured at the moment preflight was requested. This is the
+  // ONLY id ever passed to api.restore — never the (possibly-changed) `node`
+  // prop — so that even if this component instance somehow survived a node
+  // switch, the confirm action can't act on a different node than the one
+  // whose warnings the user actually reviewed.
+  const [preflightNodeId, setPreflightNodeId] = useState<string | null>(null);
   const [result, setResult] = useState<RestoreResult | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   async function startPreflight() {
+    if (busy) return;
     setBusy(true);
     setError(null);
     try {
-      const pf = await api.preflight(node.id);
+      const targetNodeId = node.id;
+      const pf = await api.preflight(targetNodeId);
       setPreflight(pf);
+      setPreflightNodeId(targetNodeId);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -65,12 +137,15 @@ function RestoreFlow({ node }: { node: ChronoNode }) {
   }
 
   async function confirmRestore() {
+    if (busy) return;
+    if (!preflightNodeId) return;
     setBusy(true);
     setError(null);
     try {
-      const res = await api.restore(node.id);
+      const res = await api.restore(preflightNodeId);
       setResult(res);
       setPreflight(null);
+      setPreflightNodeId(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -106,7 +181,13 @@ function RestoreFlow({ node }: { node: ChronoNode }) {
               </>
             )}
             <div className="modal-actions">
-              <button className="modal-cancel" onClick={() => setPreflight(null)}>
+              <button
+                className="modal-cancel"
+                onClick={() => {
+                  setPreflight(null);
+                  setPreflightNodeId(null);
+                }}
+              >
                 Cancel
               </button>
               <button
@@ -144,12 +225,8 @@ function RestoreFlow({ node }: { node: ChronoNode }) {
   );
 }
 
-export function Inspector({ node, onFlagDismissed }: InspectorProps) {
+function InspectorContent({ node, onFlagDismissed, onAnnotationAdded }: InspectorProps & { node: ChronoNode }) {
   const [payloadOpen, setPayloadOpen] = useState(false);
-
-  if (!node) {
-    return <div className="inspector-empty">Select a node to inspect it.</div>;
-  }
 
   const flags = (node.flags ?? []).filter((f) => !f.dismissed);
 
@@ -190,7 +267,28 @@ export function Inspector({ node, onFlagDismissed }: InspectorProps) {
         ))}
       </div>
 
-      <RestoreFlow node={node} />
+      <AnnotationsSection node={node} onAnnotationAdded={onAnnotationAdded} />
+
+      <RestoreFlow key={node.id} node={node} />
     </div>
+  );
+}
+
+export function Inspector({ node, onFlagDismissed, onAnnotationAdded }: InspectorProps) {
+  if (!node) {
+    return <div className="inspector-empty">Select a node to inspect it.</div>;
+  }
+
+  // Key the entire inspector content by node.id: switching the selected node
+  // must fully remount (not update) this subtree, so no state from the
+  // previous node — especially in-flight restore-preflight state — can leak
+  // across a node switch. Restoring the wrong node is a data-integrity bug.
+  return (
+    <InspectorContent
+      key={node.id}
+      node={node}
+      onFlagDismissed={onFlagDismissed}
+      onAnnotationAdded={onAnnotationAdded}
+    />
   );
 }

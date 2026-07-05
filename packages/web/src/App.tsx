@@ -1,9 +1,9 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "./api";
 import { GraphView } from "./components/GraphView";
 import { Inspector } from "./components/Inspector";
 import { Toolbar } from "./components/Toolbar";
-import type { ChronoNode, Project } from "./types";
+import type { Annotation, ChronoNode, Project } from "./types";
 import { connectWs } from "./ws";
 
 const LENS_KINDS = new Set<ChronoNode["kind"]>(["decision", "assumption", "checkpoint"]);
@@ -21,6 +21,14 @@ export function App() {
   const [flaggedOnly, setFlaggedOnly] = useState(false);
   const [wsConnected, setWsConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Kept in sync with selectedProjectId via the effect below so the WS
+  // effect (which must have stable [] deps, see below) can always read the
+  // *current* selection without reconnecting the socket on project switch.
+  const selectedProjectIdRef = useRef(selectedProjectId);
+  useEffect(() => {
+    selectedProjectIdRef.current = selectedProjectId;
+  }, [selectedProjectId]);
 
   useEffect(() => {
     api
@@ -48,8 +56,9 @@ export function App() {
 
   useEffect(() => {
     const unsubscribe = connectWs((event) => {
+      const currentProjectId = selectedProjectIdRef.current;
       if (event.type === "node_added") {
-        if (event.node.projectId !== selectedProjectId) return;
+        if (event.node.projectId !== currentProjectId) return;
         setNodes((prev) => {
           if (prev.some((n) => n.id === event.node.id)) return prev;
           return [...prev, event.node];
@@ -61,9 +70,9 @@ export function App() {
         );
         setWsConnected(true);
       } else if (event.type === "project_updated") {
-        if (event.projectId === selectedProjectId) {
+        if (event.projectId === currentProjectId && currentProjectId) {
           api
-            .getGraph(selectedProjectId)
+            .getGraph(currentProjectId)
             .then((res) => setNodes(res.nodes))
             .catch(() => {});
         }
@@ -71,7 +80,7 @@ export function App() {
       }
     });
     return unsubscribe;
-  }, [selectedProjectId]);
+  }, []);
 
   const visibleNodes = useMemo(() => {
     let filtered = nodes;
@@ -99,6 +108,14 @@ export function App() {
     );
   }
 
+  function handleAnnotationAdded(nodeId: string, annotation: Annotation) {
+    setNodes((prev) =>
+      prev.map((n) =>
+        n.id === nodeId ? { ...n, annotations: [...(n.annotations ?? []), annotation] } : n,
+      ),
+    );
+  }
+
   return (
     <div className="app-shell">
       <Toolbar
@@ -118,7 +135,11 @@ export function App() {
           selectedNodeId={selectedNodeId}
           onSelectNode={setSelectedNodeId}
         />
-        <Inspector node={selectedNode} onFlagDismissed={handleFlagDismissed} />
+        <Inspector
+          node={selectedNode}
+          onFlagDismissed={handleFlagDismissed}
+          onAnnotationAdded={handleAnnotationAdded}
+        />
       </div>
     </div>
   );

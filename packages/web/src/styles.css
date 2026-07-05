@@ -353,6 +353,43 @@ button {
   font-size: 11px;
 }
 
+.primary-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.annotation-row {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px;
+  margin-bottom: 8px;
+}
+
+.annotation-text {
+  color: var(--text);
+  margin-bottom: 4px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.annotation-input-row {
+  display: flex;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.annotation-input {
+  flex: 1;
+  min-width: 0;
+  background: var(--panel-alt);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 4px;
+  padding: 4px 8px;
+  font-size: 11px;
+  font-family: inherit;
+}
+
 .restore-btn {
   width: 100%;
   margin-top: 8px;
