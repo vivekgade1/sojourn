@@ -18,6 +18,8 @@ import {
   isPidAlive,
   killPid,
   pollHealth,
+  isDaemonProcess,
+  type PsCommandFn,
 } from "./daemonCtl.js";
 
 export interface SpawnedProcess {
@@ -46,6 +48,8 @@ export interface ProgramDeps {
   healthTimeoutMs: number;
   /** poll interval for the health check (default 200ms) */
   healthIntervalMs: number;
+  /** ps command lookup used to verify a pid is actually the daemon; injectable for tests */
+  psCommand?: PsCommandFn;
 }
 
 export function defaultDeps(overrides: Partial<ProgramDeps> = {}): ProgramDeps {
@@ -95,6 +99,7 @@ export function defaultDeps(overrides: Partial<ProgramDeps> = {}): ProgramDeps {
     exit: overrides.exit ?? ((code) => process.exit(code)),
     healthTimeoutMs: overrides.healthTimeoutMs ?? 5000,
     healthIntervalMs: overrides.healthIntervalMs ?? 200,
+    psCommand: overrides.psCommand,
   };
 }
 
@@ -109,8 +114,15 @@ export function buildProgram(deps: ProgramDeps): Command {
     .action(async () => {
       const existingPid = readPid(deps.sojournHome);
       if (existingPid !== null && isPidAlive(existingPid)) {
-        deps.stdout(`daemon already running (pid ${existingPid})`);
-        return;
+        const isDaemon = await isDaemonProcess(existingPid, { psCommand: deps.psCommand });
+        if (isDaemon) {
+          deps.stdout(`daemon already running (pid ${existingPid})`);
+          return;
+        }
+        deps.stdout(
+          `pidfile referenced pid ${existingPid}, which is not a sojourn daemon (stale pidfile) — removing and starting fresh`,
+        );
+        removePidfile(deps.sojournHome);
       }
       const entry = resolveDaemonEntry();
       const child = deps.spawnDaemon(entry, { ...process.env });
@@ -138,11 +150,21 @@ export function buildProgram(deps: ProgramDeps): Command {
   program
     .command("stop")
     .description("stop the sojourn daemon")
-    .action(() => {
+    .action(async () => {
       const pid = readPid(deps.sojournHome);
       if (pid === null) {
         deps.stdout("daemon is not running (no pidfile)");
         return;
+      }
+      if (isPidAlive(pid)) {
+        const isDaemon = await isDaemonProcess(pid, { psCommand: deps.psCommand });
+        if (!isDaemon) {
+          removePidfile(deps.sojournHome);
+          deps.stdout(
+            `pidfile referenced pid ${pid}, which is not a sojourn daemon (stale pidfile) — removed, not signaling it`,
+          );
+          return;
+        }
       }
       const sent = killPid(pid, "SIGTERM");
       removePidfile(deps.sojournHome);
@@ -188,132 +210,142 @@ export function buildProgram(deps: ProgramDeps): Command {
   program
     .command("projects")
     .description("list known projects")
-    .action(async () => {
-      const res = await client.get<Project[]>("/api/projects");
-      if (res.status !== 200) {
-        deps.stderr(`error: ${describeError(res.body)}`);
-        deps.exit(1);
-        return;
-      }
-      deps.stdout(formatProjectsTable(res.body));
-    });
+    .action(
+      withDaemonErrorHandling(deps, async () => {
+        const res = await client.get<Project[]>("/api/projects");
+        if (res.status !== 200) {
+          deps.stderr(`error: ${describeError(res.body)}`);
+          deps.exit(1);
+          return;
+        }
+        deps.stdout(formatProjectsTable(res.body));
+      }),
+    );
 
   program
     .command("flags")
     .description("list active flags for a project")
     .option("--project <id>", "project id (default: project for cwd)")
-    .action(async (opts: { project?: string }) => {
-      const projectId = opts.project ?? projectIdFor(deps.cwd);
-      const res = await client.get<{ project: Project; sessions: SessionRow[]; nodes: ChronoNode[] }>(
-        `/api/projects/${encodeNodeId(projectId)}/graph`,
-      );
-      if (res.status !== 200) {
-        deps.stderr(`error: ${describeError(res.body)}`);
-        deps.exit(1);
-        return;
-      }
-      const flags: Array<StoredFlag & { nodeId: string }> = [];
-      for (const node of res.body.nodes) {
-        for (const flag of node.flags ?? []) {
-          if (!flag.dismissed) flags.push({ ...flag, nodeId: node.id });
+    .action(
+      withDaemonErrorHandling(deps, async (opts: { project?: string }) => {
+        const projectId = opts.project ?? projectIdFor(deps.cwd);
+        const res = await client.get<{ project: Project; sessions: SessionRow[]; nodes: ChronoNode[] }>(
+          `/api/projects/${encodeNodeId(projectId)}/graph`,
+        );
+        if (res.status !== 200) {
+          deps.stderr(`error: ${describeError(res.body)}`);
+          deps.exit(1);
+          return;
         }
-      }
-      deps.stdout(formatFlagsTable(flags));
-    });
+        const flags: Array<StoredFlag & { nodeId: string }> = [];
+        for (const node of res.body.nodes) {
+          for (const flag of node.flags ?? []) {
+            if (!flag.dismissed) flags.push({ ...flag, nodeId: node.id });
+          }
+        }
+        deps.stdout(formatFlagsTable(flags));
+      }),
+    );
 
   program
     .command("mark <label>")
     .description("mark the latest node with a label")
     .option("--kind <kind>", "decision|assumption|checkpoint", "decision")
     .option("--session <id>", "session id (default: latest session in cwd's project)")
-    .action(async (label: string, opts: { kind: string; session?: string }) => {
-      const sessionId = opts.session ?? (await resolveLatestSessionId(client, deps));
-      if (!sessionId) {
-        deps.stderr("error: no session found for current project (pass --session)");
-        deps.exit(1);
-        return;
-      }
-      const res = await client.post<ChronoNode>("/api/mark", {
-        sessionId,
-        label,
-        kind: opts.kind,
-      });
-      if (res.status !== 200 && res.status !== 201) {
-        deps.stderr(`error: ${describeError(res.body)}`);
-        deps.exit(1);
-        return;
-      }
-      deps.stdout(`marked ${res.body.id} [${res.body.kind}] "${res.body.label ?? label}"`);
-    });
+    .action(
+      withDaemonErrorHandling(deps, async (label: string, opts: { kind: string; session?: string }) => {
+        const sessionId = opts.session ?? (await resolveLatestSessionId(client, deps));
+        if (!sessionId) {
+          deps.stderr("error: no session found for current project (pass --session)");
+          deps.exit(1);
+          return;
+        }
+        const res = await client.post<ChronoNode>("/api/mark", {
+          sessionId,
+          label,
+          kind: opts.kind,
+        });
+        if (res.status !== 200 && res.status !== 201) {
+          deps.stderr(`error: ${describeError(res.body)}`);
+          deps.exit(1);
+          return;
+        }
+        deps.stdout(`marked ${res.body.id} [${res.body.kind}] "${res.body.label ?? label}"`);
+      }),
+    );
 
   program
     .command("checkpoint <name>")
     .description("shorthand for mark --kind checkpoint")
     .option("--session <id>", "session id (default: latest session in cwd's project)")
-    .action(async (name: string, opts: { session?: string }) => {
-      const sessionId = opts.session ?? (await resolveLatestSessionId(client, deps));
-      if (!sessionId) {
-        deps.stderr("error: no session found for current project (pass --session)");
-        deps.exit(1);
-        return;
-      }
-      const res = await client.post<ChronoNode>("/api/mark", {
-        sessionId,
-        label: name,
-        kind: "checkpoint",
-      });
-      if (res.status !== 200 && res.status !== 201) {
-        deps.stderr(`error: ${describeError(res.body)}`);
-        deps.exit(1);
-        return;
-      }
-      deps.stdout(`marked ${res.body.id} [checkpoint] "${res.body.label ?? name}"`);
-    });
+    .action(
+      withDaemonErrorHandling(deps, async (name: string, opts: { session?: string }) => {
+        const sessionId = opts.session ?? (await resolveLatestSessionId(client, deps));
+        if (!sessionId) {
+          deps.stderr("error: no session found for current project (pass --session)");
+          deps.exit(1);
+          return;
+        }
+        const res = await client.post<ChronoNode>("/api/mark", {
+          sessionId,
+          label: name,
+          kind: "checkpoint",
+        });
+        if (res.status !== 200 && res.status !== 201) {
+          deps.stderr(`error: ${describeError(res.body)}`);
+          deps.exit(1);
+          return;
+        }
+        deps.stdout(`marked ${res.body.id} [checkpoint] "${res.body.label ?? name}"`);
+      }),
+    );
 
   program
     .command("restore <nodeId>")
     .description("restore a node's snapshot into a worktree")
     .option("--yes", "skip preflight confirmation and perform the restore", false)
-    .action(async (nodeId: string, opts: { yes: boolean }) => {
-      const encoded = encodeNodeId(nodeId);
-      if (!opts.yes) {
-        const res = await client.post<RestorePreflight>(`/api/nodes/${encoded}/preflight`);
+    .action(
+      withDaemonErrorHandling(deps, async (nodeId: string, opts: { yes: boolean }) => {
+        const encoded = encodeNodeId(nodeId);
+        if (!opts.yes) {
+          const res = await client.post<RestorePreflight>(`/api/nodes/${encoded}/preflight`);
+          if (res.status !== 200) {
+            deps.stderr(`error: ${describeError(res.body)}`);
+            deps.exit(1);
+            return;
+          }
+          const preflight = res.body;
+          if (preflight.warnings.length > 0) {
+            deps.stdout("Preflight warnings:");
+            for (const warning of preflight.warnings) {
+              deps.stdout(`  - ${warning}`);
+            }
+          } else {
+            deps.stdout("Preflight: no warnings.");
+          }
+          if (preflight.resumeCommand) {
+            deps.stdout(`Resume command: ${preflight.resumeCommand}`);
+          }
+          deps.stdout("Re-run with --yes to confirm the restore.");
+          deps.exit(1);
+          return;
+        }
+        const res = await client.post<RestoreResult>(`/api/nodes/${encoded}/restore`);
         if (res.status !== 200) {
           deps.stderr(`error: ${describeError(res.body)}`);
           deps.exit(1);
           return;
         }
-        const preflight = res.body;
-        if (preflight.warnings.length > 0) {
-          deps.stdout("Preflight warnings:");
-          for (const warning of preflight.warnings) {
-            deps.stdout(`  - ${warning}`);
-          }
-        } else {
-          deps.stdout("Preflight: no warnings.");
+        const result = res.body;
+        deps.stdout(`Worktree: ${result.worktreePath}`);
+        if (result.resumeCommand) {
+          deps.stdout(`Resume command: ${result.resumeCommand}`);
         }
-        if (preflight.resumeCommand) {
-          deps.stdout(`Resume command: ${preflight.resumeCommand}`);
+        for (const warning of result.warnings) {
+          deps.stdout(`Warning: ${warning}`);
         }
-        deps.stdout("Re-run with --yes to confirm the restore.");
-        deps.exit(1);
-        return;
-      }
-      const res = await client.post<RestoreResult>(`/api/nodes/${encoded}/restore`);
-      if (res.status !== 200) {
-        deps.stderr(`error: ${describeError(res.body)}`);
-        deps.exit(1);
-        return;
-      }
-      const result = res.body;
-      deps.stdout(`Worktree: ${result.worktreePath}`);
-      if (result.resumeCommand) {
-        deps.stdout(`Resume command: ${result.resumeCommand}`);
-      }
-      for (const warning of result.warnings) {
-        deps.stdout(`Warning: ${warning}`);
-      }
-    });
+      }),
+    );
 
   return program;
 }
@@ -331,6 +363,43 @@ async function resolveLatestSessionId(
   if (!sessions || sessions.length === 0) return null;
   const latest = [...sessions].sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))[0];
   return latest?.id ?? null;
+}
+
+/** True when `err` looks like a fetch/network failure (daemon not reachable). */
+function isFetchFailure(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  if (err.name === "TypeError" && /fetch failed/i.test(err.message)) return true;
+  const cause = (err as { cause?: unknown }).cause;
+  if (cause && typeof cause === "object" && "code" in cause) {
+    const code = (cause as { code?: unknown }).code;
+    if (code === "ECONNREFUSED" || code === "ENOTFOUND" || code === "ECONNRESET") return true;
+  }
+  return /ECONNREFUSED|ENOTFOUND|ECONNRESET/.test(err.message);
+}
+
+/**
+ * Wraps a command action so that a raw fetch/connection failure (daemon not
+ * running / not reachable) prints a friendly, actionable message instead of
+ * a raw "fetch failed" error, and exits 1.
+ */
+function withDaemonErrorHandling(
+  deps: ProgramDeps,
+  action: (...args: any[]) => Promise<void>,
+): (...args: any[]) => Promise<void> {
+  return async (...args: any[]) => {
+    try {
+      await action(...args);
+    } catch (err) {
+      if (isFetchFailure(err)) {
+        deps.stderr(
+          `sojourn daemon is not reachable at ${deps.baseUrl} — is it running? Try \`soj start\`.`,
+        );
+        deps.exit(1);
+        return;
+      }
+      throw err;
+    }
+  };
 }
 
 function describeError(body: unknown): string {

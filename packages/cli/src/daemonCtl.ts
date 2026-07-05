@@ -2,6 +2,10 @@ import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { readFileSync, writeFileSync, existsSync, unlinkSync } from "node:fs";
 import { mkdirSync } from "node:fs";
+import { execFile as execFileCb } from "node:child_process";
+import { promisify } from "node:util";
+
+const execFile = promisify(execFileCb);
 
 export interface SpawnResult {
   pid: number | undefined;
@@ -71,6 +75,47 @@ export function killPid(pid: number, signal: NodeJS.Signals | number = "SIGTERM"
     if (e.code === "ESRCH") return false;
     throw err;
   }
+}
+
+export interface PsCommandFn {
+  (pid: number): Promise<string>;
+}
+
+/** Default ps command lookup: `ps -p <pid> -o command=` (works on darwin & linux). */
+async function defaultPsCommand(pid: number): Promise<string> {
+  const { stdout } = await execFile("ps", ["-p", String(pid), "-o", "command="]);
+  return stdout;
+}
+
+export interface IsDaemonProcessDeps {
+  /** injectable for tests; defaults to a real `ps -p <pid> -o command=` invocation */
+  psCommand?: PsCommandFn;
+}
+
+/**
+ * Verifies that the process currently holding `pid` is actually a sojourn
+ * daemon, not some unrelated process the OS has recycled the pid onto.
+ *
+ * Looks up the process's command line via `ps` (cross-platform enough for
+ * darwin/linux) and checks it mentions "sojourn", or is running the daemon's
+ * built entry file ("main.js" under a path containing "daemon"). If the ps
+ * lookup fails for any reason (process gone, ps unavailable, etc.) this is
+ * treated as "not the daemon" — safer to treat an unverifiable pid as stale
+ * than to signal an unrelated process.
+ */
+export async function isDaemonProcess(pid: number, deps: IsDaemonProcessDeps = {}): Promise<boolean> {
+  const psCommand = deps.psCommand ?? defaultPsCommand;
+  let command: string;
+  try {
+    command = await psCommand(pid);
+  } catch {
+    return false;
+  }
+  const normalized = command.toLowerCase().trim();
+  if (normalized.length === 0) return false;
+  if (normalized.includes("sojourn")) return true;
+  if (normalized.includes("main.js") && normalized.includes("daemon")) return true;
+  return false;
 }
 
 export interface FetchJsonFn {

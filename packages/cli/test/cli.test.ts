@@ -495,4 +495,107 @@ describe("soj CLI", () => {
       expect(text).toContain("9.9.9");
     });
   });
+
+  describe("PID-reuse safety (isDaemonProcess)", () => {
+    it("stop: pid alive + command matches the daemon -> signals it and removes the pidfile", async () => {
+      const { writePid, readPid } = await import("../src/daemonCtl.js");
+      writePid(home, process.pid); // current test process: definitely alive
+      const psCommand = vi.fn().mockResolvedValue("/usr/bin/node /home/.sojourn/daemon/dist/main.js\n");
+      const killSpy = vi.spyOn(process, "kill").mockImplementation(((pid: number, signal?: unknown) => {
+        if (pid === process.pid && signal === "SIGTERM") return true;
+        return true;
+      }) as unknown as typeof process.kill);
+
+      const { deps, out } = makeDeps({ baseUrl: stub.baseUrl, sojournHome: home, psCommand });
+      const program = buildProgram(deps);
+      await run(program, ["stop"]);
+
+      expect(psCommand).toHaveBeenCalledWith(process.pid);
+      expect(killSpy).toHaveBeenCalledWith(process.pid, "SIGTERM");
+      expect(readPid(home)).toBeNull();
+      expect(out.join("\n")).toContain("stopped");
+      killSpy.mockRestore();
+    });
+
+    it("stop: pid alive but command is an unrelated process -> does NOT signal it, removes stale pidfile", async () => {
+      const { writePid, readPid } = await import("../src/daemonCtl.js");
+      writePid(home, process.pid); // alive, but we'll claim it's not the daemon
+      const psCommand = vi.fn().mockResolvedValue("/usr/bin/somethingelse --unrelated-flag\n");
+      const killSpy = vi.spyOn(process, "kill");
+
+      const { deps, out } = makeDeps({ baseUrl: stub.baseUrl, sojournHome: home, psCommand });
+      const program = buildProgram(deps);
+      await run(program, ["stop"]);
+
+      expect(psCommand).toHaveBeenCalledWith(process.pid);
+      // isPidAlive's liveness probe (kill(pid, 0)) is expected; SIGTERM must not be sent.
+      expect(killSpy).not.toHaveBeenCalledWith(process.pid, "SIGTERM");
+      expect(readPid(home)).toBeNull();
+      const text = out.join("\n");
+      expect(text).toContain("not a sojourn daemon");
+      expect(text).toContain("stale pidfile");
+      killSpy.mockRestore();
+    });
+
+    it("start: stale pidfile (pid alive, not a daemon) is removed and a new daemon is started", async () => {
+      const { writePid, readPid } = await import("../src/daemonCtl.js");
+      writePid(home, process.pid); // alive, but not the daemon per our psCommand shim
+      const psCommand = vi.fn().mockResolvedValue("/usr/bin/somethingelse\n");
+      stub.on("GET", "/api/health", () => ({ status: 200, body: { ok: true, version: "0.1.0" } }));
+      const spawnDaemon = vi.fn().mockReturnValue({ pid: 5555, unref: () => {} });
+
+      const { deps, out } = makeDeps({ baseUrl: stub.baseUrl, sojournHome: home, psCommand, spawnDaemon });
+      const program = buildProgram(deps);
+      await run(program, ["start"]);
+
+      expect(psCommand).toHaveBeenCalledWith(process.pid);
+      expect(spawnDaemon).toHaveBeenCalledTimes(1);
+      expect(readPid(home)).toBe(5555);
+      const text = out.join("\n");
+      expect(text).toContain("stale pidfile");
+      expect(text).toContain("5555");
+    });
+
+    it("start: pid alive + command matches the daemon -> reports already running, does not spawn", async () => {
+      const { writePid } = await import("../src/daemonCtl.js");
+      writePid(home, process.pid);
+      const psCommand = vi.fn().mockResolvedValue("/usr/bin/node /home/.sojourn/daemon/dist/main.js\n");
+      const spawnDaemon = vi.fn().mockReturnValue({ pid: 9999, unref: () => {} });
+
+      const { deps, out } = makeDeps({ baseUrl: stub.baseUrl, sojournHome: home, psCommand, spawnDaemon });
+      const program = buildProgram(deps);
+      await run(program, ["start"]);
+
+      expect(spawnDaemon).not.toHaveBeenCalled();
+      expect(out.join("\n")).toContain("already running");
+    });
+  });
+
+  describe("daemon-unreachable UX", () => {
+    async function unreachableDeps(command: string[]): Promise<{ out: string[]; err: string[]; exitCodes: number[] }> {
+      // Bind a server just to grab a free port, then close it immediately so
+      // the port is (almost certainly) connection-refused for the real test.
+      const probe = http.createServer();
+      await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", () => resolve()));
+      const addr = probe.address();
+      const port = addr && typeof addr === "object" ? addr.port : 0;
+      await new Promise<void>((resolve, reject) => probe.close((e) => (e ? reject(e) : resolve())));
+
+      const unreachableBaseUrl = `http://127.0.0.1:${port}`;
+      const { deps, out, err, exitCodes } = makeDeps({ baseUrl: unreachableBaseUrl, sojournHome: home });
+      const program = buildProgram(deps);
+      await run(program, command);
+      return { out, err, exitCodes };
+    }
+
+    it("projects: prints a friendly 'daemon not reachable' message on connection-refused, exits 1", async () => {
+      const { err, exitCodes, out } = await unreachableDeps(["projects"]);
+      const text = err.join("\n");
+      expect(text).toContain("sojourn daemon is not reachable");
+      expect(text).toContain("soj start");
+      expect(text).not.toContain("fetch failed");
+      expect(out.join("\n")).not.toContain("fetch failed");
+      expect(exitCodes).toEqual([1]);
+    });
+  });
 });
