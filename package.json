@@ -1,0 +1,19 @@
+{
+  "name": "sojourn",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "workspaces": ["packages/*"],
+  "scripts": {
+    "build": "tsc -b packages/core packages/adapter-claude packages/adapter-opencode packages/daemon packages/cli && npm run build -w @sojourn/web",
+    "build:node": "tsc -b packages/core packages/adapter-claude packages/adapter-opencode packages/daemon packages/cli",
+    "test": "vitest run",
+    "dev:daemon": "node packages/daemon/dist/main.js"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.6.0",
+    "vitest": "^3.2.0"
+  }
+}

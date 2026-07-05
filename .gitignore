@@ -1,0 +1,10 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.sojourn/
+.superpowers/
+coverage/
+.DS_Store
+*.log
+.env
+.env.*

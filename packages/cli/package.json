@@ -1,0 +1,11 @@
+{
+  "name": "@sojourn/cli",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "bin": { "soj": "./dist/main.js" },
+  "dependencies": {
+    "@sojourn/core": "*",
+    "commander": "^13.0.0"
+  }
+}
