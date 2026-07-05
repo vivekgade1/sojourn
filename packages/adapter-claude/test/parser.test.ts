@@ -71,10 +71,99 @@ describe("parseSessionJsonl", () => {
     expect(toolUse1!.kind).toBe("tool_use");
     expect(toolUse2!.kind).toBe("tool_use");
 
-    // Sibling rule: subsequent blocks parent to the previous block's node.
-    // Block order: text(uuid) -> tool_use(001) -> tool_use(002)
+    // Sibling rule: tool_use blocks never advance currentParent, so parallel
+    // tool_use blocks following a text block are SIBLINGS, both parented to
+    // that text node (not chained to each other).
     expect(toolUse1!.parentId).toBe(assistantText!.id);
-    expect(toolUse2!.parentId).toBe(toolUse1!.id);
+    expect(toolUse2!.parentId).toBe(assistantText!.id);
+    expect(toolUse1!.id).not.toBe(toolUse2!.id);
+  });
+
+  it("parents two tool_use blocks with no preceding text block to the line's parentUuid-mapped node", () => {
+    const raw = [
+      JSON.stringify({
+        type: "user",
+        uuid: "p1",
+        parentUuid: null,
+        sessionId: "session-xyz",
+        cwd: "/repo",
+        timestamp: "2026-01-01T00:00:00.000Z",
+        isSidechain: false,
+        message: { role: "user", content: "do two things" },
+      }),
+      JSON.stringify({
+        type: "assistant",
+        uuid: "a1",
+        parentUuid: "p1",
+        sessionId: "session-xyz",
+        cwd: "/repo",
+        timestamp: "2026-01-01T00:00:01.000Z",
+        isSidechain: false,
+        message: {
+          role: "assistant",
+          content: [
+            { type: "tool_use", id: "toolu_x", name: "Read", input: { file_path: "/a" } },
+            { type: "tool_use", id: "toolu_y", name: "Read", input: { file_path: "/b" } },
+          ],
+        },
+      }),
+    ].join("\n");
+    const batch = parseSessionJsonl("/tmp/no-text-blocks.jsonl", raw)!;
+    const promptNode = byNativeUuid(batch.nodes, "p1")!;
+    const toolUseX = byNativeUuid(batch.nodes, "toolu_x")!;
+    const toolUseY = byNativeUuid(batch.nodes, "toolu_y")!;
+    expect(toolUseX.parentId).toBe(promptNode.id);
+    expect(toolUseY.parentId).toBe(promptNode.id);
+    expect(toolUseX.id).not.toBe(toolUseY.id);
+  });
+
+  it("tool_use summary prefers known keys over raw object key order", () => {
+    const makeLine = (uuid: string, input: Record<string, unknown>) =>
+      JSON.stringify({
+        type: "assistant",
+        uuid,
+        parentUuid: null,
+        sessionId: "session-xyz",
+        cwd: "/repo",
+        timestamp: "2026-01-01T00:00:00.000Z",
+        isSidechain: false,
+        message: {
+          role: "assistant",
+          content: [{ type: "tool_use", id: `toolu_${uuid}`, name: "Bash", input }],
+        },
+      });
+
+    // "command" is a preferred key, even though "zzz_first" sorts/iterates first.
+    const raw = makeLine("a1", { zzz_first: "not this", command: "ls -la" });
+    const batch = parseSessionJsonl("/tmp/summary-keys.jsonl", raw)!;
+    const toolUse = byNativeUuid(batch.nodes, "toolu_a1")!;
+    expect(toolUse.summary).toBe("Bash ls -la");
+  });
+
+  it("tool_use summary falls back to the first string property when no preferred key matches", () => {
+    const raw = JSON.stringify({
+      type: "assistant",
+      uuid: "a2",
+      parentUuid: null,
+      sessionId: "session-xyz",
+      cwd: "/repo",
+      timestamp: "2026-01-01T00:00:00.000Z",
+      isSidechain: false,
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "toolu_a2",
+            name: "CustomTool",
+            input: { custom_field: "hello there" },
+          },
+        ],
+      },
+    });
+    const batch = parseSessionJsonl("/tmp/summary-fallback.jsonl", raw)!;
+    const toolUse = byNativeUuid(batch.nodes, "toolu_a2")!;
+    expect(toolUse.summary).toBe("CustomTool hello there");
   });
 
   it("parents each tool_result to its own tool_use node via tool_use_id, keeping both siblings", () => {

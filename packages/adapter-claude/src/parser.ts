@@ -241,9 +241,16 @@ function handleAssistantLine(
       ? [{ type: "text", text: content }]
       : [];
 
-  // parent chain: first block parents to the line's parentUuid-mapped node;
-  // subsequent blocks parent to the previous block's node.
-  let previousNodeId: string | null = resolveParentId(rec.parentUuid, nativeIdToNodeId);
+  // Parentage rule (resolved spec ambiguity — "keep all children / no
+  // parallel-tool-call sibling-drop"): currentParent starts at the line's
+  // parentUuid-mapped node. A text block creates its node parented to
+  // currentParent, then ADVANCES currentParent to itself (text blocks
+  // chain). A tool_use block creates its node parented to currentParent but
+  // does NOT advance currentParent — so multiple tool_use blocks in a row
+  // are siblings sharing the same parent (the preceding text node, or the
+  // line parent if no text block precedes them), never chained to each
+  // other.
+  let currentParent: string | null = resolveParentId(rec.parentUuid, nativeIdToNodeId);
   let textBlockIndex = 0;
 
   for (let i = 0; i < blocks.length; i++) {
@@ -256,7 +263,7 @@ function handleAssistantLine(
       textBlockIndex++;
       const node = makeNode({
         nativeUuid,
-        parentId: previousNodeId,
+        parentId: currentParent,
         kind: "assistant",
         sessionId,
         timestamp,
@@ -265,7 +272,7 @@ function handleAssistantLine(
       });
       nodes.push(node);
       nativeIdToNodeId.set(nativeUuid, node.id);
-      previousNodeId = node.id;
+      currentParent = node.id;
     } else if (blockType === "tool_use") {
       const id = typeof block.id === "string" ? block.id : undefined;
       if (!id) continue; // can't address a tool_use without its block id
@@ -273,7 +280,7 @@ function handleAssistantLine(
       const input = block.input;
       const node = makeNode({
         nativeUuid: id,
-        parentId: previousNodeId,
+        parentId: currentParent,
         kind: "tool_use",
         sessionId,
         timestamp,
@@ -282,15 +289,34 @@ function handleAssistantLine(
       });
       nodes.push(node);
       nativeIdToNodeId.set(id, node.id);
-      previousNodeId = node.id;
+      // Do NOT advance currentParent: parallel tool_use blocks are siblings.
     }
     // other block types (e.g. "thinking"): not part of the v1 node mapping,
-    // skip but keep chaining through previousNodeId unchanged.
+    // skip without changing currentParent.
   }
 }
 
+// Preferred keys (in priority order) for the tool_use summary's "first arg".
+// Using a fixed key preference instead of raw object/insertion order keeps
+// summaries meaningful and stable regardless of how a given tool orders its
+// input properties.
+const PREFERRED_SUMMARY_KEYS = [
+  "file_path",
+  "path",
+  "command",
+  "pattern",
+  "query",
+  "url",
+  "prompt",
+  "description",
+];
+
 function firstArgSummary(input: unknown): string {
   if (!isRecord(input)) return "";
+  for (const key of PREFERRED_SUMMARY_KEYS) {
+    const value = input[key];
+    if (typeof value === "string") return value;
+  }
   const values = Object.values(input);
   const first = values.find((v) => typeof v === "string") as string | undefined;
   return first ?? "";
