@@ -1,0 +1,5 @@
+{
+  "name": "sojourn",
+  "version": "0.1.0",
+  "description": "Streams Claude Code session activity to the local Sojourn daemon for real-time timeline capture and conversation restore."
+}

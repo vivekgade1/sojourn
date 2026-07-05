@@ -1,0 +1,38 @@
+{
+  "description": "Forwards Claude Code session lifecycle events to the local Sojourn daemon so it can capture the timeline in real time.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/../../packages/adapter-claude/dist/hooks/postToolUse.js"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/../../packages/adapter-claude/dist/hooks/postToolUse.js"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/../../packages/adapter-claude/dist/hooks/postToolUse.js"
+          }
+        ]
+      }
+    ]
+  }
+}
