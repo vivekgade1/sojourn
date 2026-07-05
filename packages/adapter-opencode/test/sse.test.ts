@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { subscribeToEvents, type OpenCodeEvent } from "../src/sse.js";
+import { subscribeToEvents, MAX_BUFFER_BYTES, type OpenCodeEvent } from "../src/sse.js";
 
 /** Builds a ReadableStream<Uint8Array> that yields the given raw SSE text chunks, then ends. */
 function streamOf(chunks: string[]): ReadableStream<Uint8Array> {
@@ -273,4 +273,117 @@ describe("subscribeToEvents", () => {
     expect(callCount).toBe(countShortlyAfter);
     expect(countShortlyAfter).toBeGreaterThanOrEqual(countAtClose);
   });
+
+  it("drops an unbounded buffer that never sees a frame boundary, logging once, without crashing", async () => {
+    // A stream that sends well over MAX_BUFFER_BYTES of data with no blank-line
+    // frame boundary anywhere. The consumer must never see an event, must not
+    // crash/hang, and the overflow must be logged exactly once (not once per
+    // chunk) while the connection loop keeps running.
+    const chunkSize = 64 * 1024;
+    const chunk = "x".repeat(chunkSize);
+    const totalChunksNeeded = Math.ceil((MAX_BUFFER_BYTES * 2.5) / chunkSize);
+    const chunks = new Array(totalChunksNeeded).fill(chunk);
+
+    const events: OpenCodeEvent[] = [];
+    const stream = streamOf(chunks);
+    const fetchImpl = vi.fn(async () => ({ ok: true, status: 200, body: stream }) as unknown as Response);
+    const delayImpl = vi.fn(parkForever);
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      const sub = subscribeToEvents({
+        baseUrl: "http://fake",
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        onEvent: (e) => events.push(e),
+        delayImpl,
+      });
+
+      // Wait until the whole scripted stream has been consumed (fetch parked
+      // in the delay afterward), rather than for any event (none should ever
+      // arrive).
+      await vi.waitFor(() => expect(delayImpl).toHaveBeenCalled());
+
+      expect(events.length).toBe(0);
+      // Overflowed roughly 2.5x MAX_BUFFER_BYTES worth of data with no
+      // boundary: buffer should have been reset ~1-2 times, logged once per
+      // reset via console.error, never once per chunk (which would be
+      // totalChunksNeeded calls).
+      expect(errorSpy.mock.calls.length).toBeGreaterThanOrEqual(1);
+      expect(errorSpy.mock.calls.length).toBeLessThan(totalChunksNeeded);
+
+      sub.close();
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("close() during backoff wait clears the pending backoff timer instead of leaving it alive for up to maxBackoffMs", async () => {
+    // Force exactly one connection failure so the loop enters backoff with a
+    // large initialBackoffMs, then close() immediately. With the delay wired
+    // to the AbortController's signal, close() must synchronously clear the
+    // real underlying timer (proving the production defaultDelay is itself
+    // abortable), not merely happen to let the test finish quickly.
+    let callCount = 0;
+    const fetchImpl = vi.fn(async () => {
+      callCount++;
+      if (callCount === 1) {
+        throw new Error("connection refused");
+      }
+      return parkForeverResponse();
+    });
+
+    const realSetTimeout = global.setTimeout;
+    const realClearTimeout = global.clearTimeout;
+    const liveTimers = new Set<NodeJS.Timeout>();
+    const setTimeoutSpy = vi
+      .spyOn(global, "setTimeout")
+      // @ts-expect-error -- overloaded signature, test only needs the (fn, ms) form
+      .mockImplementation((fn: (...a: unknown[]) => void, ms?: number, ...rest: unknown[]) => {
+        const handle = realSetTimeout(
+          (...a: unknown[]) => {
+            liveTimers.delete(handle);
+            fn(...a);
+          },
+          ms,
+          ...rest,
+        );
+        liveTimers.add(handle);
+        return handle;
+      });
+    const clearTimeoutSpy = vi.spyOn(global, "clearTimeout").mockImplementation((handle) => {
+      if (handle !== undefined) liveTimers.delete(handle as NodeJS.Timeout);
+      return realClearTimeout(handle as NodeJS.Timeout);
+    });
+
+    try {
+      const sub = subscribeToEvents({
+        baseUrl: "http://fake",
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        onEvent: () => {},
+        initialBackoffMs: 5000,
+        maxBackoffMs: 5000,
+      });
+
+      await vi.waitFor(() => expect(callCount).toBeGreaterThanOrEqual(1));
+      // The loop should now be parked in the 5s backoff delay: exactly one
+      // live timer outstanding.
+      await vi.waitFor(() => expect(liveTimers.size).toBe(1));
+
+      sub.close();
+
+      // close() must clear the outstanding backoff timer promptly (well
+      // under the 5s window), not leave it running.
+      await vi.waitFor(() => expect(liveTimers.size).toBe(0), { timeout: 500 });
+      expect(clearTimeoutSpy).toHaveBeenCalled();
+      expect(callCount).toBe(1);
+    } finally {
+      setTimeoutSpy.mockRestore();
+      clearTimeoutSpy.mockRestore();
+    }
+  });
 });
+
+/** A fetch response whose body never resolves — used to keep a second connection from ever completing. */
+function parkForeverResponse(): Promise<Response> {
+  return new Promise(() => {});
+}

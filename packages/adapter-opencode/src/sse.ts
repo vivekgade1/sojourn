@@ -21,6 +21,15 @@
  * called (AbortController-backed).
  */
 
+/**
+ * Hard cap on the in-flight SSE reassembly buffer. If no frame boundary
+ * (`\n\n` / `\r\n\r\n`) shows up before the buffer grows past this many
+ * bytes, the buffer is dropped (reset to "") and the overflow is logged
+ * once — protects against unbounded memory growth and O(n^2) rescans if a
+ * stream never emits a blank-line boundary.
+ */
+export const MAX_BUFFER_BYTES = 1_000_000;
+
 export interface OpenCodeEvent {
   type: string;
   properties?: Record<string, unknown>;
@@ -85,7 +94,7 @@ export function subscribeToEvents(options: SubscribeOptions): Subscription {
       }
 
       if (closed) return;
-      await delay(backoffMs);
+      await raceAbortableDelay(delay, backoffMs, controller.signal);
       backoffMs = Math.min(backoffMs * 2, maxBackoffMs);
     }
   };
@@ -121,6 +130,18 @@ async function consumeStream(
         const frame = buffer.slice(0, boundary);
         buffer = buffer.slice(frameLength(buffer, boundary));
         dispatchFrame(frame, onEvent, onError);
+      }
+
+      // Fail-soft guard: if a stream never emits a frame boundary, `buffer`
+      // would otherwise grow without limit (and each `indexOf` rescan above
+      // would get more expensive, O(n^2) overall). Drop the buffer and keep
+      // reading rather than let memory/CPU run away or kill the connection.
+      if (buffer.length > MAX_BUFFER_BYTES) {
+        // eslint-disable-next-line no-console
+        console.error(
+          `[adapter-opencode/sse] buffer exceeded ${MAX_BUFFER_BYTES} bytes with no frame boundary; dropping buffered data`,
+        );
+        buffer = "";
       }
     }
   } finally {
@@ -198,4 +219,51 @@ function stripTrailingSlash(url: string): string {
 
 function defaultDelay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Runs `delay(ms)`, but resolves early (without waiting for the rest of the
+ * delay) if `signal` aborts first — e.g. because `close()` was called while
+ * the reconnect loop was parked in backoff. Without this, `close()` would
+ * set `closed = true` and abort the fetch controller, but a pending
+ * `setTimeout` from a large backoff (up to `maxBackoffMs`, default 30s)
+ * would keep the loop (and its timer) alive until it fired on its own.
+ *
+ * Clears the underlying timer via `sleep`'s own AbortSignal wiring when the
+ * caller passes the default delay; for an injected `delayImpl` (tests) we
+ * can only race it, since we don't control its internal timer — but real
+ * production code always goes through `defaultDelay`, which is signal-aware.
+ */
+function raceAbortableDelay(delay: (ms: number) => Promise<void>, ms: number, signal: AbortSignal): Promise<void> {
+  if (delay === defaultDelay) {
+    return sleep(ms, signal);
+  }
+  if (signal.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const onAbort = (): void => resolve();
+    signal.addEventListener("abort", onAbort, { once: true });
+    void delay(ms).then(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    });
+  });
+}
+
+/** Abortable sleep: resolves after `ms`, or immediately if `signal` aborts first — clears the underlying timer either way. */
+function sleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal.aborted) {
+      resolve();
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      resolve();
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 }
