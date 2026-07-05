@@ -4,15 +4,18 @@ import { createRequire } from "node:module";
 import express, { type Express, type NextFunction, type Request, type Response } from "express";
 import type {
   ChronoNode,
+  CheckContext,
+  CriticLLM,
   FlagEngine,
   GraphStore,
   Project,
   RestoreEngine,
   SnapshotterLike,
 } from "@sojourn/core";
-import { SojournRestoreError } from "@sojourn/core";
+import { runCritic, SojournRestoreError } from "@sojourn/core";
 import type { EventsSink } from "./ingest.js";
 import type { FetchJson } from "@sojourn/core";
+import { anthropicCritic } from "./critic.js";
 
 export interface ServerDeps {
   store: GraphStore;
@@ -22,6 +25,12 @@ export interface ServerDeps {
   events: EventsSink;
   version: string;
   fetchJson?: FetchJson;
+  /**
+   * Builds the Tier-2 critic LLM client from an API key. Injected so tests
+   * can supply a fake `CriticLLM` and never touch the network; defaults to
+   * the real Anthropic Messages API client.
+   */
+  criticFor?: (apiKey: string) => CriticLLM;
   /**
    * Re-scans a Claude transcript file immediately (used by
    * POST /api/hooks/claude). Injected so tests can assert it was called
@@ -74,11 +83,48 @@ function resolveWebDist(): string | null {
   }
 }
 
+/** Builds the same `CheckContext` shape used by both the T1 deterministic
+ * checks and the T2 advisory critic — parent->node diff, session-scoped
+ * prior nodes, and the injected snapshotter/fetchJson. */
+async function buildCheckContext(
+  deps: ServerDeps,
+  fetchJson: FetchJson,
+  node: ChronoNode,
+): Promise<CheckContext> {
+  const project = deps.store.getProject(node.projectId);
+  const sessionNodes = deps.store.getSessionNodes(node.sessionId);
+  const parentTree = findParentSnapshotRef(deps.store, node);
+  const nodeTree = node.snapshotRef;
+
+  let diff: Awaited<ReturnType<SnapshotterLike["diff"]>> = [];
+  let snapshotter: SnapshotterLike | null = null;
+  if (project && nodeTree !== null) {
+    try {
+      snapshotter = deps.snapshotterFor(project);
+      diff = await snapshotter.diff(parentTree, nodeTree);
+    } catch (err) {
+      console.error("[sojourn] flags/run: diff failed:", err);
+    }
+  }
+
+  return {
+    node,
+    priorNodes: sessionNodes,
+    diff,
+    parentTree,
+    nodeTree,
+    projectRoot: project?.root ?? "",
+    snapshotter,
+    fetchJson,
+  };
+}
+
 export function createApp(deps: ServerDeps): Express {
   const app = express();
   app.use(express.json());
 
   const fetchJson = deps.fetchJson ?? defaultFetchJson();
+  const criticFor = deps.criticFor ?? anthropicCritic;
 
   app.get("/api/health", (_req: Request, res: Response) => {
     res.json({ ok: true, version: deps.version });
@@ -184,11 +230,29 @@ export function createApp(deps: ServerDeps): Express {
     const tier = req.body && typeof req.body.tier === "string" ? req.body.tier : "T1";
 
     if (tier === "T2") {
-      if (!process.env.ANTHROPIC_API_KEY) {
-        res.status(400).json({ error: "ANTHROPIC_API_KEY is required to run T2 checks" });
+      const apiKey = process.env.ANTHROPIC_API_KEY;
+      if (!apiKey) {
+        res.status(400).json({ error: "T2 requires ANTHROPIC_API_KEY" });
         return;
       }
-      res.status(501).json({ error: "T2 critic is not wired yet" });
+
+      try {
+        const ctx = await buildCheckContext(deps, fetchJson, node);
+        const llm = criticFor(apiKey);
+        const flags = await runCritic(llm, ctx);
+        const stored = flags.map((f) => deps.store.addFlag(node.id, f));
+
+        try {
+          deps.events.broadcast({ type: "flags_updated", nodeId: node.id, flags: stored });
+        } catch (err) {
+          console.error("[sojourn] flags/run (T2): failed to broadcast:", err);
+        }
+
+        res.json({ flags: deps.store.getFlags(node.id) });
+      } catch (err) {
+        console.error("[sojourn] flags/run (T2) failed:", err);
+        res.status(502).json({ error: "T2 critic call failed" });
+      }
       return;
     }
 
@@ -198,33 +262,7 @@ export function createApp(deps: ServerDeps): Express {
     }
 
     try {
-      const project = deps.store.getProject(node.projectId);
-      const sessionNodes = deps.store.getSessionNodes(node.sessionId);
-      const parentTree = findParentSnapshotRef(deps.store, node);
-      const nodeTree = node.snapshotRef;
-
-      let diff: Awaited<ReturnType<SnapshotterLike["diff"]>> = [];
-      let snapshotter: SnapshotterLike | null = null;
-      if (project && nodeTree !== null) {
-        try {
-          snapshotter = deps.snapshotterFor(project);
-          diff = await snapshotter.diff(parentTree, nodeTree);
-        } catch (err) {
-          console.error("[sojourn] flags/run: diff failed:", err);
-        }
-      }
-
-      const ctx = {
-        node,
-        priorNodes: sessionNodes,
-        diff,
-        parentTree,
-        nodeTree,
-        projectRoot: project?.root ?? "",
-        snapshotter,
-        fetchJson,
-      };
-
+      const ctx = await buildCheckContext(deps, fetchJson, node);
       const flags = await deps.flagEngine.runOnNode(ctx);
       const stored = flags.map((f) => deps.store.addFlag(node.id, f));
 

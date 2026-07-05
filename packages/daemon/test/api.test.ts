@@ -290,15 +290,64 @@ describe("daemon HTTP API", () => {
       expect(res.status).toBe(404);
     });
 
-    it("returns 501 for tier T2 when ANTHROPIC_API_KEY is set", async () => {
+    it("runs T2 with an injected fake CriticLLM, stores the flag, and dedups on a second call", async () => {
       const { nodes } = await ingestFixture();
+      const assistantNode = nodes.find((n) => n.kind === "assistant")!;
+
+      const complete = vi.fn(async () =>
+        JSON.stringify({
+          assumptions: [{ text: "assumed the default branch is main", confidence: "medium" }],
+          possible_hallucinations: [],
+        }),
+      );
+      const criticFor = vi.fn(() => ({ complete }));
+
       const original = process.env.ANTHROPIC_API_KEY;
       process.env.ANTHROPIC_API_KEY = "test-key";
       try {
-        const res = await request(app)
-          .post(`/api/nodes/${encodeURIComponent(nodes[0].id)}/flags/run`)
+        const deps: ServerDeps = {
+          store,
+          snapshotterFor,
+          flagEngine,
+          restoreEngine,
+          events: sink,
+          version: "test-version",
+          fetchJson,
+          criticFor,
+        };
+        const t2App = createApp(deps);
+
+        const res = await request(t2App)
+          .post(`/api/nodes/${encodeURIComponent(assistantNode.id)}/flags/run`)
           .send({ tier: "T2" });
-        expect(res.status).toBe(501);
+
+        expect(res.status).toBe(200);
+        expect(criticFor).toHaveBeenCalledWith("test-key");
+        expect(complete).toHaveBeenCalledTimes(1);
+        expect(
+          res.body.flags.some(
+            (f: { kind: string; source: string }) =>
+              f.kind === "unstated_assumption" && f.source === "llm_critic",
+          ),
+        ).toBe(true);
+
+        const storedFlags = store.getFlags(assistantNode.id);
+        expect(
+          storedFlags.some((f) => f.kind === "unstated_assumption" && f.source === "llm_critic"),
+        ).toBe(true);
+
+        // Second call with the same critic output must dedup, not duplicate.
+        const res2 = await request(t2App)
+          .post(`/api/nodes/${encodeURIComponent(assistantNode.id)}/flags/run`)
+          .send({ tier: "T2" });
+        expect(res2.status).toBe(200);
+        expect(complete).toHaveBeenCalledTimes(2);
+
+        const afterSecondCall = store.getFlags(assistantNode.id);
+        const matching = afterSecondCall.filter(
+          (f) => f.kind === "unstated_assumption" && f.source === "llm_critic",
+        );
+        expect(matching).toHaveLength(1);
       } finally {
         if (original === undefined) delete process.env.ANTHROPIC_API_KEY;
         else process.env.ANTHROPIC_API_KEY = original;
