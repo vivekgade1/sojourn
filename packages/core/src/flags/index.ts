@@ -14,3 +14,5 @@ export {
   looksLikeRelativeFilePath,
 } from "./claims.js";
 export type { ClaimKind, EditClaim } from "./claims.js";
+export { runCritic, MAX_TEXT_CHARS, MAX_DIFF_FILES } from "./critic.js";
+export type { CriticLLM } from "./critic.js";

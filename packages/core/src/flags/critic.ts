@@ -41,20 +41,46 @@ Respond with STRICT JSON and nothing else — no prose, no markdown fences. The 
 
 If there are no assumptions, use an empty array. If there are no possible hallucinations, use an empty array.`;
 
+/**
+ * Upper bound on assistant text characters included in the critic prompt.
+ * Guards against unbounded token cost / context overflow from a huge
+ * assistant message. Exported so the daemon can reference it if needed.
+ */
+export const MAX_TEXT_CHARS = 8000;
+
+/**
+ * Upper bound on the number of diff entries included in the critic prompt's
+ * diff summary. Guards against unbounded token cost / context overflow from
+ * a many-thousand-file diff. Exported so the daemon can reference it if
+ * needed.
+ */
+export const MAX_DIFF_FILES = 200;
+
+function truncateText(text: string): string {
+  if (text.length <= MAX_TEXT_CHARS) return text;
+  const truncatedChars = text.length - MAX_TEXT_CHARS;
+  return `${text.slice(0, MAX_TEXT_CHARS)}\n[...truncated ${truncatedChars} chars]`;
+}
+
 function summarizeDiff(diff: CheckContext["diff"]): string {
   if (diff.length === 0) return "(no file changes)";
-  return diff
-    .map((d) => (d.oldPath ? `${d.status} ${d.oldPath} -> ${d.path}` : `${d.status} ${d.path}`))
-    .join("\n");
+  const lines = diff
+    .slice(0, MAX_DIFF_FILES)
+    .map((d) => (d.oldPath ? `${d.status} ${d.oldPath} -> ${d.path}` : `${d.status} ${d.path}`));
+  if (diff.length > MAX_DIFF_FILES) {
+    lines.push(`…and ${diff.length - MAX_DIFF_FILES} more changed files`);
+  }
+  return lines.join("\n");
 }
 
 function buildPrompt(assistantText: string, ctx: CheckContext): string {
   const diffSummary = summarizeDiff(ctx.diff);
+  const truncatedText = truncateText(assistantText);
   return `${SYSTEM_PREAMBLE}
 
 Assistant message:
 """
-${assistantText}
+${truncatedText}
 """
 
 File diff summary:

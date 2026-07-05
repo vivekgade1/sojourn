@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { runCritic } from "../../src/flags/critic.js";
+import { runCritic, MAX_TEXT_CHARS, MAX_DIFF_FILES } from "../../src/flags/critic.js";
 import type { CriticLLM } from "../../src/flags/critic.js";
 import type { ChronoNode } from "../../src/types.js";
 import type { CheckContext, SnapshotterLike, FetchJson } from "../../src/interfaces.js";
@@ -222,6 +222,49 @@ describe("runCritic — malformed output safety", () => {
     const flags = await runCritic(llm, makeCtx());
     expect(flags).toHaveLength(1);
     expect(flags[0].evidence).toBe("Assumed: good one");
+  });
+});
+
+describe("runCritic — bounded prompt size", () => {
+  it("truncates a huge assistant message to MAX_TEXT_CHARS and bounds total prompt length", async () => {
+    const hugeText = "x".repeat(50_000);
+    let capturedPrompt = "";
+    const llm: CriticLLM = {
+      async complete(prompt: string) {
+        capturedPrompt = prompt;
+        return JSON.stringify({ assumptions: [], possible_hallucinations: [] });
+      },
+    };
+    const node = makeNode({ content: hugeText });
+    await runCritic(llm, makeCtx({ node, priorNodes: [node] }));
+
+    expect(capturedPrompt).toContain(
+      `\n[...truncated ${50_000 - MAX_TEXT_CHARS} chars]`,
+    );
+    expect(capturedPrompt.length).toBeLessThan(20_000);
+  });
+
+  it("caps the diff summary at MAX_DIFF_FILES entries with an overflow line", async () => {
+    const bigDiff = Array.from({ length: 500 }, (_, i) => ({
+      path: `src/file${i}.ts`,
+      status: "M" as const,
+    }));
+    let capturedPrompt = "";
+    const llm: CriticLLM = {
+      async complete(prompt: string) {
+        capturedPrompt = prompt;
+        return JSON.stringify({ assumptions: [], possible_hallucinations: [] });
+      },
+    };
+    await runCritic(llm, makeCtx({ diff: bigDiff }));
+
+    const fileLineCount = bigDiff
+      .slice(0, MAX_DIFF_FILES)
+      .filter((d) => capturedPrompt.includes(`M ${d.path}`)).length;
+    expect(fileLineCount).toBe(MAX_DIFF_FILES);
+    expect(capturedPrompt).toContain(
+      `…and ${500 - MAX_DIFF_FILES} more changed files`,
+    );
   });
 });
 
