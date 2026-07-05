@@ -1,4 +1,5 @@
 import type { ChronoNode, Flag, FlagKind, StoredFlag } from "../types.js";
+import { allBacktickedTokens } from "./claims.js";
 import type { CheckContext, FlagCheck } from "../interfaces.js";
 import { editClaimCheck } from "./editClaim.js";
 import { packagesCheck } from "./packages.js";
@@ -33,6 +34,35 @@ export interface GraphStoreLike {
   getFlags(nodeId: string): StoredFlag[] | Promise<StoredFlag[]>;
   resolveFlag(id: number): void | Promise<void>;
   getSessionNodes(sessionId: string): ChronoNode[] | Promise<ChronoNode[]>;
+}
+
+/**
+ * Two flags refer to the "same claim" iff they share a `kind` AND the same
+ * claimed subject. The subject is derived as the FULL ORDERED LIST of
+ * backtick-quoted tokens in the evidence string (both sides extracted the
+ * same way), falling back to exact evidence-string equality when a side has
+ * no backticked tokens at all.
+ *
+ * Using only the *first* backticked token is not enough: symbol_not_found's
+ * evidence is "claimed symbol `sym` in `file`; ..." — if two flags on the
+ * same node are about the SAME symbol name in TWO DIFFERENT files, comparing
+ * only the first token (`sym`) would treat them as the same claim, so fixing
+ * the symbol in one file would incorrectly auto-resolve the flag for the
+ * other file too. Comparing the full ordered token list (`sym`, `file`)
+ * disambiguates them while still letting a node with multiple flags of the
+ * same kind (e.g. two edit_claim_mismatch flags for two different files)
+ * resolve independently.
+ */
+function flagsMatchSameClaim(a: Flag, b: Flag): boolean {
+  if (a.kind !== b.kind) return false;
+  const tokensA = allBacktickedTokens(a.evidence);
+  const tokensB = allBacktickedTokens(b.evidence);
+  if (tokensA.length > 0 && tokensB.length > 0) {
+    return (
+      tokensA.length === tokensB.length && tokensA.every((t, i) => t === tokensB[i])
+    );
+  }
+  return a.evidence === b.evidence;
 }
 
 /**
@@ -77,7 +107,7 @@ export async function autoResolveFlags(
       };
 
       const stillFlagged = await check.run(reEvalCtx);
-      const stillHolds = stillFlagged.some((f) => f.kind === flag.kind);
+      const stillHolds = stillFlagged.some((f) => flagsMatchSameClaim(f, flag));
 
       if (!stillHolds) {
         await store.resolveFlag(flag.id);

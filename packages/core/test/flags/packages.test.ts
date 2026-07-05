@@ -124,6 +124,35 @@ describe("packagesCheck.run — true positive", () => {
   });
 });
 
+describe("packagesCheck.run — monorepo root package.json merging", () => {
+  it("does not flag an import declared only in the ROOT package.json of a monorepo (nested pkg, no node_modules on disk)", async () => {
+    const files: Record<string, string> = {
+      "packages/x/src/index.ts": `import { describe } from "vitest";\n`,
+      "packages/x/package.json": JSON.stringify({ name: "@sojourn/x", dependencies: {} }),
+      "package.json": JSON.stringify({
+        name: "sojourn-monorepo",
+        devDependencies: { vitest: "^3.0.0" },
+      }),
+    };
+    // fetchJson would 404 if actually called for "vitest" — it must not be
+    // called at all because vitest is a declared root devDependency.
+    const fetchJson: FetchJson = vi.fn(async () => ({ status: 404, body: null }));
+    const ctx = makeCtx({
+      diff: [{ path: "packages/x/src/index.ts", status: "M" }],
+      files,
+      fetchJson,
+      // No node_modules present in this fake tree — projectRoot points
+      // somewhere with nothing on disk, so the only way this can pass is by
+      // merging the root package.json's devDependencies while walking up
+      // from packages/x/src.
+      projectRoot: "/tmp/nonexistent-project-root-for-test",
+    });
+    const flags = await packagesCheck.run(ctx);
+    expect(flags).toHaveLength(0);
+    expect(fetchJson).not.toHaveBeenCalled();
+  });
+});
+
 describe("packagesCheck.run — true negatives (precision)", () => {
   it("does not flag when the package exists on the registry (200 status)", async () => {
     const files: Record<string, string> = {

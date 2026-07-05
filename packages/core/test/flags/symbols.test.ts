@@ -116,6 +116,20 @@ describe("symbolsCheck.run — true negatives (precision)", () => {
     expect(flags).toHaveLength(0);
   });
 
+  it("does not flag when the sentence names more than one file token, even if the symbol is absent from one of them (avoids cross-multiplying)", async () => {
+    const node = makeNode({
+      content:
+        "I added the function `computeTotal()` shared between `src/utils.ts` and `src/other.ts` for this feature.",
+    });
+    const files = {
+      "src/utils.ts": "export function computeTotal() { return 1; }\n",
+      "src/other.ts": "export function unrelatedFn() { return 2; }\n",
+    };
+    const ctx = makeCtx({ node, files });
+    const flags = await symbolsCheck.run(ctx);
+    expect(flags).toHaveLength(0);
+  });
+
   it("does not flag when the co-referenced file token does not resolve to an existing file", async () => {
     const node = makeNode({
       content: "I added the method `computeTotal` in `src/missing.ts` for this feature.",

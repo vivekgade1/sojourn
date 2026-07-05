@@ -185,6 +185,101 @@ describe("autoResolveFlags", () => {
     expect(store.resolved).toEqual([]);
   });
 
+  it("resolves only the claim that was fixed when one node produced TWO edit_claim_mismatch flags and only one is later fixed", async () => {
+    const nodeA = makeNode({
+      content: "I updated `auth.py` to handle refresh tokens and updated `billing.py` for the new plan.",
+    });
+    const storedFlagAuth: StoredFlag = {
+      ...makeFlag({
+        kind: "edit_claim_mismatch",
+        evidence: "claimed edit to `auth.py`; snapshot diff shows no change to that file",
+      }),
+      id: 101,
+      nodeId: nodeA.id,
+      dismissed: false,
+      createdAt: new Date().toISOString(),
+    };
+    const storedFlagBilling: StoredFlag = {
+      ...makeFlag({
+        kind: "edit_claim_mismatch",
+        evidence: "claimed edit to `billing.py`; snapshot diff shows no change to that file",
+      }),
+      id: 102,
+      nodeId: nodeA.id,
+      dismissed: false,
+      createdAt: new Date().toISOString(),
+    };
+    const nodeB = makeNode({ content: "Following up on the previous change." });
+
+    const flagsByNode = new Map<string, StoredFlag[]>([
+      [nodeA.id, [storedFlagAuth, storedFlagBilling]],
+    ]);
+    const store = makeFakeStore(flagsByNode, [nodeA, nodeB]);
+
+    // Only auth.py shows up as changed in the later diff; billing.py's claim
+    // is still unfixed.
+    const ctxB = makeCtx(nodeB, { diff: [{ path: "auth.py", status: "M" }] });
+
+    const count = await autoResolveFlags(store, nodeB, ctxB);
+    expect(count).toBe(1);
+    expect(store.resolved).toEqual([101]);
+  });
+
+  it("resolves only the file-A symbol_not_found flag when the same symbol is still missing in file B", async () => {
+    const nodeA = makeNode({
+      content:
+        "I called `helperA()` in `src/a.ts`. I also called `helperA()` in `src/b.ts`.",
+    });
+    const storedFlagA: StoredFlag = {
+      ...makeFlag({
+        kind: "symbol_not_found",
+        evidence:
+          "claimed symbol `helperA` in `src/a.ts`; that file's content has no occurrence of `helperA`",
+      }),
+      id: 201,
+      nodeId: nodeA.id,
+      dismissed: false,
+      createdAt: new Date().toISOString(),
+    };
+    const storedFlagB: StoredFlag = {
+      ...makeFlag({
+        kind: "symbol_not_found",
+        evidence:
+          "claimed symbol `helperA` in `src/b.ts`; that file's content has no occurrence of `helperA`",
+      }),
+      id: 202,
+      nodeId: nodeA.id,
+      dismissed: false,
+      createdAt: new Date().toISOString(),
+    };
+    const nodeB = makeNode({ content: "Following up on the previous change." });
+
+    const flagsByNode = new Map<string, StoredFlag[]>([
+      [nodeA.id, [storedFlagA, storedFlagB]],
+    ]);
+    const store = makeFakeStore(flagsByNode, [nodeA, nodeB]);
+
+    // autoResolveFlags re-runs the real symbolsCheck (kind "symbol_not_found")
+    // for nodeA's claim text, but against the ground truth available at
+    // nodeB (i.e. this ctx's snapshotter). The symbol now exists in file A's
+    // content but is still missing in file B's content.
+    const fileContents: Record<string, string> = {
+      "src/a.ts": "export function helperA() {}",
+      "src/b.ts": "export function other() {}",
+    };
+    const snapshotter = {
+      readFile: async (_tree: string, path: string) => fileContents[path] ?? null,
+    };
+    const ctxB = makeCtx(nodeB, {
+      snapshotter: snapshotter as unknown as CheckContext["snapshotter"],
+      nodeTree: "node-tree-b",
+    });
+
+    const count = await autoResolveFlags(store, nodeB, ctxB);
+    expect(count).toBe(1);
+    expect(store.resolved).toEqual([201]);
+  });
+
   it("does not attempt to resolve flags that are already dismissed", async () => {
     const nodeA = makeNode({ content: "I updated `auth.py` to handle refresh tokens." });
     const storedFlag: StoredFlag = {

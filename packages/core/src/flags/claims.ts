@@ -46,6 +46,34 @@ export function extractSearchableText(content: unknown): string {
   }
 }
 
+/**
+ * Returns the first backtick-quoted token in a string, or null if there is
+ * none. Evidence strings produced by every T1 check are deterministic and
+ * always name the claimed subject (path/package/symbol/file) as the first
+ * backticked token — this is used to derive a stable per-claim identity for
+ * comparing flags across re-runs (see `autoResolveFlags`).
+ */
+export function firstBacktickedToken(text: string): string | null {
+  const m = /`([^`\n]+)`/.exec(text);
+  return m ? m[1] : null;
+}
+
+/**
+ * Returns every backtick-quoted token in a string, in order of appearance.
+ * Used to derive claim identity from evidence strings that name more than
+ * one subject (e.g. symbol_not_found's "claimed symbol `sym` in `file`; ..."
+ * names both the symbol AND the file it was claimed to be in). Using only
+ * the first token there would collide two flags about the same symbol name
+ * in two different files — the full ordered list disambiguates them.
+ */
+export function allBacktickedTokens(text: string): string[] {
+  const tokens: string[] = [];
+  const re = /`([^`\n]+)`/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) tokens.push(m[1]);
+  return tokens;
+}
+
 export type ClaimKind = "EDIT" | "CREATE" | "DELETE";
 
 export interface EditClaim {

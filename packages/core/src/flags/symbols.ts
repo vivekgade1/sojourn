@@ -99,29 +99,33 @@ export const symbolsCheck: FlagCheck = {
       const mentions = findSymbolMentions(sentence.text);
       if (mentions.length === 0) continue;
       const fileTokens = findFileTokens(sentence.text);
-      if (fileTokens.length === 0) continue;
+      // Only fire when the sentence names EXACTLY ONE candidate file token.
+      // Multiple file tokens in the same sentence make the symbol-to-file
+      // co-reference ambiguous (cross-multiplying every symbol against every
+      // file would flag unrelated files) — precision over recall: skip
+      // entirely rather than guess which file the symbol belongs to.
+      if (fileTokens.length !== 1) continue;
 
-      for (const fileToken of fileTokens) {
-        let content = fileContentCache.get(fileToken);
-        if (content === undefined) {
-          content = await ctx.snapshotter.readFile(ctx.nodeTree, fileToken);
-          fileContentCache.set(fileToken, content);
-        }
-        if (content === null) continue; // token doesn't resolve to an existing file
+      const fileToken = fileTokens[0];
+      let content = fileContentCache.get(fileToken);
+      if (content === undefined) {
+        content = await ctx.snapshotter.readFile(ctx.nodeTree, fileToken);
+        fileContentCache.set(fileToken, content);
+      }
+      if (content === null) continue; // token doesn't resolve to an existing file
 
-        for (const mention of mentions) {
-          const key = `${fileToken}::${mention.name}`;
-          if (seen.has(key)) continue;
-          seen.add(key);
-          if (content.includes(mention.name)) continue;
-          flags.push({
-            kind: "symbol_not_found",
-            tier: "verified",
-            confidence: "high",
-            evidence: `claimed symbol \`${mention.name}\` in \`${fileToken}\`; that file's content has no occurrence of \`${mention.name}\``,
-            source: "deterministic",
-          });
-        }
+      for (const mention of mentions) {
+        const key = `${fileToken}::${mention.name}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        if (content.includes(mention.name)) continue;
+        flags.push({
+          kind: "symbol_not_found",
+          tier: "verified",
+          confidence: "high",
+          evidence: `claimed symbol \`${mention.name}\` in \`${fileToken}\`; that file's content has no occurrence of \`${mention.name}\``,
+          source: "deterministic",
+        });
       }
     }
 

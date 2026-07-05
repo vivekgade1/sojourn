@@ -165,6 +165,13 @@ function pyTopLevelModule(specifier: string): string {
   return specifier.split(".")[0];
 }
 
+/** Walk from the file's directory all the way up to the project root
+ * (tree-relative "."), MERGING dependencies+devDependencies (+peer/optional)
+ * from EVERY package.json found along the way. In a monorepo a dependency
+ * declared only in the ROOT package.json (e.g. a shared devDependency like
+ * `vitest`) must still count as "known" for a nested package's imports —
+ * stopping at the first (nearest) package.json would miss it and risk a
+ * false package_hallucination flag. */
 async function nearestPackageJsonDeps(
   snapshotter: NonNullable<CheckContext["snapshotter"]>,
   nodeTree: string,
@@ -173,9 +180,6 @@ async function nearestPackageJsonDeps(
   const deps = new Set<string>();
   let dir = path.posix.dirname(fromFile);
   const seen = new Set<string>();
-  // Walk upward from the file's directory to the root, collecting the
-  // nearest package.json (and also merge root package.json workspaces deps
-  // for good measure since project layout may be a monorepo).
   while (true) {
     if (seen.has(dir)) break;
     seen.add(dir);
@@ -191,9 +195,8 @@ async function nearestPackageJsonDeps(
           }
         }
       } catch {
-        // malformed package.json: ignore
+        // malformed package.json: ignore, keep walking up
       }
-      break;
     }
     if (dir === "." || dir === "/") break;
     dir = path.posix.dirname(dir);
