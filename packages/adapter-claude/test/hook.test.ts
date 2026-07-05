@@ -116,5 +116,32 @@ describe("postToolUse hook script (compiled)", () => {
       const result = await runHook("", { SOJOURN_PORT: String(port) });
       expect(result.code).toBe(0);
     });
+
+    it("exits 0 within ~4s when stdin is written but never closed (hangs open)", async () => {
+      const port = await findFreePort();
+      const result = await new Promise<{ code: number | null; stdout: string; stderr: string }>(
+        (resolve, reject) => {
+          const child = spawn(process.execPath, [hookScriptPath], {
+            env: { ...process.env, SOJOURN_PORT: String(port) },
+            stdio: ["pipe", "pipe", "pipe"],
+          });
+
+          let stdout = "";
+          let stderr = "";
+          child.stdout.on("data", (d) => (stdout += d.toString()));
+          child.stderr.on("data", (d) => (stderr += d.toString()));
+          child.on("error", reject);
+          child.on("close", (code) => resolve({ code, stdout, stderr }));
+
+          // Write a partial, incomplete JSON payload and deliberately never
+          // call child.stdin.end() — the caller (Claude Code) is not
+          // guaranteed to close stdin, and this hook must not hang forever
+          // waiting for EOF.
+          child.stdin.write('{"session_id": "abc", "incomplete":');
+        },
+      );
+
+      expect(result.code).toBe(0);
+    }, 4500);
   });
 });

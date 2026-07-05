@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node ${CLAUDE_PLUGIN_ROOT}/../../packages/adapter-claude/dist/hooks/postToolUse.js"
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/../../packages/adapter-claude/dist/hooks/postToolUse.js\""
           }
         ]
       }
@@ -18,7 +18,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node ${CLAUDE_PLUGIN_ROOT}/../../packages/adapter-claude/dist/hooks/postToolUse.js"
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/../../packages/adapter-claude/dist/hooks/postToolUse.js\""
           }
         ]
       }
@@ -29,7 +29,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node ${CLAUDE_PLUGIN_ROOT}/../../packages/adapter-claude/dist/hooks/postToolUse.js"
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/../../packages/adapter-claude/dist/hooks/postToolUse.js\""
           }
         ]
       }

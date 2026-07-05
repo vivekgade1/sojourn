@@ -1,0 +1,95 @@
+[
+  {
+    "info": {
+      "id": "msg_1",
+      "role": "user",
+      "sessionID": "ses_abc",
+      "time": { "created": 1735689600000 }
+    },
+    "parts": [
+      {
+        "id": "prt_1",
+        "messageID": "msg_1",
+        "sessionID": "ses_abc",
+        "type": "text",
+        "text": "Please add a health check endpoint to the server."
+      }
+    ]
+  },
+  {
+    "info": {
+      "id": "msg_2",
+      "role": "assistant",
+      "sessionID": "ses_abc",
+      "time": { "created": 1735689601000 }
+    },
+    "parts": [
+      {
+        "id": "prt_2",
+        "messageID": "msg_2",
+        "sessionID": "ses_abc",
+        "type": "text",
+        "text": "I'll add a /health route and then check the existing router file."
+      },
+      {
+        "id": "prt_3",
+        "messageID": "msg_2",
+        "sessionID": "ses_abc",
+        "type": "tool",
+        "callID": "call_read_001",
+        "tool": "read",
+        "state": {
+          "status": "completed",
+          "input": { "filePath": "/repo/project/src/server.ts" },
+          "output": "import express from \"express\";\nconst app = express();\nexport default app;\n"
+        }
+      },
+      {
+        "id": "prt_4",
+        "messageID": "msg_2",
+        "sessionID": "ses_abc",
+        "type": "tool",
+        "callID": "call_read_002",
+        "tool": "read",
+        "state": {
+          "status": "completed",
+          "input": { "filePath": "/repo/project/src/router.ts" },
+          "output": "export const routes = [];\n"
+        }
+      }
+    ]
+  },
+  {
+    "info": {
+      "id": "msg_3",
+      "role": "assistant",
+      "sessionID": "ses_abc",
+      "time": { "created": 1735689602000 }
+    },
+    "parts": [
+      {
+        "id": "prt_5",
+        "messageID": "msg_3",
+        "sessionID": "ses_abc",
+        "type": "text",
+        "text": "Both files look straightforward. I'll add the /health route now returning a 200 with a JSON status payload, wiring it into the existing router module."
+      }
+    ]
+  },
+  {
+    "info": {
+      "id": "msg_4",
+      "role": "assistant",
+      "sessionID": "ses_abc",
+      "time": { "created": 1735689603000 }
+    },
+    "parts": [
+      {
+        "id": "prt_6",
+        "messageID": "msg_4",
+        "sessionID": "ses_abc",
+        "type": "step-start"
+      }
+    ]
+  }
+]
