@@ -120,6 +120,40 @@ describe("ShadowSnapshotter", () => {
     expect(noPatch).toBe("");
   });
 
+  it("diffFile() with a null base diffs against the empty tree, returning the added content on the first snapshot", async () => {
+    await fsp.writeFile(
+      path.join(projectRoot, "file.txt"),
+      "snapshot-1-content\n",
+    );
+    const tree = await snapshotter.snapshot();
+
+    const patch = await snapshotter.diffFile(null, tree, "file.txt");
+    expect(patch).not.toBe("");
+    expect(patch).toContain("file.txt");
+    expect(patch).toContain("+snapshot-1-content");
+  });
+
+  it("diff() reports a renamed file with unchanged content as status R with oldPath set", async () => {
+    await fsp.writeFile(
+      path.join(projectRoot, "old-name.txt"),
+      "unchanged rename content\n",
+    );
+    const tree1 = await snapshotter.snapshot();
+
+    await fsp.rename(
+      path.join(projectRoot, "old-name.txt"),
+      path.join(projectRoot, "new-name.txt"),
+    );
+    const tree2 = await snapshotter.snapshot();
+
+    const changes = await snapshotter.diff(tree1, tree2);
+    const renameEntries = changes.filter((c) => c.status === "R");
+
+    expect(renameEntries).toHaveLength(1);
+    expect(renameEntries[0].path).toBe("new-name.txt");
+    expect(renameEntries[0].oldPath).toBe("old-name.txt");
+  });
+
   it("excludes node_modules, dist, and other ignored paths from listFiles", async () => {
     await fsp.mkdir(path.join(projectRoot, "node_modules"), { recursive: true });
     await fsp.writeFile(

@@ -7,6 +7,12 @@ import { runGit, type ShadowGitEnv } from "./git.js";
 
 const SOJOURN_HEAD_REF = "refs/sojourn/head";
 
+// git's canonical empty tree hash — the well-known SHA-1 of `git hash-object
+// -t tree /dev/null`. Used as the "before" side when diffing a null base
+// against a tree, since `--root` requires a commit (treeB here is always a
+// bare tree hash, not a commit-ish).
+const EMPTY_TREE_HASH = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
 const EXCLUDE_ENTRIES = [
   ".git/",
   "node_modules/",
@@ -102,7 +108,7 @@ export class ShadowSnapshotter implements SnapshotterLike {
     }
 
     const output = await runGit(
-      ["diff-tree", "-r", "--name-status", treeA, treeB],
+      ["diff-tree", "-r", "-M", "--name-status", treeA, treeB],
       this.env,
     );
     return this.parseNameStatus(output);
@@ -113,26 +119,11 @@ export class ShadowSnapshotter implements SnapshotterLike {
     treeB: string,
     filePath: string,
   ): Promise<string> {
-    if (treeA === null) {
-      const args = [
-        "diff-tree",
-        "-r",
-        "-p",
-        "--root",
-        treeB,
-        "--",
-        filePath,
-      ];
-      try {
-        return await runGit(args, this.env);
-      } catch {
-        return "";
-      }
-    }
+    const fromTree = treeA ?? EMPTY_TREE_HASH;
 
     try {
       const output = await runGit(
-        ["diff-tree", "-r", "-p", treeA, treeB, "--", filePath],
+        ["diff-tree", "-r", "-p", fromTree, treeB, "--", filePath],
         this.env,
       );
       return output;
@@ -173,7 +164,9 @@ export class ShadowSnapshotter implements SnapshotterLike {
       GIT_INDEX_FILE: tempIndexFile,
     };
 
-    const prefix = destDir.endsWith(path.sep) ? destDir : `${destDir}${path.sep}`;
+    // git's checkout-index --prefix always expects a forward slash,
+    // regardless of the host OS (even on Windows).
+    const prefix = destDir.endsWith("/") ? destDir : `${destDir}/`;
 
     try {
       await runGit(["read-tree", tree], restoreEnv);
