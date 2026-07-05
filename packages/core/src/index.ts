@@ -3,3 +3,4 @@
 export * from "./types.js";
 export * from "./interfaces.js";
 export * from "./paths.js";
+export * from "./store/index.js";
