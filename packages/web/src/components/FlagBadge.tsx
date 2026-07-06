@@ -10,9 +10,12 @@ export interface FlagBadgeProps {
  * - advisory (tier "advisory"): muted amber OUTLINE badge.
  * A mixed set of flags always renders as "verified" — a proven issue must
  * never be hidden behind a merely-advisory count.
+ *
+ * Auto-resolved flags are NOT active: they never count toward the badge
+ * (a fixed issue must not keep crying wolf on the graph).
  */
 export function FlagBadge({ flags }: FlagBadgeProps) {
-  const active = flags.filter((f) => !f.dismissed);
+  const active = flags.filter((f) => !f.dismissed && !f.autoResolved);
   if (active.length === 0) return null;
 
   const hasVerified = active.some((f) => f.tier === "verified");

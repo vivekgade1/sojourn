@@ -73,12 +73,20 @@ function flagsMatchSameClaim(a: Flag, b: Flag): boolean {
  * check no longer reproduces that flag kind for the original node's claim,
  * the flag is considered fixed and resolveFlag(id) is called.
  *
- * Returns the number of flags resolved.
+ * `ctx` is the CURRENT node's CheckContext, so the re-evaluation uses the
+ * same turn-scoped grounding base (parentTree = snapshot before the current
+ * turn's prompt) that the T1 run for `node` used.
+ *
+ * Returns the number of flags resolved. When `onResolved` is provided it is
+ * called once per resolved flag with the flag's node id and flag id, so
+ * callers (e.g. the daemon's ingest pipeline) can re-broadcast the affected
+ * nodes' full flag lists. A throwing `onResolved` never aborts the pass.
  */
 export async function autoResolveFlags(
   store: GraphStoreLike,
   node: ChronoNode,
   ctx: CheckContext,
+  onResolved?: (nodeId: string, flagId: number) => void,
 ): Promise<number> {
   const sessionNodes = await store.getSessionNodes(node.sessionId);
   const checksByKind = new Map<FlagKind, FlagCheck>(allT1Checks().map((c) => [c.kind, c]));
@@ -112,6 +120,13 @@ export async function autoResolveFlags(
       if (!stillHolds) {
         await store.resolveFlag(flag.id);
         resolvedCount += 1;
+        if (onResolved) {
+          try {
+            onResolved(priorNode.id, flag.id);
+          } catch {
+            // observer must never break the auto-resolve pass
+          }
+        }
       }
     }
   }

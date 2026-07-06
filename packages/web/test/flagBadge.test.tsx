@@ -72,4 +72,22 @@ describe("FlagBadge", () => {
     const { container } = render(<FlagBadge flags={[]} />);
     expect(container.firstChild).toBeNull();
   });
+
+  it("excludes auto-resolved flags from the count", () => {
+    const flags = [
+      makeFlag({ id: 1 }),
+      makeFlag({ id: 2, autoResolved: true }),
+      makeFlag({ id: 3, autoResolved: true }),
+    ];
+    render(<FlagBadge flags={flags} />);
+    expect(screen.getByTestId("flag-badge").textContent).toContain("1");
+    expect(screen.getByTestId("flag-badge").textContent).not.toContain("3");
+  });
+
+  it("renders nothing when every flag is auto-resolved", () => {
+    const { container } = render(
+      <FlagBadge flags={[makeFlag({ id: 1, autoResolved: true })]} />,
+    );
+    expect(container.firstChild).toBeNull();
+  });
 });

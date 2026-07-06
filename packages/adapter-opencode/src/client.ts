@@ -5,6 +5,7 @@
  * there is no OpenCode server available here. Route shapes verified from
  * the docs:
  *   GET    /session                       -> Session[]
+ *   GET    /session/:id                    -> Session
  *   GET    /session/:id/message            -> { info, parts }[]
  *   POST   /session/:id/revert             body { messageID, partID? }
  *   POST   /session/:id/fork               body { messageID? }
@@ -17,6 +18,9 @@
 export interface OpenCodeSession {
   id: string;
   title?: string;
+  /** Absolute path of the project directory the session runs in (per the
+   * documented Session shape); consumers must treat it as optional. */
+  directory?: string;
   [key: string]: unknown;
 }
 
@@ -58,6 +62,10 @@ export class OpenCodeClient {
 
   async listSessions(): Promise<ClientResult<OpenCodeSession[]>> {
     return this.request<OpenCodeSession[]>("GET", "/session");
+  }
+
+  async getSession(sessionId: string): Promise<ClientResult<OpenCodeSession>> {
+    return this.request<OpenCodeSession>("GET", `/session/${encodeURIComponent(sessionId)}`);
   }
 
   async getMessages(sessionId: string): Promise<ClientResult<OpenCodeMessage[]>> {

@@ -19,8 +19,17 @@ export interface CheckContext {
   node: ChronoNode;
   /** same-session nodes, chronological, including `node` */
   priorNodes: ChronoNode[];
-  /** parentTree -> nodeTree */
+  /** parentTree -> nodeTree, i.e. everything that changed during the turn */
   diff: FileChange[];
+  /**
+   * TURN-scoped grounding base: the snapshotRef nearest at-or-before the
+   * node's closest ancestor PROMPT node (the start of the current turn) —
+   * NOT simply the previous snapshot. Adapters ingest in debounced batches,
+   * so a tool edit and the assistant's claim about it can carry different
+   * snapshots; grounding at the turn's prompt makes `diff` cover the whole
+   * turn's changes (what the assistant's prose actually describes). Null
+   * when no ancestor prompt / no snapshot before it — checks stay silent.
+   */
   parentTree: string | null;
   nodeTree: string | null;
   projectRoot: string;

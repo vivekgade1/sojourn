@@ -226,8 +226,9 @@ export function buildProgram(deps: ProgramDeps): Command {
     .command("flags")
     .description("list active flags for a project")
     .option("--project <id>", "project id (default: project for cwd)")
+    .option("--all", "include auto-resolved flags (annotated)", false)
     .action(
-      withDaemonErrorHandling(deps, async (opts: { project?: string }) => {
+      withDaemonErrorHandling(deps, async (opts: { project?: string; all: boolean }) => {
         const projectId = opts.project ?? projectIdFor(deps.cwd);
         const res = await client.get<{ project: Project; sessions: SessionRow[]; nodes: ChronoNode[] }>(
           `/api/projects/${encodeNodeId(projectId)}/graph`,
@@ -240,10 +241,41 @@ export function buildProgram(deps: ProgramDeps): Command {
         const flags: Array<StoredFlag & { nodeId: string }> = [];
         for (const node of res.body.nodes) {
           for (const flag of node.flags ?? []) {
-            if (!flag.dismissed) flags.push({ ...flag, nodeId: node.id });
+            if (flag.dismissed) continue;
+            // Auto-resolved flags are settled history — hidden by default,
+            // shown (annotated) only with --all.
+            if (flag.autoResolved && !opts.all) continue;
+            flags.push({ ...flag, nodeId: node.id });
           }
         }
         deps.stdout(formatFlagsTable(flags));
+      }),
+    );
+
+  program
+    .command("critic <nodeId>")
+    .description("run the Tier-2 advisory critic on a node (requires ANTHROPIC_API_KEY on the daemon)")
+    .action(
+      withDaemonErrorHandling(deps, async (nodeId: string) => {
+        const res = await client.post<{ flags: StoredFlag[] }>(
+          `/api/nodes/${encodeNodeId(nodeId)}/flags/run`,
+          { tier: "T2" },
+        );
+        if (res.status !== 200) {
+          deps.stderr(`error: ${describeError(res.body)}`);
+          deps.exit(1);
+          return;
+        }
+        const advisory = (res.body.flags ?? []).filter(
+          (f) => f.tier === "advisory" && !f.dismissed,
+        );
+        if (advisory.length === 0) {
+          deps.stdout("no advisory flags.");
+          return;
+        }
+        deps.stdout(
+          formatFlagsTable(advisory.map((f) => ({ ...f, nodeId: f.nodeId ?? nodeId }))),
+        );
       }),
     );
 
@@ -419,7 +451,14 @@ function formatProjectsTable(projects: Project[]): string {
 function formatFlagsTable(flags: Array<StoredFlag & { nodeId: string }>): string {
   if (flags.length === 0) return "no active flags.";
   const header = ["kind", "tier", "confidence", "node", "evidence"];
-  const rows = flags.map((f) => [f.kind, f.tier, f.confidence, f.nodeId, f.evidence]);
+  const rows = flags.map((f) => [
+    // Annotate settled flags so they can never read as active findings.
+    f.autoResolved ? `${f.kind} (auto-resolved)` : f.kind,
+    f.tier,
+    f.confidence,
+    f.nodeId,
+    f.evidence,
+  ]);
   return renderTable(header, rows);
 }
 

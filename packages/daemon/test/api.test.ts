@@ -227,47 +227,56 @@ describe("daemon HTTP API", () => {
     it("executes T1 checks with mocked fetchJson and stores flags", async () => {
       await fsp.writeFile(path.join(projectRoot, "auth.py"), "def refresh(): pass\n");
 
-      const priorNode: ChronoNode = {
-        id: "claude:prior-run",
-        parentId: null,
-        kind: "assistant",
-        cli: "claude",
-        sessionId: "s-run",
-        projectId: "",
-        timestamp: "2026-01-01T00:00:00.000Z",
-        snapshotRef: null,
-        label: null,
-        summary: "",
-        content: { type: "text", text: "Sure." },
-        meta: { nativeUuid: "prior-run" },
-      };
+      function mkNode(
+        id: string,
+        parentId: string | null,
+        kind: ChronoNode["kind"],
+        timestamp: string,
+        content: unknown,
+      ): ChronoNode {
+        return {
+          id: `claude:${id}`,
+          parentId: parentId === null ? null : `claude:${parentId}`,
+          kind,
+          cli: "claude",
+          sessionId: "s-run",
+          projectId: "",
+          timestamp,
+          snapshotRef: null,
+          label: null,
+          summary: "",
+          content,
+          meta: { nativeUuid: id },
+        };
+      }
+
+      // Turn 1: prompt + assistant reply — the assistant anchors the
+      // snapshot that becomes the next turn's grounding base.
+      const prompt1 = mkNode("run-p1", null, "prompt", "2026-01-01T00:00:00.000Z", "hi");
+      const priorNode = mkNode("prior-run", "run-p1", "assistant", "2026-01-01T00:00:01.000Z", {
+        type: "text",
+        text: "Sure.",
+      });
       await ingestBatch(ingestDeps, {
         project: { root: projectRoot, name: "test" },
         session: { id: "s-run", cli: "claude" },
-        nodes: [priorNode],
+        nodes: [prompt1, priorNode],
       });
 
-      const targetNode: ChronoNode = {
-        id: "claude:target-run",
-        parentId: "claude:prior-run",
-        kind: "assistant",
-        cli: "claude",
-        sessionId: "s-run",
-        projectId: "",
-        timestamp: "2026-01-01T00:00:01.000Z",
-        snapshotRef: null,
-        label: null,
-        summary: "",
-        content: { type: "text", text: "I updated `auth.py` to handle refresh tokens." },
-        meta: { nativeUuid: "target-run" },
-      };
+      // Turn 2: prompt + claim, with NO disk change anywhere in the turn —
+      // the claimed edit is untruthful and must flag.
+      const prompt2 = mkNode("run-p2", "prior-run", "prompt", "2026-01-01T00:00:02.000Z", "fix auth");
+      const targetNode = mkNode("target-run", "run-p2", "assistant", "2026-01-01T00:00:03.000Z", {
+        type: "text",
+        text: "I updated `auth.py` to handle refresh tokens.",
+      });
       // Ingest (not a raw upsert) so the node gets a real snapshotRef —
       // flags/run needs nodeTree to be non-null for edit_claim_mismatch to
       // evaluate at all.
       await ingestBatch(ingestDeps, {
         project: { root: projectRoot, name: "test" },
         session: { id: "s-run", cli: "claude" },
-        nodes: [priorNode, targetNode],
+        nodes: [prompt1, priorNode, prompt2, targetNode],
       });
 
       const res = await request(app)
@@ -276,8 +285,8 @@ describe("daemon HTTP API", () => {
 
       expect(res.status).toBe(200);
       expect(Array.isArray(res.body.flags)).toBe(true);
-      // auth.py existed before this node's snapshot and was not touched by
-      // it, so the claimed edit doesn't show up in the parent->node diff.
+      // auth.py existed before this turn started and was not touched during
+      // the turn, so the claimed edit doesn't show up in the turn diff.
       expect(res.body.flags.some((f: { kind: string }) => f.kind === "edit_claim_mismatch")).toBe(
         true,
       );

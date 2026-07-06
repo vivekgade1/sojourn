@@ -3,13 +3,15 @@ import { api } from "./api";
 import { GraphView } from "./components/GraphView";
 import { Inspector } from "./components/Inspector";
 import { Toolbar } from "./components/Toolbar";
-import type { Annotation, ChronoNode, Project } from "./types";
+import type { Annotation, ChronoNode, Project, StoredFlag } from "./types";
 import { connectWs } from "./ws";
 
 const LENS_KINDS = new Set<ChronoNode["kind"]>(["decision", "assumption", "checkpoint"]);
 
 function hasActiveFlags(node: ChronoNode): boolean {
-  return (node.flags ?? []).some((f) => !f.dismissed);
+  // Auto-resolved flags are settled history, not active signal — they must
+  // not keep a node in the flagged-only / lens views.
+  return (node.flags ?? []).some((f) => !f.dismissed && !f.autoResolved);
 }
 
 export function App() {
@@ -108,6 +110,12 @@ export function App() {
     );
   }
 
+  function handleFlagsUpdated(nodeId: string, flags: StoredFlag[]) {
+    // `flags` is always the node's FULL current flag list (same contract as
+    // the WS flags_updated event) — replace, never merge.
+    setNodes((prev) => prev.map((n) => (n.id === nodeId ? { ...n, flags } : n)));
+  }
+
   function handleAnnotationAdded(nodeId: string, annotation: Annotation) {
     setNodes((prev) =>
       prev.map((n) =>
@@ -139,6 +147,7 @@ export function App() {
           node={selectedNode}
           onFlagDismissed={handleFlagDismissed}
           onAnnotationAdded={handleAnnotationAdded}
+          onFlagsUpdated={handleFlagsUpdated}
         />
       </div>
     </div>

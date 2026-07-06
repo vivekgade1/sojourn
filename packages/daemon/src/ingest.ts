@@ -129,7 +129,7 @@ export async function ingestBatch(
     for (const node of newAssistantNodes) {
       try {
         const sessionNodes = store.getSessionNodes(node.sessionId);
-        const parentTree = resolveParentTree(store, node);
+        const parentTree = resolveTurnBaseTree(store, node);
         const effectiveNodeTree = node.snapshotRef ?? nodeTree;
 
         let diff: FileChange[] = [];
@@ -155,17 +155,44 @@ export async function ingestBatch(
         const flags = await deps.flagEngine.runOnNode(ctx);
         const stored = flags.map((f) => store.addFlag(node.id, f));
 
+        // autoResolveFlags re-evaluates earlier flags against the SAME
+        // turn-scoped ctx built above; collect which nodes actually had a
+        // flag resolved so their (full) flag lists can be re-broadcast.
+        const resolvedNodeIds = new Set<string>();
         try {
-          await autoResolveFlags(store, node, ctx);
+          await autoResolveFlags(store, node, ctx, (resolvedNodeId) => {
+            resolvedNodeIds.add(resolvedNodeId);
+          });
         } catch (err) {
           console.error("[sojourn] ingest: autoResolveFlags failed:", err);
         }
 
         if (stored.length > 0) {
           try {
-            deps.events.broadcast({ type: "flags_updated", nodeId: node.id, flags: stored });
+            // Always broadcast the node's FULL current flag list (not just
+            // the newly added flags) so clients can replace, never merge.
+            deps.events.broadcast({
+              type: "flags_updated",
+              nodeId: node.id,
+              flags: store.getFlags(node.id),
+            });
           } catch (err) {
             console.error("[sojourn] ingest: failed to broadcast flags_updated:", err);
+          }
+        }
+
+        for (const resolvedNodeId of resolvedNodeIds) {
+          try {
+            deps.events.broadcast({
+              type: "flags_updated",
+              nodeId: resolvedNodeId,
+              flags: store.getFlags(resolvedNodeId),
+            });
+          } catch (err) {
+            console.error(
+              "[sojourn] ingest: failed to broadcast flags_updated after auto-resolve:",
+              err,
+            );
           }
         }
       } catch (err) {
@@ -194,20 +221,53 @@ export async function ingestBatch(
   return { added };
 }
 
-/** The parent node's own snapshotRef, walking up parentId (not ancestor
- * search across snapshot gaps — just the immediate lineage) so the T1
- * checks get a "before" tree that matches the most recent snapshot prior to
- * this node. Falls back to null (checks that need a tree stay silent). */
-function resolveParentTree(store: GraphStore, node: ChronoNode): string | null {
+/**
+ * Turn-scoped grounding base for a node's CheckContext (`parentTree`).
+ *
+ * Walks the parentId chain to the nearest ANCESTOR PROMPT node (the start of
+ * the current turn), then returns the nearest snapshotRef at-or-before that
+ * prompt (the prompt's own snapshotRef if it somehow has one, else the first
+ * ancestor snapshot above it). Returns null when there is no ancestor prompt
+ * (or no snapshot before it) — checks that need ground truth stay silent.
+ *
+ * WHY the prompt, not the nearest snapshot: adapters deliver transcripts in
+ * debounce-sized batches, so an Edit tool_result (batch A, snapshot S1) and
+ * the assistant's claim about that edit (batch B, snapshot S2 == S1) often
+ * land in DIFFERENT batches. A nearest-snapshot base would make the claim's
+ * step-diff empty and fire a false edit_claim_mismatch on a truthful claim.
+ * Grounding at the turn's prompt makes ctx.diff cover the WHOLE turn's
+ * changes, which is what the assistant's prose is actually describing.
+ */
+export function resolveTurnBaseTree(store: GraphStore, node: ChronoNode): string | null {
+  // 1) Find the nearest ancestor prompt node (strictly above `node`).
+  const seen = new Set<string>([node.id]);
   let current: ChronoNode | null = node;
-  const seen = new Set<string>();
+  let turnPrompt: ChronoNode | null = null;
   while (current && current.parentId !== null) {
     if (seen.has(current.parentId)) break;
     seen.add(current.parentId);
     const parent = store.getNode(current.parentId);
     if (!parent) break;
-    if (parent.snapshotRef !== null) return parent.snapshotRef;
+    if (parent.kind === "prompt") {
+      turnPrompt = parent;
+      break;
+    }
     current = parent;
+  }
+  if (!turnPrompt) return null;
+
+  // 2) Nearest snapshot at-or-before the prompt: the prompt itself first,
+  //    then its ancestors.
+  if (turnPrompt.snapshotRef !== null) return turnPrompt.snapshotRef;
+  const seenAbove = new Set<string>([turnPrompt.id]);
+  let cursor: ChronoNode | null = turnPrompt;
+  while (cursor && cursor.parentId !== null) {
+    if (seenAbove.has(cursor.parentId)) break;
+    seenAbove.add(cursor.parentId);
+    const parent = store.getNode(cursor.parentId);
+    if (!parent) break;
+    if (parent.snapshotRef !== null) return parent.snapshotRef;
+    cursor = parent;
   }
   return null;
 }

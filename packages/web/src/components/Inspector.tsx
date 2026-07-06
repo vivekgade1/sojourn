@@ -7,6 +7,8 @@ export interface InspectorProps {
   node: ChronoNode | null;
   onFlagDismissed: (nodeId: string, flagId: number) => void;
   onAnnotationAdded: (nodeId: string, annotation: Annotation) => void;
+  /** Called with a node's FULL current flag list (replace, never merge). */
+  onFlagsUpdated?: (nodeId: string, flags: StoredFlag[]) => void;
 }
 
 function FlagRow({
@@ -29,6 +31,30 @@ function FlagRow({
   }
 
   if (flag.dismissed) return null;
+
+  // Auto-resolved flags render in a visually "resolved" state — muted and
+  // struck through, explicitly labeled — so a settled issue can never be
+  // mistaken for an active one.
+  if (flag.autoResolved) {
+    return (
+      <div
+        className={`flag-row flag-row-${flag.tier} flag-row-resolved`}
+        style={{ opacity: 0.55 }}
+        data-testid="flag-row-resolved"
+      >
+        <div className="flag-row-header">
+          <span className={`flag-tier-label ${flag.tier}`}>
+            {flag.tier === "verified" ? "Verified" : "Advisory"}
+          </span>
+          <span className="inspector-meta">{flag.kind.replace(/_/g, " ")}</span>
+          <span className="flag-resolved-label">auto-resolved</span>
+        </div>
+        <div className="flag-evidence" style={{ textDecoration: "line-through" }}>
+          {flag.evidence}
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className={`flag-row flag-row-${flag.tier}`}>
@@ -108,13 +134,24 @@ function AnnotationsSection({
   );
 }
 
-function RestoreFlow({ node }: { node: ChronoNode }) {
+interface RestoreFlowProps {
+  /** The node id whose snapshot the restore actually targets. */
+  targetNodeId: string;
+  /** Button label — must truthfully describe WHERE the restore lands. */
+  buttonLabel: string;
+  /** One-line explanation shown in the confirm modal. */
+  modalDescription: string;
+  /** Optional section heading; omit to render the buttons inline (flag context). */
+  heading?: string;
+}
+
+function RestoreFlow({ targetNodeId, buttonLabel, modalDescription, heading }: RestoreFlowProps) {
   const [preflight, setPreflight] = useState<RestorePreflight | null>(null);
   // The node id captured at the moment preflight was requested. This is the
-  // ONLY id ever passed to api.restore — never the (possibly-changed) `node`
-  // prop — so that even if this component instance somehow survived a node
-  // switch, the confirm action can't act on a different node than the one
-  // whose warnings the user actually reviewed.
+  // ONLY id ever passed to api.restore — never the (possibly-changed)
+  // target prop — so that even if this component instance somehow survived
+  // a node switch, the confirm action can't act on a different node than
+  // the one whose warnings the user actually reviewed.
   const [preflightNodeId, setPreflightNodeId] = useState<string | null>(null);
   const [result, setResult] = useState<RestoreResult | null>(null);
   const [busy, setBusy] = useState(false);
@@ -125,7 +162,6 @@ function RestoreFlow({ node }: { node: ChronoNode }) {
     setBusy(true);
     setError(null);
     try {
-      const targetNodeId = node.id;
       const pf = await api.preflight(targetNodeId);
       setPreflight(pf);
       setPreflightNodeId(targetNodeId);
@@ -154,10 +190,10 @@ function RestoreFlow({ node }: { node: ChronoNode }) {
   }
 
   return (
-    <div className="inspector-section">
-      <h3>Restore</h3>
+    <div className={heading ? "inspector-section" : "restore-inline"}>
+      {heading && <h3>{heading}</h3>}
       <button className="restore-btn" onClick={startPreflight} disabled={busy}>
-        {busy ? "Checking…" : "Restore to just before this"}
+        {busy ? "Checking…" : buttonLabel}
       </button>
       {error && <div className="flag-evidence">{error}</div>}
 
@@ -165,6 +201,7 @@ function RestoreFlow({ node }: { node: ChronoNode }) {
         <div className="modal-overlay" role="dialog" aria-modal="true">
           <div className="modal">
             <h3>Confirm restore</h3>
+            <p>{modalDescription}</p>
             {!preflight.treeValid && (
               <div className="flag-evidence">
                 Snapshot is no longer valid for this node — restore is unavailable.
@@ -225,10 +262,45 @@ function RestoreFlow({ node }: { node: ChronoNode }) {
   );
 }
 
-function InspectorContent({ node, onFlagDismissed, onAnnotationAdded }: InspectorProps & { node: ChronoNode }) {
+function InspectorContent({
+  node,
+  onFlagDismissed,
+  onAnnotationAdded,
+  onFlagsUpdated,
+}: InspectorProps & { node: ChronoNode }) {
   const [payloadOpen, setPayloadOpen] = useState(false);
+  const [criticBusy, setCriticBusy] = useState(false);
+  const [criticError, setCriticError] = useState<string | null>(null);
+  const [criticRan, setCriticRan] = useState(false);
+  // Local fallback so the advisory results render even without a parent
+  // onFlagsUpdated wiring (e.g. when rendered in isolation). When the
+  // parent DOES wire onFlagsUpdated, node.flags is the single source of
+  // truth — the local copy is ignored so later parent updates (dismissals,
+  // WS flags_updated) are never shadowed by a stale local list.
+  const [localFlags, setLocalFlags] = useState<StoredFlag[] | null>(null);
 
-  const flags = (node.flags ?? []).filter((f) => !f.dismissed);
+  const allFlags = (onFlagsUpdated ? node.flags : (localFlags ?? node.flags)) ?? [];
+  const activeFlags = allFlags.filter((f) => !f.dismissed && !f.autoResolved);
+  const resolvedFlags = allFlags.filter((f) => !f.dismissed && f.autoResolved);
+
+  async function runAdvisoryCritic() {
+    if (criticBusy) return;
+    setCriticBusy(true);
+    setCriticError(null);
+    try {
+      const res = await api.runFlags(node.id, "T2");
+      // The daemon returns the node's FULL current flag list.
+      setLocalFlags(res.flags);
+      setCriticRan(true);
+      onFlagsUpdated?.(node.id, res.flags);
+    } catch (e) {
+      // e.g. 400 "T2 requires ANTHROPIC_API_KEY", 502 on critic failure —
+      // shown as-is, never styled like a flag.
+      setCriticError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setCriticBusy(false);
+    }
+  }
 
   return (
     <div className="inspector" data-testid="inspector">
@@ -256,25 +328,69 @@ function InspectorContent({ node, onFlagDismissed, onAnnotationAdded }: Inspecto
       </div>
 
       <div className="inspector-section">
-        <h3>Flags{flags.length > 0 ? ` (${flags.length})` : ""}</h3>
-        {flags.length === 0 && <div className="inspector-meta">No active flags.</div>}
-        {flags.map((flag) => (
+        <h3>Flags{activeFlags.length > 0 ? ` (${activeFlags.length})` : ""}</h3>
+        {activeFlags.length === 0 && <div className="inspector-meta">No active flags.</div>}
+        {activeFlags.map((flag) => (
           <FlagRow
             key={flag.id}
             flag={flag}
             onDismiss={(flagId) => onFlagDismissed(node.id, flagId)}
           />
         ))}
+        {resolvedFlags.map((flag) => (
+          <FlagRow
+            key={flag.id}
+            flag={flag}
+            onDismiss={(flagId) => onFlagDismissed(node.id, flagId)}
+          />
+        ))}
+
+        {node.kind === "assistant" && (
+          <div className="critic-row">
+            <button
+              className="critic-btn"
+              onClick={runAdvisoryCritic}
+              disabled={criticBusy}
+            >
+              {criticBusy ? "Running critic…" : "Run advisory critic"}
+            </button>
+            {criticError && <div className="inspector-meta">{criticError}</div>}
+            {criticRan && !criticError && allFlags.filter((f) => f.tier === "advisory").length === 0 && (
+              <div className="inspector-meta">Critic ran — no advisory flags.</div>
+            )}
+          </div>
+        )}
+
+        {activeFlags.length > 0 && (
+          <RestoreFlow
+            // A flagged node means "this step went wrong" — the useful
+            // rollback is to the state BEFORE this node, i.e. its parent's
+            // snapshot. Root nodes (no parent) fall back to the node itself.
+            targetNodeId={node.parentId ?? node.id}
+            buttonLabel="Restore to before this node"
+            modalDescription={
+              node.parentId
+                ? "This restores the files to the state just before this node (its parent's snapshot), into a new worktree."
+                : "This node has no parent — this restores the files to this node's own snapshot, into a new worktree."
+            }
+          />
+        )}
       </div>
 
       <AnnotationsSection node={node} onAnnotationAdded={onAnnotationAdded} />
 
-      <RestoreFlow key={node.id} node={node} />
+      <RestoreFlow
+        key={node.id}
+        targetNodeId={node.id}
+        heading="Restore"
+        buttonLabel="Restore at this node"
+        modalDescription="This restores the files exactly as they were AT this node's snapshot, into a new worktree."
+      />
     </div>
   );
 }
 
-export function Inspector({ node, onFlagDismissed, onAnnotationAdded }: InspectorProps) {
+export function Inspector({ node, onFlagDismissed, onAnnotationAdded, onFlagsUpdated }: InspectorProps) {
   if (!node) {
     return <div className="inspector-empty">Select a node to inspect it.</div>;
   }
@@ -289,6 +405,7 @@ export function Inspector({ node, onFlagDismissed, onAnnotationAdded }: Inspecto
       node={node}
       onFlagDismissed={onFlagDismissed}
       onAnnotationAdded={onAnnotationAdded}
+      onFlagsUpdated={onFlagsUpdated}
     />
   );
 }

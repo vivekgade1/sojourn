@@ -21,6 +21,8 @@ import { ingestBatch, type IngestDeps } from "./ingest.js";
 import { EventsHub } from "./events.js";
 import { startWatcher, type WatcherHandle } from "./watcher.js";
 import { runSerialized } from "./serialize.js";
+import { rescanOpenCodeSession, startOpenCodeSubscriber } from "./opencodeIngest.js";
+import type { Subscription } from "@sojourn/adapter-opencode";
 
 /**
  * True when `candidate` resolves to a path that is inside `dir` (or `dir`
@@ -91,6 +93,10 @@ export interface BuiltDaemon {
   /** Starts the chokidar watcher over the Claude transcripts directory,
    * wired to the same ingest pipeline the HTTP hooks use. */
   attachWatcher(server: HttpServer): WatcherHandle;
+  /** Starts the (opt-in, `SOJOURN_OPENCODE=1`) OpenCode `/event` SSE
+   * subscriber, wired to the same ingest pipeline. Off by default — most
+   * environments run no OpenCode server. */
+  attachOpenCodeSubscriber(server: HttpServer): Subscription;
 }
 
 /**
@@ -161,11 +167,22 @@ export function buildDaemon(): BuiltDaemon {
         version,
         fetchJson,
         rescanClaudeTranscript,
+        // Fail-soft by construction (rescanOpenCodeSession never throws);
+        // the project root comes from the parsed batch, and the call goes
+        // through the same per-project serializer as every other ingest.
+        rescanOpenCodeSession(sessionId: string) {
+          if (!ingestDeps) return;
+          return rescanOpenCodeSession(ingestDeps, sessionId);
+        },
       });
     },
     attachWatcher(server: HttpServer) {
       const deps = ensureWired(server);
       return startWatcher(deps, claudeProjectsDir());
+    },
+    attachOpenCodeSubscriber(server: HttpServer) {
+      const deps = ensureWired(server);
+      return startOpenCodeSubscriber(deps);
     },
   };
 }

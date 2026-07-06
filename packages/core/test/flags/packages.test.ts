@@ -211,6 +211,38 @@ describe("packagesCheck.run — true negatives (precision)", () => {
     expect(fetchJson).not.toHaveBeenCalled();
   });
 
+  it("does not flag path-alias / subpath imports (@/, ~/, #) — never registry packages", async () => {
+    const files: Record<string, string> = {
+      "src/index.ts": [
+        `import { util } from "@/lib/utils";`,
+        `import { widget } from "~/components/widget";`,
+        `import { internal } from "#internal/thing";`,
+      ].join("\n"),
+    };
+    // Would 404 if any alias leaked through to a registry lookup.
+    const fetchJson: FetchJson = vi.fn(async () => ({ status: 404, body: null }));
+    const ctx = makeCtx({ diff: [{ path: "src/index.ts", status: "M" }], files, fetchJson });
+    const flags = await packagesCheck.run(ctx);
+    expect(flags).toHaveLength(0);
+    expect(fetchJson).not.toHaveBeenCalled();
+  });
+
+  it("does not flag a Python import that resolves to a local module in the tree (m/ dir or m.py)", async () => {
+    const files: Record<string, string> = {
+      "script.py": `import helpers\nfrom mypackage.sub import thing\n`,
+      "helpers.py": "def helper(): pass\n",
+      "mypackage/__init__.py": "",
+      "mypackage/sub.py": "thing = 1\n",
+    };
+    // Neither `helpers` nor `mypackage` exists on PyPI in this scenario —
+    // the lookup must be skipped entirely, not merely tolerated.
+    const fetchJson: FetchJson = vi.fn(async () => ({ status: 404, body: null }));
+    const ctx = makeCtx({ diff: [{ path: "script.py", status: "A" }], files, fetchJson });
+    const flags = await packagesCheck.run(ctx);
+    expect(flags).toHaveLength(0);
+    expect(fetchJson).not.toHaveBeenCalled();
+  });
+
   it("caches lookups so the same package is only fetched once per run", async () => {
     const files: Record<string, string> = {
       "a.ts": `import { x } from "dupe-package";\n`,

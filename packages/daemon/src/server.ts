@@ -13,9 +13,10 @@ import type {
   SnapshotterLike,
 } from "@sojourn/core";
 import { runCritic, SojournRestoreError } from "@sojourn/core";
-import type { EventsSink } from "./ingest.js";
+import { resolveTurnBaseTree, type EventsSink } from "./ingest.js";
 import type { FetchJson } from "@sojourn/core";
 import { anthropicCritic } from "./critic.js";
+import { runSerialized } from "./serialize.js";
 
 export interface ServerDeps {
   store: GraphStore;
@@ -37,6 +38,14 @@ export interface ServerDeps {
    * without touching the real filesystem watcher.
    */
   rescanClaudeTranscript?: (transcriptPath: string) => Promise<void> | void;
+  /**
+   * Re-scans an OpenCode session immediately (used by
+   * POST /api/hooks/opencode): pulls the session + messages from the local
+   * OpenCode server and ingests them. Fire-and-forget and fail-soft — the
+   * route 200s regardless. Injected so tests can wire a stub OpenCode
+   * server (or assert the call) without a live OpenCode install.
+   */
+  rescanOpenCodeSession?: (sessionId: string) => Promise<void> | void;
 }
 
 /** Decodes a `:id` route param — node ids contain `:` (e.g. `claude:uuid`)
@@ -84,8 +93,9 @@ function resolveWebDist(): string | null {
 }
 
 /** Builds the same `CheckContext` shape used by both the T1 deterministic
- * checks and the T2 advisory critic — parent->node diff, session-scoped
- * prior nodes, and the injected snapshotter/fetchJson. */
+ * checks and the T2 advisory critic — TURN-scoped diff (snapshot before the
+ * node's turn prompt -> node snapshot, see `resolveTurnBaseTree`),
+ * session-scoped prior nodes, and the injected snapshotter/fetchJson. */
 async function buildCheckContext(
   deps: ServerDeps,
   fetchJson: FetchJson,
@@ -93,7 +103,10 @@ async function buildCheckContext(
 ): Promise<CheckContext> {
   const project = deps.store.getProject(node.projectId);
   const sessionNodes = deps.store.getSessionNodes(node.sessionId);
-  const parentTree = findParentSnapshotRef(deps.store, node);
+  const parentTree =
+    node.kind === "assistant"
+      ? resolveTurnBaseTree(deps.store, node)
+      : findParentSnapshotRef(deps.store, node);
   const nodeTree = node.snapshotRef;
 
   let diff: Awaited<ReturnType<SnapshotterLike["diff"]>> = [];
@@ -240,15 +253,18 @@ export function createApp(deps: ServerDeps): Express {
         const ctx = await buildCheckContext(deps, fetchJson, node);
         const llm = criticFor(apiKey);
         const flags = await runCritic(llm, ctx);
-        const stored = flags.map((f) => deps.store.addFlag(node.id, f));
+        for (const f of flags) deps.store.addFlag(node.id, f);
 
+        // Broadcast the node's FULL current flag list so clients replace,
+        // never merge (same contract as the ingest pipeline's broadcasts).
+        const fullFlags = deps.store.getFlags(node.id);
         try {
-          deps.events.broadcast({ type: "flags_updated", nodeId: node.id, flags: stored });
+          deps.events.broadcast({ type: "flags_updated", nodeId: node.id, flags: fullFlags });
         } catch (err) {
           console.error("[sojourn] flags/run (T2): failed to broadcast:", err);
         }
 
-        res.json({ flags: deps.store.getFlags(node.id) });
+        res.json({ flags: fullFlags });
       } catch (err) {
         console.error("[sojourn] flags/run (T2) failed:", err);
         res.status(502).json({ error: "T2 critic call failed" });
@@ -264,25 +280,47 @@ export function createApp(deps: ServerDeps): Express {
     try {
       const ctx = await buildCheckContext(deps, fetchJson, node);
       const flags = await deps.flagEngine.runOnNode(ctx);
-      const stored = flags.map((f) => deps.store.addFlag(node.id, f));
+      for (const f of flags) deps.store.addFlag(node.id, f);
 
+      // Broadcast (and return) the node's FULL current flag list so clients
+      // replace, never merge.
+      const fullFlags = deps.store.getFlags(node.id);
       try {
-        deps.events.broadcast({ type: "flags_updated", nodeId: node.id, flags: stored });
+        deps.events.broadcast({ type: "flags_updated", nodeId: node.id, flags: fullFlags });
       } catch (err) {
         console.error("[sojourn] flags/run: failed to broadcast:", err);
       }
 
-      res.json({ flags: stored });
+      res.json({ flags: fullFlags });
     } catch (err) {
       console.error("[sojourn] flags/run failed:", err);
       res.status(500).json({ error: "Failed to run flags" });
     }
   });
 
+  /**
+   * Serializer key for restore-related work on a node: the node's project
+   * root (resolved), i.e. the SAME key ingestion uses. Restore/preflight
+   * touch the project's single ShadowSnapshotter (safety snapshot, tree
+   * checks), so they must never overlap an in-flight ingest snapshot for
+   * that project. Null when the node/project is unknown — the engine will
+   * throw its own typed not_found in that case, no serialization needed.
+   */
+  function restoreSerializerKey(nodeId: string): string | null {
+    const node = deps.store.getNode(nodeId);
+    if (!node) return null;
+    const project = deps.store.getProject(node.projectId);
+    if (!project) return null;
+    return path.resolve(project.root);
+  }
+
   app.post("/api/nodes/:id/preflight", async (req: Request, res: Response) => {
     const id = decodeId(req.params.id);
     try {
-      const preflight = await deps.restoreEngine.preflight(id);
+      const key = restoreSerializerKey(id);
+      const preflight = key
+        ? await runSerialized(key, () => deps.restoreEngine.preflight(id))
+        : await deps.restoreEngine.preflight(id);
       res.json(preflight);
     } catch (err) {
       handleRestoreError(err, id, res);
@@ -292,7 +330,10 @@ export function createApp(deps: ServerDeps): Express {
   app.post("/api/nodes/:id/restore", async (req: Request, res: Response) => {
     const id = decodeId(req.params.id);
     try {
-      const result = await deps.restoreEngine.restore(id);
+      const key = restoreSerializerKey(id);
+      const result = key
+        ? await runSerialized(key, () => deps.restoreEngine.restore(id))
+        : await deps.restoreEngine.restore(id);
       res.json(result);
     } catch (err) {
       handleRestoreError(err, id, res);
@@ -400,9 +441,21 @@ export function createApp(deps: ServerDeps): Express {
     }
   });
 
-  app.post("/api/hooks/opencode", (req: Request, res: Response) => {
-    console.log("[sojourn] received opencode hook:", JSON.stringify(req.body ?? {}));
+  app.post("/api/hooks/opencode", async (req: Request, res: Response) => {
+    const body = req.body ?? {};
+    const sessionId = typeof body.sessionId === "string" ? body.sessionId : undefined;
+
+    // Respond immediately — the rescan is fire-and-forget and must never
+    // block or fail the hook caller (capture never blocks the session).
     res.json({ ok: true });
+
+    if (sessionId && deps.rescanOpenCodeSession) {
+      try {
+        await deps.rescanOpenCodeSession(sessionId);
+      } catch (err) {
+        console.error("[sojourn] hooks/opencode: rescan failed:", err);
+      }
+    }
   });
 
   const webDist = resolveWebDist();

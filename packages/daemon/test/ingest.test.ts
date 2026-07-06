@@ -194,61 +194,125 @@ describe("ingestBatch", () => {
     expect(stored.snapshotRef).toBeNull();
   });
 
-  it("runs T1 checks on new assistant nodes and stores flags (edit claim with no diff)", async () => {
-    await fsp.writeFile(path.join(projectRoot, "a.txt"), "hello");
-
-    // Seed a prior assistant node with its own snapshot so the flagged
-    // node's parentTree resolves to a real (non-null) tree — the T1 checks
-    // that need ground truth (edit_claim_mismatch, file_ref_missing,
-    // symbol_not_found) all stay silent when parentTree/nodeTree is null.
-    const priorNode: ChronoNode = {
-      id: "claude:prior",
-      parentId: null,
-      kind: "assistant",
+  /** Builds a bare ChronoNode for hand-rolled batches in these tests. */
+  function node(
+    id: string,
+    parentId: string | null,
+    kind: ChronoNode["kind"],
+    sessionId: string,
+    timestamp: string,
+    content: unknown,
+  ): ChronoNode {
+    return {
+      id: `claude:${id}`,
+      parentId: parentId === null ? null : `claude:${parentId}`,
+      kind,
       cli: "claude",
-      sessionId: "s-flag",
+      sessionId,
       projectId: "",
-      timestamp: "2026-01-01T00:00:00.000Z",
+      timestamp,
       snapshotRef: null,
       label: null,
       summary: "",
-      content: { type: "text", text: "Sure, I'll look into it." },
-      meta: { nativeUuid: "prior" },
+      content,
+      meta: { nativeUuid: id },
     };
-    const firstBatch: IngestBatch = {
-      project: { root: projectRoot, name: "test" },
-      session: { id: "s-flag", cli: "claude" },
-      nodes: [priorNode],
-    };
+  }
+
+  it("runs T1 checks on new assistant nodes and stores flags (untruthful edit claim, empty turn diff)", async () => {
+    await fsp.writeFile(path.join(projectRoot, "a.txt"), "hello");
     const deps = makeDeps();
-    await ingestBatch(deps, firstBatch);
+    const sess = "s-flag";
+
+    // Turn 1: prompt + assistant reply — the assistant node anchors snapshot
+    // S1, which becomes the "turn base" for the NEXT turn's claims.
+    const prompt1 = node("p1", null, "prompt", sess, "2026-01-01T00:00:00.000Z", "please fix auth");
+    const prior = node("prior", "p1", "assistant", sess, "2026-01-01T00:00:01.000Z", {
+      type: "text",
+      text: "Sure, I'll look into it.",
+    });
+    await ingestBatch(deps, {
+      project: { root: projectRoot, name: "test" },
+      session: { id: sess, cli: "claude" },
+      nodes: [prompt1, prior],
+    });
     expect(store.getNode("claude:prior")!.snapshotRef).not.toBeNull();
 
-    const node: ChronoNode = {
-      id: "claude:flagme",
-      parentId: "claude:prior",
-      kind: "assistant",
-      cli: "claude",
-      sessionId: "s-flag",
-      projectId: "",
-      timestamp: "2026-01-01T00:00:01.000Z",
-      snapshotRef: null,
-      label: null,
-      summary: "",
-      content: { type: "text", text: "I updated `auth.py` to handle refresh tokens." },
-      meta: { nativeUuid: "flagme" },
-    };
-
-    const secondBatch: IngestBatch = {
+    // Turn 2: a new prompt then an assistant claim — but NOTHING on disk
+    // changed anywhere in this turn, so the claim is untruthful and must
+    // flag (true positive: claim with no edit anywhere in the turn).
+    const prompt2 = node("p2", "prior", "prompt", sess, "2026-01-01T00:00:02.000Z", "and refresh tokens?");
+    const claim = node("flagme", "p2", "assistant", sess, "2026-01-01T00:00:03.000Z", {
+      type: "text",
+      text: "I updated `auth.py` to handle refresh tokens.",
+    });
+    await ingestBatch(deps, {
       project: { root: projectRoot, name: "test" },
-      session: { id: "s-flag", cli: "claude" },
-      nodes: [priorNode, node],
-    };
-    await ingestBatch(deps, secondBatch);
+      session: { id: sess, cli: "claude" },
+      nodes: [prompt1, prior, prompt2, claim],
+    });
 
     const stored = store.getNode("claude:flagme")!;
     expect(stored.flags && stored.flags.length).toBeGreaterThan(0);
     expect(stored.flags?.some((f) => f.kind === "edit_claim_mismatch")).toBe(true);
+  });
+
+  it("does NOT flag a truthful edit claim that arrives in a later batch than the edit (turn-scoped grounding)", async () => {
+    await fsp.writeFile(path.join(projectRoot, "a.txt"), "hello");
+    const deps = makeDeps();
+    const sess = "s-truthful";
+
+    // Turn 1 (setup): prompt + assistant reply anchors snapshot S1 — the
+    // state BEFORE the interesting turn.
+    const prompt1 = node("t-p1", null, "prompt", sess, "2026-01-01T00:00:00.000Z", "hi");
+    const prior = node("t-prior", "t-p1", "assistant", sess, "2026-01-01T00:00:01.000Z", {
+      type: "text",
+      text: "Hello! What should I do?",
+    });
+    await ingestBatch(deps, {
+      project: { root: projectRoot, name: "test" },
+      session: { id: sess, cli: "claude" },
+      nodes: [prompt1, prior],
+    });
+
+    // The REAL edit happens during turn 2, before the Edit tool_result's
+    // batch is ingested.
+    await fsp.writeFile(path.join(projectRoot, "auth.py"), "def refresh(): pass\n");
+
+    // Batch A (debounced watcher batch #1): prompt + tool_use + tool_result.
+    // The tool_result anchors snapshot S2 (which contains auth.py).
+    const prompt2 = node("t-p2", "t-prior", "prompt", sess, "2026-01-01T00:00:02.000Z", "fix auth.py");
+    const toolUse = node("t-tu", "t-p2", "tool_use", sess, "2026-01-01T00:00:03.000Z", {
+      name: "Edit",
+      input: { file_path: "auth.py" },
+    });
+    const toolResult = node("t-tr", "t-tu", "tool_result", sess, "2026-01-01T00:00:04.000Z", {
+      content: "ok",
+    });
+    await ingestBatch(deps, {
+      project: { root: projectRoot, name: "test" },
+      session: { id: sess, cli: "claude" },
+      nodes: [prompt1, prior, prompt2, toolUse, toolResult],
+    });
+    expect(store.getNode("claude:t-tr")!.snapshotRef).not.toBeNull();
+
+    // Batch B (debounced watcher batch #2, ~300ms later): the assistant's
+    // TRUTHFUL claim. No files changed since batch A, so a naive
+    // previous-snapshot diff would be empty — but the turn-scoped diff
+    // (from the snapshot before this turn's prompt) contains auth.py.
+    const claim = node("t-claim", "t-tr", "assistant", sess, "2026-01-01T00:00:05.000Z", {
+      type: "text",
+      text: "I updated `auth.py` to handle refresh tokens.",
+    });
+    await ingestBatch(deps, {
+      project: { root: projectRoot, name: "test" },
+      session: { id: sess, cli: "claude" },
+      nodes: [prompt1, prior, prompt2, toolUse, toolResult, claim],
+    });
+
+    const stored = store.getNode("claude:t-claim")!;
+    const editClaimFlags = (stored.flags ?? []).filter((f) => f.kind === "edit_claim_mismatch");
+    expect(editClaimFlags).toEqual([]);
   });
 
   it("emits node_added for each new node and project_updated once", async () => {

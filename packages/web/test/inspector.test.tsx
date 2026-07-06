@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { Inspector } from "../src/components/Inspector";
 import { api } from "../src/api";
-import type { Annotation, ChronoNode, RestorePreflight } from "../src/types";
+import type { Annotation, ChronoNode, RestorePreflight, StoredFlag } from "../src/types";
 
 afterEach(() => {
   cleanup();
@@ -55,7 +55,7 @@ describe("Inspector / RestoreFlow node-switch safety", () => {
     );
 
     // Open the preflight modal for node A.
-    fireEvent.click(screen.getByRole("button", { name: /restore to just before this/i }));
+    fireEvent.click(screen.getByRole("button", { name: /restore at this node/i }));
     await waitFor(() => expect(screen.getByRole("dialog")).toBeTruthy());
     expect(preflightSpy).toHaveBeenCalledWith("claude:a");
     expect(screen.getByText("warning for claude:a")).toBeTruthy();
@@ -65,11 +65,11 @@ describe("Inspector / RestoreFlow node-switch safety", () => {
     rerender(<Inspector node={nodeB} onFlagDismissed={() => {}} onAnnotationAdded={() => {}} />);
 
     expect(screen.queryByRole("dialog")).toBeNull();
-    expect(screen.getByRole("button", { name: /restore to just before this/i })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /restore at this node/i })).toBeTruthy();
 
     // Confirming now must never be possible without a fresh preflight, and
     // if a fresh preflight is started it must be scoped to node B, never A.
-    fireEvent.click(screen.getByRole("button", { name: /restore to just before this/i }));
+    fireEvent.click(screen.getByRole("button", { name: /restore at this node/i }));
     await waitFor(() => expect(screen.getByRole("dialog")).toBeTruthy());
     expect(preflightSpy).toHaveBeenCalledWith("claude:b");
     expect(screen.getByText("warning for claude:b")).toBeTruthy();
@@ -92,7 +92,7 @@ describe("Inspector / RestoreFlow node-switch safety", () => {
 
     render(<Inspector node={node} onFlagDismissed={() => {}} onAnnotationAdded={() => {}} />);
 
-    fireEvent.click(screen.getByRole("button", { name: /restore to just before this/i }));
+    fireEvent.click(screen.getByRole("button", { name: /restore at this node/i }));
     await waitFor(() => expect(screen.getByRole("dialog")).toBeTruthy());
 
     fireEvent.click(screen.getByRole("button", { name: /confirm restore/i }));
@@ -148,5 +148,138 @@ describe("Inspector / Annotations section", () => {
     expect(addButton).toHaveProperty("disabled", true);
     fireEvent.click(addButton);
     expect(addSpy).not.toHaveBeenCalled();
+  });
+});
+
+function makeStoredFlag(overrides: Partial<StoredFlag> = {}): StoredFlag {
+  return {
+    id: 1,
+    nodeId: "claude:f1",
+    kind: "edit_claim_mismatch",
+    tier: "verified",
+    confidence: "high",
+    evidence: "claimed edit to `auth.py`; snapshot diff shows no change to that file",
+    source: "deterministic",
+    dismissed: false,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
+describe("Inspector / advisory critic button", () => {
+  it("runs the T2 critic via api.runFlags and renders the returned advisory flag", async () => {
+    const node = makeNode("claude:critic1", { kind: "assistant" });
+    const advisory = makeStoredFlag({
+      id: 7,
+      nodeId: "claude:critic1",
+      kind: "unstated_assumption",
+      tier: "advisory",
+      confidence: "medium",
+      evidence: "Assumed: the default branch is main",
+      source: "llm_critic",
+    });
+    const runSpy = vi.spyOn(api, "runFlags").mockResolvedValue({ flags: [advisory] });
+    const onFlagsUpdated = vi.fn();
+
+    render(
+      <Inspector
+        node={node}
+        onFlagDismissed={() => {}}
+        onAnnotationAdded={() => {}}
+        onFlagsUpdated={onFlagsUpdated}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /run advisory critic/i }));
+
+    await waitFor(() => expect(runSpy).toHaveBeenCalledWith("claude:critic1", "T2"));
+    // The FULL flag list returned by the daemon is handed to the parent
+    // (replace semantics), which owns node.flags.
+    await waitFor(() =>
+      expect(onFlagsUpdated).toHaveBeenCalledWith("claude:critic1", [advisory]),
+    );
+  });
+
+  it("renders advisory styling for advisory flags and shows the daemon error cleanly on failure", async () => {
+    const advisory = makeStoredFlag({
+      id: 8,
+      kind: "unstated_assumption",
+      tier: "advisory",
+      confidence: "low",
+      evidence: "Assumed: tests cover the edge cases",
+      source: "llm_critic",
+    });
+    const node = makeNode("claude:critic2", { kind: "assistant", flags: [advisory] });
+    vi.spyOn(api, "runFlags").mockRejectedValue(new Error("T2 requires ANTHROPIC_API_KEY"));
+
+    const { container } = render(
+      <Inspector node={node} onFlagDismissed={() => {}} onAnnotationAdded={() => {}} />,
+    );
+
+    // Advisory flag renders with the advisory (never verified) row class.
+    expect(container.querySelector(".flag-row-advisory")).toBeTruthy();
+    expect(container.querySelector(".flag-row-advisory.flag-row-verified")).toBeNull();
+    expect(screen.getByText("Advisory")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: /run advisory critic/i }));
+    await waitFor(() =>
+      expect(screen.getByText("T2 requires ANTHROPIC_API_KEY")).toBeTruthy(),
+    );
+  });
+});
+
+describe("Inspector / auto-resolved flags", () => {
+  it("renders auto-resolved flags in a resolved state, labeled and excluded from the active count", () => {
+    const active = makeStoredFlag({ id: 1, evidence: "claimed edit to `a.ts`; no change" });
+    const resolved = makeStoredFlag({
+      id: 2,
+      evidence: "claimed edit to `b.ts`; no change",
+      autoResolved: true,
+    });
+    const node = makeNode("claude:res1", { kind: "assistant", flags: [active, resolved] });
+
+    render(<Inspector node={node} onFlagDismissed={() => {}} onAnnotationAdded={() => {}} />);
+
+    // Active count excludes the resolved flag.
+    expect(screen.getByText("Flags (1)")).toBeTruthy();
+    // Resolved flag renders, visually distinct and labeled.
+    const resolvedRow = screen.getByTestId("flag-row-resolved");
+    expect(resolvedRow.className).toMatch(/flag-row-resolved/);
+    expect(screen.getByText("auto-resolved")).toBeTruthy();
+  });
+});
+
+describe("Inspector / flag-context restore targets the parent", () => {
+  it("'Restore to before this node' preflights the PARENT node id", async () => {
+    const flagged = makeNode("claude:child", {
+      kind: "assistant",
+      parentId: "claude:parent",
+      flags: [makeStoredFlag({ nodeId: "claude:child" })],
+    });
+    const preflightSpy = vi
+      .spyOn(api, "preflight")
+      .mockImplementation(async (nodeId: string) => makePreflight(nodeId));
+
+    render(<Inspector node={flagged} onFlagDismissed={() => {}} onAnnotationAdded={() => {}} />);
+
+    fireEvent.click(screen.getByRole("button", { name: /restore to before this node/i }));
+    await waitFor(() => expect(preflightSpy).toHaveBeenCalledWith("claude:parent"));
+    expect(preflightSpy).not.toHaveBeenCalledWith("claude:child");
+  });
+
+  it("falls back to the node itself when parentId is null", async () => {
+    const flagged = makeNode("claude:root", {
+      kind: "assistant",
+      parentId: null,
+      flags: [makeStoredFlag({ nodeId: "claude:root" })],
+    });
+    const preflightSpy = vi
+      .spyOn(api, "preflight")
+      .mockImplementation(async (nodeId: string) => makePreflight(nodeId));
+
+    render(<Inspector node={flagged} onFlagDismissed={() => {}} onAnnotationAdded={() => {}} />);
+
+    fireEvent.click(screen.getByRole("button", { name: /restore to before this node/i }));
+    await waitFor(() => expect(preflightSpy).toHaveBeenCalledWith("claude:root"));
   });
 });

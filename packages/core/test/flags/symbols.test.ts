@@ -106,6 +106,29 @@ describe("symbolsCheck.run — true negatives (precision)", () => {
     expect(flags).toHaveLength(0);
   });
 
+  it("does not flag a dotted mention (`A.b()`) when the file defines the final segment without the dotted form", async () => {
+    const node = makeNode({
+      content: "I call `parser.tokenize()` in `src/lexer.ts` before scanning.",
+    });
+    // The file defines `tokenize` as a method — the full dotted form
+    // "parser.tokenize" never appears verbatim.
+    const files = { "src/lexer.ts": "export class Parser { tokenize() { return []; } }\n" };
+    const ctx = makeCtx({ node, files });
+    const flags = await symbolsCheck.run(ctx);
+    expect(flags).toHaveLength(0);
+  });
+
+  it("still flags a dotted mention when neither the dotted form nor its final segment appears", async () => {
+    const node = makeNode({
+      content: "I call `parser.tokenize()` in `src/lexer.ts` before scanning.",
+    });
+    const files = { "src/lexer.ts": "export class Parser { scan() { return []; } }\n" };
+    const ctx = makeCtx({ node, files });
+    const flags = await symbolsCheck.run(ctx);
+    expect(flags).toHaveLength(1);
+    expect(flags[0].kind).toBe("symbol_not_found");
+  });
+
   it("does not flag when there is no co-referenced file in the same sentence", async () => {
     const node = makeNode({
       content: "The function `computeTotal()` handles the aggregation logic nicely.",

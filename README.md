@@ -23,7 +23,7 @@ The pull-based watcher is the source of truth; the plugin in `plugins/claude/` j
 
 ### OpenCode
 
-`packages/adapter-opencode` speaks OpenCode's local server API (sessions, messages, revert/fork, `/event` SSE) and `plugins/opencode/sojourn.ts` forwards session events to the daemon. **This adapter was written against OpenCode's documented API and is not yet live-integration-tested** — every module carries that header, and it fails soft everywhere.
+`packages/adapter-opencode` speaks OpenCode's local server API (sessions, messages, revert/fork, `/event` SSE) and `plugins/opencode/sojourn.ts` forwards session events to the daemon, whose `POST /api/hooks/opencode` route pulls that session's messages and ingests them (fail-soft when no OpenCode server is running). Set `SOJOURN_OPENCODE=1` to additionally have the daemon subscribe to OpenCode's `/event` SSE stream directly — off by default, since most environments run no OpenCode server. **This adapter was written against OpenCode's documented API and is not yet live-integration-tested** — every module carries that header, and it fails soft everywhere.
 
 ## The CLI
 
@@ -31,7 +31,8 @@ The pull-based watcher is the source of truth; the plugin in `plugins/claude/` j
 soj start | stop | status      # daemon lifecycle
 soj open                       # open the web UI
 soj projects                   # captured projects
-soj flags [--project <id>]     # active confidence flags with evidence
+soj flags [--project <id>] [--all]   # active confidence flags with evidence (--all includes auto-resolved)
+soj critic <nodeId>            # run the Tier-2 advisory critic on a node (needs ANTHROPIC_API_KEY on the daemon)
 soj mark <label> [--kind decision|assumption|checkpoint]
 soj checkpoint <name>
 soj restore <nodeId> [--yes]   # without --yes: preflight + warnings only
@@ -57,7 +58,7 @@ Verified flags auto-resolve when a later node fixes the issue. They are tuned fo
 
 Every node checkout: **safety-snapshot your current state → validate the target snapshot exists → restore into a NEW git worktree under `~/.sojourn/worktrees/` → hand you the native resume command** (`claude --resume <session> --fork-session`). Your working tree and your `.git` are never touched; snapshots live in a shadow git repo per project under `~/.sojourn/snapshots/`.
 
-Sojourn restores *conversation* + *whole-tree file state*. It **cannot** undo Bash side effects (`rm`, `mv`), DB migrations, network calls, or `git push` — the preflight panel warns you every time.
+Sojourn restores *conversation* + *whole-tree file state*. It **cannot** undo Bash side effects (`rm`, `mv`), DB migrations, network calls, or `git push` — the preflight panel warns you every time. One caveat on the conversation side: the native CLIs can only fork a resumed conversation from the session's current tip (e.g. `claude --resume … --fork-session`), so the resumed *conversation* continues from where the session left off, while the *filesystem* in the new worktree is restored exactly to the node you chose.
 
 ## Architecture
 

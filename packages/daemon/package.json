@@ -4,10 +4,13 @@
   "version": "0.1.0",
   "type": "module",
   "main": "./dist/wire.js",
-  "bin": { "sojourn-daemon": "./dist/main.js" },
+  "bin": {
+    "sojourn-daemon": "./dist/main.js"
+  },
   "dependencies": {
-    "@sojourn/core": "*",
     "@sojourn/adapter-claude": "*",
+    "@sojourn/adapter-opencode": "*",
+    "@sojourn/core": "*",
     "chokidar": "^4.0.0",
     "express": "^4.21.0",
     "ws": "^8.18.0"

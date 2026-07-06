@@ -131,6 +131,13 @@ function isRelativeImport(specifier: string): boolean {
   return specifier.startsWith(".") || specifier.startsWith("/");
 }
 
+/** Path aliases / subpath imports that never name a registry package:
+ * `@/…` (bundler/tsconfig alias), `~/…` (alias convention), and `#…`
+ * (Node subpath imports, resolved via package.json "imports"). */
+function isAliasedImport(specifier: string): boolean {
+  return specifier.startsWith("@/") || specifier.startsWith("~/") || specifier.startsWith("#");
+}
+
 function isNodeBuiltin(name: string): boolean {
   if (name.startsWith("node:")) return true;
   return NODE_BUILTINS.has(name);
@@ -204,6 +211,36 @@ async function nearestPackageJsonDeps(
   return deps;
 }
 
+/**
+ * True when Python module `m` resolves to a LOCAL module in the snapshot
+ * tree — an `m.py` file or an `m/` package directory, either at the tree
+ * root or next to the importing file. Local modules must never be looked up
+ * on PyPI (a 404 there would be a guaranteed false package_hallucination).
+ */
+async function isLocalPyModule(
+  snapshotter: NonNullable<CheckContext["snapshotter"]>,
+  nodeTree: string,
+  moduleName: string,
+  importingFile: string,
+  cache: { files: string[] | null },
+): Promise<boolean> {
+  if (cache.files === null) {
+    try {
+      cache.files = await snapshotter.listFiles(nodeTree);
+    } catch {
+      cache.files = [];
+    }
+  }
+  const roots = new Set<string>(["."]);
+  roots.add(path.posix.dirname(importingFile));
+  for (const root of roots) {
+    const filePath = root === "." ? `${moduleName}.py` : path.posix.join(root, `${moduleName}.py`);
+    const dirPrefix = root === "." ? `${moduleName}/` : path.posix.join(root, moduleName) + "/";
+    if (cache.files.some((f) => f === filePath || f.startsWith(dirPrefix))) return true;
+  }
+  return false;
+}
+
 function existsInNodeModules(projectRoot: string, name: string): boolean {
   try {
     return fs.existsSync(path.join(projectRoot, "node_modules", name));
@@ -240,6 +277,9 @@ export const packagesCheck: FlagCheck = {
 
     const candidatesByName = new Map<string, Candidate>();
     const depsCache = new Map<string, Set<string>>();
+    // Lazily-loaded full file list of nodeTree, shared across all Python
+    // local-module checks in this run.
+    const treeFilesCache: { files: string[] | null } = { files: null };
 
     for (const fileChange of relevantFiles) {
       const content = await ctx.snapshotter.readFile(ctx.nodeTree, fileChange.path);
@@ -262,9 +302,17 @@ export const packagesCheck: FlagCheck = {
           if (isRelativeImport(raw)) continue;
           const top = pyTopLevelModule(raw);
           if (PYTHON_STDLIB.has(top)) continue;
+          // Local module in the same tree (a `m/` package dir or an `m.py`
+          // file, at the tree root or next to the importing file): never a
+          // PyPI package — skip before any registry lookup.
+          if (
+            await isLocalPyModule(ctx.snapshotter, ctx.nodeTree, top, fileChange.path, treeFilesCache)
+          )
+            continue;
           if (!candidatesByName.has(`py:${top}`)) candidatesByName.set(`py:${top}`, { name: top, lang: "py" });
         } else {
           if (isRelativeImport(raw)) continue;
+          if (isAliasedImport(raw)) continue;
           const bare = toBarePackageName(raw);
           if (isNodeBuiltin(bare)) continue;
           if (deps.has(bare)) continue;

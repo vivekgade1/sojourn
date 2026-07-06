@@ -119,6 +119,14 @@ export const symbolsCheck: FlagCheck = {
         if (seen.has(key)) continue;
         seen.add(key);
         if (content.includes(mention.name)) continue;
+        // Dotted mention (`A.b()` / method `obj.name`): the file rarely
+        // spells the full dotted form (it defines `b() { ... }` on A), so
+        // when the full form is absent, match the FINAL segment before
+        // flagging — precision over recall.
+        if (mention.name.includes(".")) {
+          const finalSegment = mention.name.split(".").pop() ?? "";
+          if (finalSegment.length > 0 && content.includes(finalSegment)) continue;
+        }
         flags.push({
           kind: "symbol_not_found",
           tier: "verified",

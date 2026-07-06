@@ -208,6 +208,78 @@ describe("soj CLI", () => {
       expect(text).not.toContain("test_claim_unverified");
     });
 
+    it("hides auto-resolved flags by default and shows them annotated with --all", async () => {
+      const cwd = "/repo/current";
+      const projectId = projectIdFor(cwd);
+      stub.on("GET", `/api/projects/${projectId}/graph`, () => ({
+        status: 200,
+        body: {
+          project: { id: projectId, root: cwd, name: "Current", createdAt: "2026-01-01T00:00:00.000Z" },
+          sessions: [],
+          nodes: [
+            {
+              id: "claude:node-2",
+              parentId: null,
+              kind: "assistant",
+              cli: "claude",
+              sessionId: "s1",
+              projectId,
+              timestamp: "2026-01-01T00:00:00.000Z",
+              snapshotRef: null,
+              label: null,
+              summary: "did a thing",
+              content: {},
+              meta: { nativeUuid: "node-2" },
+              flags: [
+                {
+                  id: 10,
+                  nodeId: "claude:node-2",
+                  kind: "edit_claim_mismatch",
+                  tier: "verified",
+                  confidence: "high",
+                  evidence: "still active claim",
+                  source: "deterministic",
+                  autoResolved: false,
+                  dismissed: false,
+                  createdAt: "2026-01-01T00:00:00.000Z",
+                },
+                {
+                  id: 11,
+                  nodeId: "claude:node-2",
+                  kind: "symbol_not_found",
+                  tier: "verified",
+                  confidence: "high",
+                  evidence: "since-fixed claim",
+                  source: "deterministic",
+                  autoResolved: true,
+                  dismissed: false,
+                  createdAt: "2026-01-01T00:00:00.000Z",
+                },
+              ],
+            },
+          ],
+        },
+      }));
+
+      const { deps, out } = makeDeps({ baseUrl: stub.baseUrl, sojournHome: home, cwd });
+      const program = buildProgram(deps);
+      await run(program, ["flags"]);
+
+      const defaultText = out.join("\n");
+      expect(defaultText).toContain("still active claim");
+      // auto-resolved flag hidden by default
+      expect(defaultText).not.toContain("since-fixed claim");
+      expect(defaultText).not.toContain("auto-resolved");
+
+      out.length = 0;
+      const program2 = buildProgram(deps);
+      await run(program2, ["flags", "--all"]);
+      const allText = out.join("\n");
+      expect(allText).toContain("still active claim");
+      expect(allText).toContain("since-fixed claim");
+      expect(allText).toContain("symbol_not_found (auto-resolved)");
+    });
+
     it("respects an explicit --project flag over cwd", async () => {
       stub.on("GET", "/api/projects/explicit-id/graph", () => ({
         status: 200,
@@ -218,6 +290,72 @@ describe("soj CLI", () => {
       await run(program, ["flags", "--project", "explicit-id"]);
       expect(stub.requests[0]?.url).toBe("/api/projects/explicit-id/graph");
       expect(out.join("\n")).toContain("no active flags");
+    });
+  });
+
+  describe("critic", () => {
+    it("POSTs flags/run with tier T2 and prints the advisory flags", async () => {
+      stub.on("POST", "/api/nodes/claude%3Anode-1/flags/run", () => ({
+        status: 200,
+        body: {
+          flags: [
+            {
+              id: 5,
+              nodeId: "claude:node-1",
+              kind: "unstated_assumption",
+              tier: "advisory",
+              confidence: "medium",
+              evidence: "Assumed: the default branch is main",
+              source: "llm_critic",
+              autoResolved: false,
+              dismissed: false,
+              createdAt: "2026-01-01T00:00:00.000Z",
+            },
+            {
+              id: 6,
+              nodeId: "claude:node-1",
+              kind: "edit_claim_mismatch",
+              tier: "verified",
+              confidence: "high",
+              evidence: "verified flag must not be listed by critic output filter? it is not advisory",
+              source: "deterministic",
+              autoResolved: false,
+              dismissed: false,
+              createdAt: "2026-01-01T00:00:00.000Z",
+            },
+          ],
+        },
+      }));
+
+      const { deps, out, exitCodes } = makeDeps({ baseUrl: stub.baseUrl, sojournHome: home });
+      const program = buildProgram(deps);
+      await run(program, ["critic", "claude:node-1"]);
+
+      const req = stub.requests.find((r) => r.url === "/api/nodes/claude%3Anode-1/flags/run");
+      expect(req?.method).toBe("POST");
+      expect(req?.body).toEqual({ tier: "T2" });
+
+      const text = out.join("\n");
+      expect(text).toContain("unstated_assumption");
+      expect(text).toContain("advisory");
+      expect(text).toContain("Assumed: the default branch is main");
+      // only advisory flags are printed by `soj critic`
+      expect(text).not.toContain("edit_claim_mismatch");
+      expect(exitCodes).toEqual([]);
+    });
+
+    it("prints the daemon's error cleanly (e.g. missing ANTHROPIC_API_KEY) and exits 1", async () => {
+      stub.on("POST", "/api/nodes/claude%3Anode-1/flags/run", () => ({
+        status: 400,
+        body: { error: "T2 requires ANTHROPIC_API_KEY" },
+      }));
+
+      const { deps, err, exitCodes } = makeDeps({ baseUrl: stub.baseUrl, sojournHome: home });
+      const program = buildProgram(deps);
+      await run(program, ["critic", "claude:node-1"]);
+
+      expect(err.join("\n")).toContain("T2 requires ANTHROPIC_API_KEY");
+      expect(exitCodes).toEqual([1]);
     });
   });
 
