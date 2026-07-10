@@ -16,7 +16,6 @@ import { runCritic, SojournRestoreError } from "@sojourn/core";
 import { resolveTurnBaseTree, type EventsSink } from "./ingest.js";
 import type { FetchJson } from "@sojourn/core";
 import { anthropicCritic } from "./critic.js";
-import { runSerialized } from "./serialize.js";
 
 export interface ServerDeps {
   store: GraphStore;
@@ -298,30 +297,15 @@ export function createApp(deps: ServerDeps): Express {
     }
   });
 
-  /**
-   * Serializer key for restore-related work on a node: the node's project
-   * root (resolved), i.e. the SAME key ingestion uses. Restore/preflight
-   * touch the project's single ShadowSnapshotter (safety snapshot, tree
-   * checks), so they must never overlap an in-flight ingest snapshot for
-   * that project. Null when the node/project is unknown — the engine will
-   * throw its own typed not_found in that case, no serialization needed.
-   */
-  function restoreSerializerKey(nodeId: string): string | null {
-    const node = deps.store.getNode(nodeId);
-    if (!node) return null;
-    const project = deps.store.getProject(node.projectId);
-    if (!project) return null;
-    return path.resolve(project.root);
-  }
-
+  // Deliberately NOT serialized with the ingest chain: preflight is
+  // read-only, and restore's safety snapshot uses the snapshotter's private
+  // temp-index path (snapshotSafety, own ref) — so an explicit user action
+  // never queues behind minutes of capture work, and still can't race the
+  // shared ingest index or refs/sojourn/head.
   app.post("/api/nodes/:id/preflight", async (req: Request, res: Response) => {
     const id = decodeId(req.params.id);
     try {
-      const key = restoreSerializerKey(id);
-      const preflight = key
-        ? await runSerialized(key, () => deps.restoreEngine.preflight(id))
-        : await deps.restoreEngine.preflight(id);
-      res.json(preflight);
+      res.json(await deps.restoreEngine.preflight(id));
     } catch (err) {
       handleRestoreError(err, id, res);
     }
@@ -330,11 +314,7 @@ export function createApp(deps: ServerDeps): Express {
   app.post("/api/nodes/:id/restore", async (req: Request, res: Response) => {
     const id = decodeId(req.params.id);
     try {
-      const key = restoreSerializerKey(id);
-      const result = key
-        ? await runSerialized(key, () => deps.restoreEngine.restore(id))
-        : await deps.restoreEngine.restore(id);
-      res.json(result);
+      res.json(await deps.restoreEngine.restore(id));
     } catch (err) {
       handleRestoreError(err, id, res);
     }

@@ -6,6 +6,7 @@ import type { SnapshotterLike } from "../interfaces.js";
 import { runGit, type ShadowGitEnv } from "./git.js";
 
 const SOJOURN_HEAD_REF = "refs/sojourn/head";
+const SOJOURN_SAFETY_REF = "refs/sojourn/safety";
 
 // git's canonical empty tree hash — the well-known SHA-1 of `git hash-object
 // -t tree /dev/null`. Used as the "before" side when diffing a null base
@@ -90,6 +91,42 @@ export class ShadowSnapshotter implements SnapshotterLike {
     await runGit(["update-ref", SOJOURN_HEAD_REF, commit], this.env);
 
     return tree;
+  }
+
+  /**
+   * Concurrency-safe sibling of snapshot(): captures the working tree using
+   * a PRIVATE temp index and records the commit on refs/sojourn/safety —
+   * never the shared ingest index or refs/sojourn/head. Restore's safety
+   * snapshot uses this so it can run while capture is mid-snapshot.
+   * (Git object-database writes are concurrency-safe; the only shared
+   * mutable state in snapshot() is the index file and the head ref, and
+   * this method touches neither.)
+   */
+  async snapshotSafety(): Promise<string> {
+    const tempIndexFile = path.join(
+      this.shadowDir,
+      `safety-index-${crypto.randomBytes(8).toString("hex")}`,
+    );
+    const safetyEnv = { ...this.env, GIT_INDEX_FILE: tempIndexFile };
+    try {
+      await runGit(["add", "-A"], safetyEnv);
+      const tree = (await runGit(["write-tree"], safetyEnv)).trim();
+
+      let prevSafety: string | null = null;
+      try {
+        prevSafety = (await runGit(["rev-parse", "--verify", SOJOURN_SAFETY_REF], safetyEnv)).trim();
+      } catch {
+        prevSafety = null;
+      }
+      const commitArgs = ["commit-tree", tree, "-m", "safety"];
+      if (prevSafety) commitArgs.push("-p", prevSafety);
+      const commit = (await runGit(commitArgs, safetyEnv)).trim();
+      await runGit(["update-ref", SOJOURN_SAFETY_REF, commit], safetyEnv);
+
+      return tree;
+    } finally {
+      await fs.rm(tempIndexFile, { force: true }).catch(() => {});
+    }
   }
 
   async hasTree(tree: string): Promise<boolean> {

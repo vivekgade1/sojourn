@@ -3,6 +3,14 @@ import type { ChronoNode, FileChange, Flag, FlagKind } from "./types.js";
 export interface SnapshotterLike {
   init(): Promise<void>;
   snapshot(): Promise<string>;
+  /**
+   * Like snapshot(), but safe to run CONCURRENTLY with snapshot(): uses a
+   * private temp index and its own ref (never the shared ingest index or
+   * refs/sojourn/head). The restore path uses this for its safety snapshot
+   * so an explicit user restore never queues behind capture work.
+   * Optional: callers fall back to snapshot() when absent.
+   */
+  snapshotSafety?(): Promise<string>;
   hasTree(tree: string): Promise<boolean>;
   diff(treeA: string | null, treeB: string): Promise<FileChange[]>;
   diffFile(treeA: string | null, treeB: string, path: string): Promise<string>;

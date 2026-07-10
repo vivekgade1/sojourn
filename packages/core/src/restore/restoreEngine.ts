@@ -185,7 +185,11 @@ export class RestoreEngine {
 
     // Safety snapshot of current working-dir state ALWAYS happens before
     // any checkout, so nothing dirty is ever lost.
-    const safetySnapshotRef = await snapshotter.snapshot();
+    // Prefer the concurrency-safe variant: a user restore must never wait on
+    // (or race) the capture pipeline's shared index / head ref.
+    const safetySnapshotRef = await (snapshotter.snapshotSafety
+      ? snapshotter.snapshotSafety()
+      : snapshotter.snapshot());
 
     const node8 = nodeId.replace(/[^a-zA-Z0-9]/g, "").slice(0, 8);
     const stamp = formatTimestamp(this.now());

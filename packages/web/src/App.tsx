@@ -79,12 +79,10 @@ export function App() {
           if (prev.some((n) => n.id === event.node.id)) return prev;
           return [...prev, event.node];
         });
-        setWsConnected(true);
       } else if (event.type === "flags_updated") {
         setNodes((prev) =>
           prev.map((n) => (n.id === event.nodeId ? { ...n, flags: event.flags } : n)),
         );
-        setWsConnected(true);
       } else if (event.type === "project_updated") {
         if (event.projectId === currentProjectId && currentProjectId) {
           api
@@ -92,9 +90,8 @@ export function App() {
             .then((res) => setNodes(res.nodes))
             .catch(() => {});
         }
-        setWsConnected(true);
       }
-    });
+    }, setWsConnected);
     return unsubscribe;
   }, []);
 

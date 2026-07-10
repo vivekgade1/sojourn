@@ -214,6 +214,30 @@ describe("ShadowSnapshotter", () => {
     }
   });
 
+  it("snapshotSafety() captures the same tree as snapshot(), touches neither the shared index chain nor refs/sojourn/head, and runs concurrently with snapshot()", async () => {
+    const fs = await import("node:fs/promises");
+    const path = await import("node:path");
+
+    await fs.writeFile(path.join(projectRoot, "s.txt"), "state-1");
+    const regular = await snapshotter.snapshot();
+
+    // Same working tree -> the safety snapshot must produce the SAME tree hash.
+    const safety = await snapshotter.snapshotSafety();
+    expect(safety).toBe(regular);
+    expect(await snapshotter.hasTree(safety)).toBe(true);
+
+    // Interleave: run a safety snapshot CONCURRENTLY with a regular snapshot
+    // after mutating the tree — both must succeed (no index.lock collision).
+    await fs.writeFile(path.join(projectRoot, "s.txt"), "state-2");
+    const [a, b] = await Promise.all([snapshotter.snapshot(), snapshotter.snapshotSafety()]);
+    expect(a).toBe(b); // identical working tree, identical tree hash
+    expect(await snapshotter.hasTree(a)).toBe(true);
+
+    // No stray safety temp index left behind.
+    const leftovers = (await fs.readdir(shadowDir)).filter((f) => f.startsWith("safety-index-"));
+    expect(leftovers).toEqual([]);
+  });
+
   it("restoreToWorktree() does not leave a stray temporary index file in shadowDir", async () => {
     await fsp.writeFile(path.join(projectRoot, "a.txt"), "content");
     const tree = await snapshotter.snapshot();

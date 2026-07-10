@@ -1,12 +1,15 @@
 import type { WsEvent } from "./types";
 
 export type WsListener = (event: WsEvent) => void;
+export type WsStatusListener = (connected: boolean) => void;
 
 /**
  * Opens a WebSocket to /ws (proxied to the daemon in dev) and reconnects with
- * backoff on close. Returns an unsubscribe function.
+ * backoff on close. `onStatus` reports the socket's actual OPEN/CLOSED state
+ * — an idle-but-open socket is connected; message arrival is irrelevant.
+ * Returns an unsubscribe function.
  */
-export function connectWs(onEvent: WsListener): () => void {
+export function connectWs(onEvent: WsListener, onStatus?: WsStatusListener): () => void {
   let socket: WebSocket | null = null;
   let closedByCaller = false;
   let retryDelay = 1000;
@@ -30,6 +33,7 @@ export function connectWs(onEvent: WsListener): () => void {
     });
 
     socket.addEventListener("close", () => {
+      onStatus?.(false);
       if (closedByCaller) return;
       retryTimer = setTimeout(() => {
         retryDelay = Math.min(retryDelay * 2, 15000);
@@ -39,6 +43,7 @@ export function connectWs(onEvent: WsListener): () => void {
 
     socket.addEventListener("open", () => {
       retryDelay = 1000;
+      onStatus?.(true);
     });
   }
 

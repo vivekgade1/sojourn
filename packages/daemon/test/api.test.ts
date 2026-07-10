@@ -16,6 +16,7 @@ import type { ChronoNode, FetchJson, IngestBatch, Project, SnapshotterLike } fro
 import { parseSessionJsonl } from "@sojourn/adapter-claude";
 import { createApp, type ServerDeps } from "../src/server.js";
 import { ingestBatch, type IngestDeps } from "../src/ingest.js";
+import { runSerialized } from "../src/serialize.js";
 import type { SojournEvent } from "../src/events.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -500,6 +501,54 @@ describe("daemon HTTP API", () => {
       expect(restore.status).toBe(200);
       expect(typeof restore.body.worktreePath).toBe("string");
       expect(fs.existsSync(restore.body.worktreePath)).toBe(true);
+    });
+
+    it("responds to preflight AND restore while the project's ingest chain is busy (user ops never queue behind capture)", async () => {
+      await fsp.writeFile(path.join(projectRoot, "a.txt"), "v1");
+      const node: ChronoNode = {
+        id: "claude:restore-busy",
+        parentId: null,
+        kind: "assistant",
+        cli: "claude",
+        sessionId: "s-busy",
+        projectId: "",
+        timestamp: "2026-01-01T00:00:00.000Z",
+        snapshotRef: null,
+        label: null,
+        summary: "",
+        content: { type: "text", text: "done" },
+        meta: { nativeUuid: "restore-busy" },
+      };
+      await ingestBatch(ingestDeps, {
+        project: { root: projectRoot, name: "test" },
+        session: { id: "s-busy", cli: "claude" },
+        nodes: [node],
+      });
+
+      // Occupy the project's ingest serializer chain with a long-running
+      // capture task — exactly what a big watcher re-scan does in prod.
+      const slow = { done: false };
+      const slowTask = runSerialized(path.resolve(projectRoot), async () => {
+        await new Promise((r) => setTimeout(r, 1500));
+        slow.done = true;
+      });
+
+      const pf = await request(app)
+        .post(`/api/nodes/${encodeURIComponent(node.id)}/preflight`)
+        .send();
+      expect(pf.status).toBe(200);
+      expect(pf.body.treeValid).toBe(true);
+      // The whole point: preflight answered while capture was still busy.
+      expect(slow.done).toBe(false);
+
+      const restore = await request(app)
+        .post(`/api/nodes/${encodeURIComponent(node.id)}/restore`)
+        .send();
+      expect(restore.status).toBe(200);
+      expect(fs.existsSync(restore.body.worktreePath)).toBe(true);
+      expect(slow.done).toBe(false);
+
+      await slowTask;
     });
 
     it("400s restore when the preflight tree is invalid", async () => {
