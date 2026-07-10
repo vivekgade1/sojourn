@@ -82,7 +82,9 @@ Node ids come from `soj flags` output or the web UI inspector. They contain a `:
 
 `soj open` → `http://localhost:4177` (served by the daemon from `packages/web/dist`).
 
-- **Graph view** — the session tree, laid out top-down. Nodes are color-coded by kind; Claude nodes have solid borders, OpenCode nodes dashed. The latest node of each session carries a "you are here" marker. Updates live over WebSocket while you work.
+- **Graph view** — the session tree as a left→right trail (d3 tidy tree): time flows left to right, parallel tool calls stack vertically in one column. Nodes are color-coded by kind (see the legend strip); Claude nodes have solid borders, OpenCode nodes dashed. The latest node of each session carries a "you are here" marker. Pan/zoom with the mouse (plus `+ − fit` controls); updates live over WebSocket while you work.
+- **The lit trail** — hover or select any node and its entire lineage back to the session root lights up in gold while everything else recedes: that glowing chain is literally "how the agent got here." The Inspector mirrors it as a clickable **Path** breadcrumb.
+- **Search** — the toolbar search box matches node gists, labels, kinds, tool names, and ids as you type; non-matches dim, a counter shows `n / total`, and Enter / Shift+Enter (or ‹ ›) cycles through matches, panning the viewport to each. Esc clears.
 - **Flag badges** — a **solid red badge with a count** means verified flags; a **muted amber outline badge** means advisory. They are deliberately impossible to confuse. Auto-resolved flags leave the badge counts.
 - **Toolbar** — project selector, **decision lens** (collapse the graph to decision/assumption/checkpoint *and flagged* nodes — the "how did we get here, and where did it guess?" view), and a flagged-only filter.
 - **Inspector** (click a node) — summary, raw payload, **on-demand file diff** for that node's step, annotations (add free-text notes), and every flag with its evidence. Dismiss buttons remember your dismissals. A **"Run advisory critic"** button triggers the T2 pass for that node.

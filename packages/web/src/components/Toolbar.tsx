@@ -9,6 +9,11 @@ export interface ToolbarProps {
   flaggedOnly: boolean;
   onToggleFlaggedOnly: () => void;
   wsConnected: boolean;
+  searchQuery: string;
+  onSearchQueryChange: (q: string) => void;
+  matchCount: number;
+  activeMatchIndex: number; // 0-based; -1 when none
+  onCycleMatch: (direction: 1 | -1) => void;
 }
 
 export function Toolbar({
@@ -20,10 +25,18 @@ export function Toolbar({
   flaggedOnly,
   onToggleFlaggedOnly,
   wsConnected,
+  searchQuery,
+  onSearchQueryChange,
+  matchCount,
+  activeMatchIndex,
+  onCycleMatch,
 }: ToolbarProps) {
+  const searching = searchQuery.trim().length > 0;
   return (
     <div className="toolbar" data-testid="toolbar">
-      <span className="toolbar-brand">Sojourn</span>
+      <span className="toolbar-brand">
+        Sojourn<span className="toolbar-brand-dot">.</span>
+      </span>
 
       <select
         aria-label="Project"
@@ -38,6 +51,34 @@ export function Toolbar({
         ))}
       </select>
 
+      <div className={`toolbar-search${searching ? " active" : ""}`}>
+        <input
+          type="search"
+          aria-label="Search nodes"
+          placeholder="Search nodes — gist, kind, tool, id…"
+          value={searchQuery}
+          onChange={(e) => onSearchQueryChange(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              onCycleMatch(e.shiftKey ? -1 : 1);
+            }
+            if (e.key === "Escape") onSearchQueryChange("");
+          }}
+        />
+        {searching && (
+          <span className="toolbar-search-count" data-testid="search-count">
+            {matchCount === 0 ? "0 matches" : `${activeMatchIndex + 1} / ${matchCount}`}
+          </span>
+        )}
+        {searching && matchCount > 0 && (
+          <span className="toolbar-search-nav">
+            <button aria-label="Previous match" onClick={() => onCycleMatch(-1)}>‹</button>
+            <button aria-label="Next match" onClick={() => onCycleMatch(1)}>›</button>
+          </span>
+        )}
+      </div>
+
       <label className={`toolbar-toggle${decisionLens ? " active" : ""}`}>
         <input type="checkbox" checked={decisionLens} onChange={onToggleDecisionLens} />
         Decision lens
@@ -48,7 +89,9 @@ export function Toolbar({
         Flagged only
       </label>
 
-      <span className="toolbar-status">{wsConnected ? "live" : "disconnected"}</span>
+      <span className={`toolbar-status${wsConnected ? " live" : ""}`}>
+        {wsConnected ? "live" : "disconnected"}
+      </span>
     </div>
   );
 }

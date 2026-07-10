@@ -1,13 +1,19 @@
-import { Handle, Position, type NodeProps } from "reactflow";
 import type { ChronoNode } from "../types";
 import { FlagBadge } from "./FlagBadge";
 
-export interface SojournNodeData {
+export interface SojournNodeProps {
   node: ChronoNode;
+  selected?: boolean;
   isHere?: boolean;
+  onTrail?: boolean;
+  /** Strong dim: active search and this node doesn't match. */
+  dimmed?: boolean;
+  /** Soft dim: a trail is lit and this node isn't on it. */
+  receded?: boolean;
+  searchHit?: boolean;
 }
 
-const KIND_LABEL: Record<ChronoNode["kind"], string> = {
+export const KIND_LABEL: Record<ChronoNode["kind"], string> = {
   prompt: "Prompt",
   assistant: "Assistant",
   tool_use: "Tool use",
@@ -18,18 +24,38 @@ const KIND_LABEL: Record<ChronoNode["kind"], string> = {
   checkpoint: "Checkpoint",
 };
 
-export function SojournNode({ data, selected }: NodeProps<SojournNodeData>) {
-  const { node, isHere } = data;
+/** Compact card for one graph node. Full summary lives in the title tooltip. */
+export function SojournNode({
+  node,
+  selected,
+  isHere,
+  onTrail,
+  dimmed,
+  receded,
+  searchHit,
+}: SojournNodeProps) {
   const flags = node.flags ?? [];
+  const gist = node.label ?? node.summary;
+  const classes = [
+    "sojourn-node",
+    `sojourn-node-cli-${node.cli}`,
+    selected ? "selected" : "",
+    onTrail ? "on-trail" : "",
+    dimmed ? "dimmed" : "",
+    receded ? "receded" : "",
+    searchHit ? "search-hit" : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
 
   return (
     <div
-      className={`sojourn-node sojourn-node-cli-${node.cli}${selected ? " selected" : ""}`}
+      className={classes}
       data-testid="sojourn-node"
       data-kind={node.kind}
       data-cli={node.cli}
+      title={gist}
     >
-      <Handle type="target" position={Position.Top} />
       <div className="sojourn-node-kind-bar" style={{ background: `var(--kind-${node.kind})` }} />
       {isHere && <div className="sojourn-node-here">you are here</div>}
       <div className="sojourn-node-header">
@@ -38,8 +64,7 @@ export function SojournNode({ data, selected }: NodeProps<SojournNodeData>) {
         </span>
         <FlagBadge flags={flags} />
       </div>
-      <div className="sojourn-node-summary">{node.label ?? node.summary}</div>
-      <Handle type="source" position={Position.Bottom} />
+      <div className="sojourn-node-summary">{gist}</div>
     </div>
   );
 }

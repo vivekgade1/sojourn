@@ -9,6 +9,46 @@ export interface InspectorProps {
   onAnnotationAdded: (nodeId: string, annotation: Annotation) => void;
   /** Called with a node's FULL current flag list (replace, never merge). */
   onFlagsUpdated?: (nodeId: string, flags: StoredFlag[]) => void;
+  /** Lineage from session root to this node (inclusive), for the Path section. */
+  path?: ChronoNode[];
+  /** Select (and pan to) another node — used by Path breadcrumb clicks. */
+  onSelectNode?: (id: string) => void;
+}
+
+/**
+ * The textual twin of the graph's lit trail: how this node was reached,
+ * root → here, each step clickable.
+ */
+function PathSection({
+  path,
+  currentId,
+  onSelectNode,
+}: {
+  path: ChronoNode[];
+  currentId: string;
+  onSelectNode?: (id: string) => void;
+}) {
+  if (path.length <= 1) return null;
+  return (
+    <div className="inspector-section" data-testid="path-section">
+      <h3>Path ({path.length} steps)</h3>
+      <ol className="path-list">
+        {path.map((step) => (
+          <li key={step.id}>
+            <button
+              className={`path-crumb${step.id === currentId ? " current" : ""}`}
+              onClick={() => onSelectNode?.(step.id)}
+              title={step.summary}
+            >
+              <span className="legend-dot" style={{ background: `var(--kind-${step.kind})` }} />
+              <span className="path-crumb-kind">{step.kind.replace(/_/g, " ")}</span>
+              <span className="path-crumb-gist">{step.label ?? step.summary}</span>
+            </button>
+          </li>
+        ))}
+      </ol>
+    </div>
+  );
 }
 
 function FlagRow({
@@ -267,6 +307,8 @@ function InspectorContent({
   onFlagDismissed,
   onAnnotationAdded,
   onFlagsUpdated,
+  path,
+  onSelectNode,
 }: InspectorProps & { node: ChronoNode }) {
   const [payloadOpen, setPayloadOpen] = useState(false);
   const [criticBusy, setCriticBusy] = useState(false);
@@ -308,6 +350,8 @@ function InspectorContent({
       <div className="inspector-meta">
         {node.cli} · {node.kind} · {new Date(node.timestamp).toLocaleString()}
       </div>
+
+      <PathSection path={path ?? []} currentId={node.id} onSelectNode={onSelectNode} />
 
       <div className="inspector-section">
         <h3>Summary</h3>
@@ -390,7 +434,14 @@ function InspectorContent({
   );
 }
 
-export function Inspector({ node, onFlagDismissed, onAnnotationAdded, onFlagsUpdated }: InspectorProps) {
+export function Inspector({
+  node,
+  onFlagDismissed,
+  onAnnotationAdded,
+  onFlagsUpdated,
+  path,
+  onSelectNode,
+}: InspectorProps) {
   if (!node) {
     return <div className="inspector-empty">Select a node to inspect it.</div>;
   }
@@ -406,6 +457,8 @@ export function Inspector({ node, onFlagDismissed, onAnnotationAdded, onFlagsUpd
       onFlagDismissed={onFlagDismissed}
       onAnnotationAdded={onAnnotationAdded}
       onFlagsUpdated={onFlagsUpdated}
+      path={path}
+      onSelectNode={onSelectNode}
     />
   );
 }

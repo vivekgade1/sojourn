@@ -1,8 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "./api";
-import { GraphView } from "./components/GraphView";
+import { GraphCanvas } from "./components/GraphCanvas";
 import { Inspector } from "./components/Inspector";
+import { Legend } from "./components/Legend";
 import { Toolbar } from "./components/Toolbar";
+import { trailOf } from "./layout";
+import { searchNodes } from "./search";
 import type { Annotation, ChronoNode, Project, StoredFlag } from "./types";
 import { connectWs } from "./ws";
 
@@ -23,6 +26,9 @@ export function App() {
   const [flaggedOnly, setFlaggedOnly] = useState(false);
   const [wsConnected, setWsConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [activeMatchIndex, setActiveMatchIndex] = useState(-1);
+  const [focus, setFocus] = useState<{ id: string | null; nonce: number }>({ id: null, nonce: 0 });
 
   // Kept in sync with selectedProjectId via the effect below so the WS
   // effect (which must have stable [] deps, see below) can always read the
@@ -95,10 +101,52 @@ export function App() {
     return filtered;
   }, [nodes, decisionLens, flaggedOnly]);
 
+  const searchActive = searchQuery.trim().length > 0;
+  const matchIds = useMemo(
+    () => (searchActive ? searchNodes(visibleNodes, searchQuery) : []),
+    [visibleNodes, searchQuery, searchActive],
+  );
+  const searchHits = useMemo(
+    () => (searchActive ? new Set(matchIds) : null),
+    [matchIds, searchActive],
+  );
+
+  // Reset match cursor whenever the query or result set changes.
+  useEffect(() => {
+    setActiveMatchIndex(matchIds.length > 0 ? 0 : -1);
+    if (matchIds.length > 0) {
+      setFocus((f) => ({ id: matchIds[0], nonce: f.nonce + 1 }));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchQuery, matchIds.join("\n")]);
+
+  function cycleMatch(direction: 1 | -1) {
+    if (matchIds.length === 0) return;
+    const next = (activeMatchIndex + direction + matchIds.length) % matchIds.length;
+    setActiveMatchIndex(next);
+    setSelectedNodeId(matchIds[next]);
+    setFocus((f) => ({ id: matchIds[next], nonce: f.nonce + 1 }));
+  }
+
+  function selectAndFocus(id: string) {
+    setSelectedNodeId(id);
+    setFocus((f) => ({ id, nonce: f.nonce + 1 }));
+  }
+
   const selectedNode = useMemo(
     () => nodes.find((n) => n.id === selectedNodeId) ?? null,
     [nodes, selectedNodeId],
   );
+
+  const selectedPath = useMemo(() => {
+    if (!selectedNodeId) return [];
+    const byId = new Map(nodes.map((n) => [n.id, n]));
+    return trailOf(selectedNodeId, nodes)
+      .map((id) => byId.get(id))
+      .filter((n): n is ChronoNode => Boolean(n));
+  }, [selectedNodeId, nodes]);
+
+  const sessionCount = useMemo(() => new Set(visibleNodes.map((n) => n.sessionId)).size, [visibleNodes]);
 
   function handleFlagDismissed(nodeId: string, flagId: number) {
     setNodes((prev) =>
@@ -135,19 +183,30 @@ export function App() {
         flaggedOnly={flaggedOnly}
         onToggleFlaggedOnly={() => setFlaggedOnly((v) => !v)}
         wsConnected={wsConnected}
+        searchQuery={searchQuery}
+        onSearchQueryChange={setSearchQuery}
+        matchCount={matchIds.length}
+        activeMatchIndex={activeMatchIndex}
+        onCycleMatch={cycleMatch}
       />
+      <Legend nodeCount={visibleNodes.length} sessionCount={sessionCount} />
       {error && <div className="inspector-meta" style={{ padding: 8 }}>{error}</div>}
       <div className="app-body">
-        <GraphView
+        <GraphCanvas
           nodes={visibleNodes}
           selectedNodeId={selectedNodeId}
           onSelectNode={setSelectedNodeId}
+          searchHits={searchHits}
+          focusNodeId={focus.id}
+          focusNonce={focus.nonce}
         />
         <Inspector
           node={selectedNode}
           onFlagDismissed={handleFlagDismissed}
           onAnnotationAdded={handleAnnotationAdded}
           onFlagsUpdated={handleFlagsUpdated}
+          path={selectedPath}
+          onSelectNode={selectAndFocus}
         />
       </div>
     </div>
