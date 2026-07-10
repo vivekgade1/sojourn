@@ -1,35 +1,67 @@
-:root {
+:root,
+:root[data-theme="light"] {
   color-scheme: light;
-  /* Claude's warm paper world */
-  --bg: #f0eae0;
-  --panel: #faf6ee;
-  --panel-alt: #ece4d4;
-  --border: #d8cdb8;
-  --text: #2a2520;
-  --text-dim: #7a7264;
-  --accent: #c15f3c; /* terracotta — Claude's ink */
+  /* Glacier — light. Kind palette validated (dataviz six checks, light surface). */
+  --bg: #f2f7f5;
+  --panel: #fbfdfc;
+  --panel-alt: #e6efeb;
+  --border: #cbdad3;
+  --text: #16241e;
+  --text-dim: #5d7268;
+  --accent: #0c8f7c;
 
-  --kind-prompt: #3b6fb5;
-  --kind-assistant: #6c51c9;
-  --kind-tool_use: #2e8a66;
-  --kind-tool_result: #247055;
-  --kind-decision: #c07a18;
-  --kind-assumption: #947c10;
-  --kind-fork_point: #b0489b;
-  --kind-checkpoint: #2e7f96;
+  --kind-prompt: #1273b8;
+  --kind-assistant: #8250df;
+  --kind-tool_use: #0e8a62;
+  --kind-tool_result: #b0348f;
+  --kind-decision: #c25e0f;
+  --kind-assumption: #0090a8;
+  --kind-fork_point: #6e6f00;
+  --kind-checkpoint: #d04c7e;
 
-  --verified-red: #c43d3d;
-  --advisory-amber: #94701c;
+  --verified-red: #c93a47;
+  --on-verified: #ffffff;
+  --advisory-amber: #8f6e10;
 
-  /* The signature accent: the lit lineage trail / active route. */
-  --trail: #c15f3c;
-  --trail-glow: rgba(193, 95, 60, 0.3);
-  --route-claude: #c15f3c;
-  --route-opencode: #2e7f96;
-  --paper-line: rgba(42, 37, 32, 0.055);
+  --trail: #0c8f7c;
+  --trail-glow: rgba(12, 143, 124, 0.32);
+  --route-claude: #0c8f7c;
+  --route-opencode: #8250df;
+  --paper-line: rgba(22, 36, 30, 0.07);
   --mono:
     ui-monospace, "SF Mono", SFMono-Regular, "JetBrains Mono", Menlo, Consolas, monospace;
   --serif: "Iowan Old Style", Georgia, "Palatino Linotype", "Times New Roman", serif;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  /* Glacier — dark. Same hue system, steps re-picked and validated for the dark surface. */
+  --bg: #0c1310;
+  --panel: #121b17;
+  --panel-alt: #1a2620;
+  --border: #2a3a32;
+  --text: #deede6;
+  --text-dim: #86988e;
+  --accent: #2bc7ac;
+
+  --kind-prompt: #3e8fd6;
+  --kind-assistant: #9c74f0;
+  --kind-tool_use: #22a878;
+  --kind-tool_result: #d14fa8;
+  --kind-decision: #d07e28;
+  --kind-assumption: #1e96ac;
+  --kind-fork_point: #8a912c;
+  --kind-checkpoint: #e06280;
+
+  --verified-red: #f0616c;
+  --on-verified: #14090a;
+  --advisory-amber: #d3a93f;
+
+  --trail: #2bc7ac;
+  --trail-glow: rgba(43, 199, 172, 0.35);
+  --route-claude: #2bc7ac;
+  --route-opencode: #9c74f0;
+  --paper-line: rgba(222, 237, 230, 0.05);
 }
 
 * {
@@ -85,8 +117,8 @@ button {
 .toolbar {
   display: flex;
   align-items: center;
-  gap: 16px;
-  padding: 8px 16px;
+  gap: 10px;
+  padding: 8px 14px;
   background: var(--panel);
   border-bottom: 1px solid var(--border);
 }
@@ -254,7 +286,7 @@ button {
 
 .flag-badge-verified {
   background: var(--verified-red);
-  color: #fff;
+  color: var(--on-verified);
   border: 1px solid var(--verified-red);
 }
 
@@ -312,7 +344,7 @@ button {
 }
 
 .payload-json {
-  background: #efe8da;
+  background: var(--panel-alt);
   border: 1px solid var(--border);
   border-radius: 6px;
   padding: 8px;
@@ -500,7 +532,7 @@ button {
 .modal-confirm {
   background: var(--verified-red);
   border: none;
-  color: #fff;
+  color: var(--on-verified);
   border-radius: 4px;
   padding: 6px 12px;
   font-weight: 600;
@@ -513,7 +545,7 @@ button {
 
 .restore-result code {
   display: block;
-  background: #efe8da;
+  background: var(--panel-alt);
   border: 1px solid var(--border);
   border-radius: 4px;
   padding: 6px;
@@ -528,7 +560,7 @@ button {
   height: 100%;
   display: block;
   background:
-    radial-gradient(circle at 1px 1px, rgba(42, 37, 32, 0.12) 1px, transparent 0) 0 0 / 28px 28px,
+    radial-gradient(circle at 1px 1px, var(--paper-line) 1px, transparent 0) 0 0 / 28px 28px,
     var(--bg);
   cursor: grab;
 }
@@ -547,7 +579,7 @@ button {
 
 .graph-edge {
   fill: none;
-  stroke: #b7ab93;
+  stroke: color-mix(in oklab, var(--border) 60%, var(--text-dim));
   stroke-width: 1.5;
   transition:
     stroke 140ms ease,
@@ -613,7 +645,8 @@ button {
   align-items: center;
   gap: 8px;
   flex: 1;
-  max-width: 460px;
+  min-width: 0;
+  max-width: 380px;
 }
 
 .toolbar-search input {
@@ -794,9 +827,7 @@ button {
   flex: 1;
   display: block;
   cursor: grab;
-  background:
-    radial-gradient(ellipse at 30% 20%, rgba(255, 252, 245, 0.7), transparent 60%),
-    var(--bg);
+  background: var(--bg);
 }
 
 .map-svg:active {
@@ -866,7 +897,7 @@ button {
 }
 
 .map-waypoint.selected .map-waypoint-ring {
-  fill: #fff;
+  fill: var(--panel);
   stroke-width: 4;
   filter: drop-shadow(0 1px 6px var(--trail-glow));
 }
@@ -906,7 +937,7 @@ button {
 }
 
 .map-hazard text {
-  fill: #fff;
+  fill: var(--on-verified);
   font-size: 10px;
   font-weight: 700;
   text-anchor: middle;
@@ -936,12 +967,12 @@ button {
 
 .map-here path {
   fill: var(--accent);
-  stroke: #fff;
+  stroke: var(--panel);
   stroke-width: 1;
 }
 
 .map-here circle {
-  fill: #fff;
+  fill: var(--panel);
 }
 
 /* Turn drawer */
@@ -1046,8 +1077,9 @@ button {
   background: var(--panel);
   border: none;
   color: var(--text-dim);
-  padding: 5px 14px;
+  padding: 5px 12px;
   font-size: 12px;
+  white-space: nowrap;
 }
 
 .view-switch button.active {
@@ -1113,4 +1145,95 @@ button {
 .map-pane .graph-controls {
   bottom: auto;
   top: 12px;
+}
+
+/* Minimap, work rings, settle-in, flow */
+
+.minimap {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  background: color-mix(in oklab, var(--panel) 82%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+  backdrop-filter: blur(2px);
+}
+
+.minimap-dot {
+  fill: var(--route-claude);
+  opacity: 0.45;
+}
+
+.minimap-dot-opencode {
+  fill: var(--route-opencode);
+}
+
+.minimap-dot.hazard {
+  fill: var(--verified-red);
+}
+
+.minimap-viewport {
+  fill: transparent;
+  stroke: var(--text);
+  stroke-width: 1.5;
+  stroke-dasharray: 3 2;
+  pointer-events: none;
+}
+
+.map-work-ring {
+  pointer-events: none;
+  opacity: 0.9;
+}
+
+@keyframes waypoint-settle {
+  from {
+    opacity: 0;
+    transform: scale(0.5);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.map-waypoint-inner {
+  animation: waypoint-settle 320ms ease-out backwards;
+}
+
+/* The lit trail flows toward the selected node — direction made visible. */
+@keyframes trail-flow {
+  to {
+    stroke-dashoffset: -24;
+  }
+}
+
+.graph-edge.on-trail {
+  stroke-dasharray: 8 4;
+  animation: trail-flow 1s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .map-waypoint-inner {
+    animation: none;
+  }
+  .graph-edge.on-trail {
+    animation: none;
+    stroke-dasharray: none;
+  }
+}
+
+.theme-toggle {
+  background: var(--panel-alt);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 999px;
+  width: 30px;
+  height: 30px;
+  font-size: 14px;
+  line-height: 1;
+}
+
+.theme-toggle:hover {
+  border-color: var(--accent);
 }

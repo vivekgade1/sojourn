@@ -60,6 +60,9 @@ export function layoutGraph(nodes: ChronoNode[]): LayoutResult {
     }
   }
 
+  // Newest tree first: the session you're working on is the first one you see.
+  roots.sort((a, b) => -chrono(a, b));
+
   const toDatum = (node: ChronoNode, seen: Set<string>): TreeDatum => ({
     node,
     children: (childrenOf.get(node.id) ?? [])

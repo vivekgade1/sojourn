@@ -7,6 +7,7 @@ import { Legend } from "./components/Legend";
 import { Toolbar } from "./components/Toolbar";
 import { trailOf } from "./layout";
 import { searchNodes } from "./search";
+import { initTheme, toggleTheme, type Theme } from "./theme";
 import { buildJourneys, nodeToTurnIndex } from "./turns";
 import type { Annotation, ChronoNode, Project, StoredFlag } from "./types";
 import { connectWs } from "./ws";
@@ -34,6 +35,7 @@ export function App() {
   const [error, setError] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [activeMatchIndex, setActiveMatchIndex] = useState(-1);
+  const [theme, setTheme] = useState<Theme>(() => initTheme());
   const [focus, setFocus] = useState<{ id: string | null; nonce: number }>({ id: null, nonce: 0 });
 
   // Kept in sync with selectedProjectId via the effect below so the WS
@@ -223,6 +225,8 @@ export function App() {
         }}
         view={view}
         onSetView={setView}
+        theme={theme}
+        onToggleTheme={() => setTheme((t) => toggleTheme(t))}
         decisionLens={decisionLens}
         onToggleDecisionLens={() => setDecisionLens((v) => !v)}
         flaggedOnly={flaggedOnly}

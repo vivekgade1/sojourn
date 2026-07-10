@@ -6,6 +6,8 @@ export interface ToolbarProps {
   onSelectProject: (id: string) => void;
   view: "map" | "graph";
   onSetView: (view: "map" | "graph") => void;
+  theme: "light" | "dark";
+  onToggleTheme: () => void;
   decisionLens: boolean;
   onToggleDecisionLens: () => void;
   flaggedOnly: boolean;
@@ -24,6 +26,8 @@ export function Toolbar({
   onSelectProject,
   view,
   onSetView,
+  theme,
+  onToggleTheme,
   decisionLens,
   onToggleDecisionLens,
   flaggedOnly,
@@ -113,6 +117,15 @@ export function Toolbar({
       <span className={`toolbar-status${wsConnected ? " live" : ""}`}>
         {wsConnected ? "live" : "disconnected"}
       </span>
+
+      <button
+        className="theme-toggle"
+        aria-label={theme === "dark" ? "Switch to light theme" : "Switch to dark theme"}
+        title={theme === "dark" ? "Switch to light theme" : "Switch to dark theme"}
+        onClick={onToggleTheme}
+      >
+        {theme === "dark" ? "☀" : "☾"}
+      </button>
     </div>
   );
 }

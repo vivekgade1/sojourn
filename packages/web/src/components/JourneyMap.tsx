@@ -3,7 +3,7 @@ import { select } from "d3-selection";
 // Side-effect import: patches Selection with .transition() for animated pans.
 import "d3-transition";
 import { zoom, zoomIdentity, type ZoomBehavior } from "d3-zoom";
-import { line, curveCatmullRom } from "d3-shape";
+import { line, curveCatmullRom, arc as d3arc, pie as d3pie } from "d3-shape";
 import type { ChronoNode } from "../types";
 import type { Journey, Turn } from "../turns";
 
@@ -50,6 +50,28 @@ const trailLine = line<{ x: number; y: number }>()
   .y((d) => d.y)
   .curve(curveCatmullRom.alpha(0.6));
 
+/**
+ * The work ring: a thin donut around the waypoint number showing WHAT the
+ * turn was made of — tool calls, assistant text, everything else. Order is
+ * fixed (tool, assistant, other); identity is reinforced by the drawer's
+ * labeled chips, never color alone.
+ */
+const RING_COLORS = ["var(--kind-tool_use)", "var(--kind-assistant)", "var(--border)"] as const;
+const ringPie = d3pie<number>().sort(null).padAngle(0.06);
+
+function workRingSegments(turn: Turn, r: number): Array<{ d: string; color: string }> {
+  const assistantCount = turn.nodes.filter((n) => n.kind === "assistant").length;
+  const other = Math.max(0, turn.nodes.length - turn.toolCount - assistantCount);
+  const values = [turn.toolCount, assistantCount, other];
+  if (values.every((v) => v === 0)) return [];
+  const gen = d3arc<{ startAngle: number; endAngle: number; padAngle: number }>()
+    .innerRadius(r + 2)
+    .outerRadius(r + 6);
+  return ringPie(values)
+    .filter((slice) => slice.value > 0)
+    .map((slice) => ({ d: gen(slice) ?? "", color: RING_COLORS[slice.index]! }));
+}
+
 /** Deterministic faint contour lines — the paper's topography. */
 function contourPaths(width: number, height: number): string[] {
   const paths: string[] = [];
@@ -80,6 +102,22 @@ export function JourneyMap({
   const viewportRef = useRef<SVGGElement | null>(null);
   const zoomRef = useRef<ZoomBehavior<SVGSVGElement, unknown> | null>(null);
   const didFitRef = useRef(false);
+  const minimapViewportRef = useRef<SVGRectElement | null>(null);
+  const minimapScaleRef = useRef(1);
+
+  // Direct-DOM sync (no React re-render per wheel event): the minimap's
+  // viewport rectangle mirrors the main d3-zoom transform.
+  function syncMinimapViewport(t: { k: number; x: number; y: number }) {
+    const rectEl = minimapViewportRef.current;
+    const svg = svgRef.current;
+    if (!rectEl || !svg) return;
+    const s = minimapScaleRef.current;
+    const view = svg.getBoundingClientRect();
+    rectEl.setAttribute("x", String(((0 - t.x) / t.k) * s));
+    rectEl.setAttribute("y", String(((0 - t.y) / t.k) * s));
+    rectEl.setAttribute("width", String((view.width / t.k) * s));
+    rectEl.setAttribute("height", String((view.height / t.k) * s));
+  }
 
   const { placed, bandTops, mapWidth, mapHeight } = useMemo(() => {
     const all: Placed[] = [];
@@ -123,7 +161,10 @@ export function JourneyMap({
     if (!svg || !viewport) return;
     const behavior = zoom<SVGSVGElement, unknown>()
       .scaleExtent([0.1, 2.5])
-      .on("zoom", (event) => viewport.setAttribute("transform", event.transform.toString()));
+      .on("zoom", (event) => {
+        viewport.setAttribute("transform", event.transform.toString());
+        syncMinimapViewport(event.transform as { k: number; x: number; y: number });
+      });
     zoomRef.current = behavior;
     select(svg).call(behavior).on("dblclick.zoom", null);
     return () => {
@@ -138,13 +179,11 @@ export function JourneyMap({
     if (!svg || !behavior || placed.length === 0) return;
     const rect = svg.getBoundingClientRect();
     const pad = 40;
-    const scale = Math.min(
-      1.4,
-      Math.max(0.12, Math.min((rect.width - pad) / mapWidth, (rect.height - pad) / mapHeight)),
-    );
+    // Newest journey renders first (top of the sheet) — anchor the fit to the
+    // TOP so "latest" is what you see, and fit width first for readability.
+    const scale = Math.min(1.2, Math.max(0.12, (rect.width - pad) / mapWidth));
     const tx = (rect.width - mapWidth * scale) / 2;
-    const ty = Math.max(8, (rect.height - mapHeight * scale) / 2);
-    select(svg).call(behavior.transform, zoomIdentity.translate(tx, ty).scale(scale));
+    select(svg).call(behavior.transform, zoomIdentity.translate(tx, 16).scale(scale));
   }
 
   function zoomBy(factor: number) {
@@ -180,6 +219,31 @@ export function JourneyMap({
       );
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [focusTurnId, focusNonce]);
+
+  const MINI_W = 180;
+  const miniScale = Math.min(MINI_W / mapWidth, 130 / Math.max(1, mapHeight));
+  const miniH = Math.max(24, mapHeight * miniScale);
+  useEffect(() => {
+    minimapScaleRef.current = miniScale;
+  }, [miniScale]);
+
+  function minimapJump(e: React.MouseEvent<SVGSVGElement>) {
+    const svg = svgRef.current;
+    const behavior = zoomRef.current;
+    if (!svg || !behavior) return;
+    const box = e.currentTarget.getBoundingClientRect();
+    const wx = (e.clientX - box.left) / miniScale;
+    const wy = (e.clientY - box.top) / miniScale;
+    const view = svg.getBoundingClientRect();
+    const k = 0.9;
+    select(svg)
+      .transition()
+      .duration(250)
+      .call(
+        behavior.transform,
+        zoomIdentity.translate(view.width / 2 - wx * k, view.height / 2 - wy * k).scale(k),
+      );
+  }
 
   function turnFaded(turn: Turn): boolean {
     if (matchedTurnIds !== null) return !matchedTurnIds.has(turn.id);
@@ -232,12 +296,18 @@ export function JourneyMap({
                   const mid = { x: (prev.x + p.x) / 2, y: (prev.y + p.y) / 2 + 10 };
                   const d = trailLine([prev, mid, p]) ?? "";
                   const faded = turnFaded(p.turn) && turnFaded(prev.turn);
+                  // Time direction as ink density: the trail darkens toward now.
+                  const ramp =
+                    0.4 + 0.6 * (bandPlaced.length > 2 ? i / (bandPlaced.length - 2) : 1);
                   return (
                     <path
                       key={p.turn.id}
                       d={d}
-                      className={`${routeClass}${faded ? " faded" : ""}`}
-                      style={{ strokeWidth: 2 + Math.min(5, p.turn.toolCount * 0.6) }}
+                      className={routeClass}
+                      style={{
+                        strokeWidth: 2 + Math.min(5, p.turn.toolCount * 0.6),
+                        opacity: faded ? 0.12 : ramp,
+                      }}
                     />
                   );
                 })}
@@ -271,10 +341,18 @@ export function JourneyMap({
                     turn.toolNames.length ? ` (${turn.toolNames.join(", ")})` : ""
                   }${turn.verifiedCount ? `\n⚠ ${turn.verifiedCount} verified flag(s)` : ""}`}
                 </title>
-                <circle className="map-waypoint-ring" r={p.r} vectorEffect="non-scaling-stroke" />
-                <text className="map-waypoint-number" dy="0.36em">
-                  {turn.index}
-                </text>
+                <g
+                  className="map-waypoint-inner"
+                  style={{ animationDelay: `${Math.min(placed.indexOf(p) * 18, 500)}ms` }}
+                >
+                  <circle className="map-waypoint-ring" r={p.r} vectorEffect="non-scaling-stroke" />
+                  {workRingSegments(turn, p.r).map((seg, si) => (
+                    <path key={si} d={seg.d} fill={seg.color} className="map-work-ring" />
+                  ))}
+                  <text className="map-waypoint-number" dy="0.36em">
+                    {turn.index}
+                  </text>
+                </g>
                 {turn.verifiedCount > 0 && (
                   <g className="map-hazard" transform={`translate(${p.r * 0.75}, ${-p.r * 0.75})`}>
                     <circle r={9} />
@@ -316,6 +394,30 @@ export function JourneyMap({
         <button aria-label="Zoom out" onClick={() => zoomBy(1 / 1.3)}>−</button>
         <button aria-label="Fit map to view" onClick={fitView}>fit</button>
       </div>
+
+      {placed.length > 0 && (
+        <svg
+          className="minimap"
+          width={MINI_W}
+          height={miniH}
+          onClick={minimapJump}
+          role="presentation"
+          aria-hidden="true"
+        >
+          {placed.map((p) => (
+            <circle
+              key={p.turn.id}
+              cx={p.x * miniScale}
+              cy={p.y * miniScale}
+              r={Math.max(1.4, p.r * miniScale)}
+              className={`minimap-dot minimap-dot-${p.journey.cli}${
+                p.turn.verifiedCount > 0 ? " hazard" : ""
+              }`}
+            />
+          ))}
+          <rect ref={minimapViewportRef} className="minimap-viewport" x={0} y={0} width={0} height={0} />
+        </svg>
+      )}
 
       {selectedTurn && (
         <div className="turn-drawer" data-testid="turn-drawer">

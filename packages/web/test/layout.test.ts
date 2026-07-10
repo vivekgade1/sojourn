@@ -62,7 +62,7 @@ describe("layoutGraph (left→right d3 tidy tree)", () => {
     expect(positions.has("claude:3")).toBe(true);
   });
 
-  it("stacks separate session trees without overlap and reports bounds", () => {
+  it("stacks separate session trees newest-first and reports bounds", () => {
     const nodes: ChronoNode[] = [
       makeNode("claude:r1", null, { sessionId: "s1" }),
       makeNode("claude:c1", "claude:r1", { sessionId: "s1" }),
@@ -73,7 +73,8 @@ describe("layoutGraph (left→right d3 tidy tree)", () => {
 
     const r1 = positions.get("claude:r1")!;
     const r2 = positions.get("claude:r2")!;
-    expect(r2.y).toBeGreaterThan(r1.y); // second tree below the first
+    // r2 is NEWER, so its tree renders first (above the older r1 tree).
+    expect(r2.y).toBeLessThan(r1.y);
     expect(width).toBeGreaterThan(0);
     expect(height).toBeGreaterThan(0);
   });
