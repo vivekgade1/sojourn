@@ -1,10 +1,17 @@
 # Sojourn Claude Code plugin
 
-Forwards Claude Code session lifecycle events (`SessionStart` / `PostToolUse` /
-`Stop`) to the local Sojourn daemon (`POST /api/hooks/claude`) so ingestion is
-immediate instead of waiting on the filesystem watcher's debounce. The hook
-script always exits 0 within ~3s, daemon up or not — capture never blocks or
-breaks a session.
+Two things ship in this plugin:
+
+1. **Hooks** — forwards Claude Code session lifecycle events (`SessionStart` /
+   `PostToolUse` / `Stop`) to the local Sojourn daemon (`POST /api/hooks/claude`)
+   so ingestion is immediate instead of waiting on the filesystem watcher's
+   debounce. The hook script always exits 0 within ~3s, daemon up or not —
+   capture never blocks or breaks a session.
+2. **The `sojourn` skill** (`skills/sojourn/SKILL.md`) — teaches Claude Code how
+   to drive the `soj` CLI: list flags with evidence, mark decisions/checkpoints,
+   and walk a user through a preflight-confirmed restore, with the product's
+   honesty rules (advisory never presented as verified) baked in. The complete
+   user guide it defers to is `docs/USAGE.md` at the repo root.
 
 ## In-repo checkout assumption
 

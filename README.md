@@ -6,6 +6,8 @@ Sojourn is a cross-CLI decision-graph, state-restore, and assumption/hallucinati
 
 Everything runs on localhost. No account, no upload.
 
+**📖 Complete user guide: [docs/USAGE.md](docs/USAGE.md)** — CLI reference, web UI tour, flag semantics, restore guarantees, Claude Code/OpenCode setup, troubleshooting.
+
 ## Install & run (from this repo)
 
 ```bash
