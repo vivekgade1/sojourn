@@ -1,30 +1,35 @@
 :root {
-  color-scheme: dark;
-  --bg: #0e1116;
-  --panel: #161b22;
-  --panel-alt: #1c222b;
-  --border: #2a313c;
-  --text: #d7dde5;
-  --text-dim: #8790a0;
-  --accent: #5b9dff;
+  color-scheme: light;
+  /* Claude's warm paper world */
+  --bg: #f0eae0;
+  --panel: #faf6ee;
+  --panel-alt: #ece4d4;
+  --border: #d8cdb8;
+  --text: #2a2520;
+  --text-dim: #7a7264;
+  --accent: #c15f3c; /* terracotta — Claude's ink */
 
-  --kind-prompt: #5b9dff;
-  --kind-assistant: #8a7bff;
-  --kind-tool_use: #3fb98a;
-  --kind-tool_result: #2f9c78;
-  --kind-decision: #f0a83c;
-  --kind-assumption: #e0c341;
-  --kind-fork_point: #d95dc0;
-  --kind-checkpoint: #63c7d9;
+  --kind-prompt: #3b6fb5;
+  --kind-assistant: #6c51c9;
+  --kind-tool_use: #2e8a66;
+  --kind-tool_result: #247055;
+  --kind-decision: #c07a18;
+  --kind-assumption: #947c10;
+  --kind-fork_point: #b0489b;
+  --kind-checkpoint: #2e7f96;
 
-  --verified-red: #e5484d;
-  --advisory-amber: #d9a441;
+  --verified-red: #c43d3d;
+  --advisory-amber: #94701c;
 
-  /* The signature: the lit lineage trail. Warm gold — a path lit at dusk. */
-  --trail: #e8b24a;
-  --trail-glow: rgba(232, 178, 74, 0.35);
+  /* The signature accent: the lit lineage trail / active route. */
+  --trail: #c15f3c;
+  --trail-glow: rgba(193, 95, 60, 0.3);
+  --route-claude: #c15f3c;
+  --route-opencode: #2e7f96;
+  --paper-line: rgba(42, 37, 32, 0.055);
   --mono:
     ui-monospace, "SF Mono", SFMono-Regular, "JetBrains Mono", Menlo, Consolas, monospace;
+  --serif: "Iowan Old Style", Georgia, "Palatino Linotype", "Times New Roman", serif;
 }
 
 * {
@@ -87,8 +92,11 @@ button {
 }
 
 .toolbar-brand {
+  font-family: var(--serif);
+  font-style: italic;
   font-weight: 600;
-  letter-spacing: 0.02em;
+  font-size: 17px;
+  letter-spacing: 0.01em;
   color: var(--text);
   margin-right: 8px;
 }
@@ -216,7 +224,7 @@ button {
   top: -10px;
   right: -8px;
   background: var(--accent);
-  color: #0b0d10;
+  color: #fff;
   font-size: 9px;
   font-weight: 700;
   padding: 2px 6px;
@@ -304,7 +312,7 @@ button {
 }
 
 .payload-json {
-  background: #0b0d10;
+  background: #efe8da;
   border: 1px solid var(--border);
   border-radius: 6px;
   padding: 8px;
@@ -325,16 +333,16 @@ button {
 }
 
 .diff-status-A {
-  color: #3fb98a;
+  color: #2e8a66;
 }
 .diff-status-M {
-  color: #d9a441;
+  color: #94701c;
 }
 .diff-status-D {
-  color: #e5484d;
+  color: #c43d3d;
 }
 .diff-status-R {
-  color: #5b9dff;
+  color: #3b6fb5;
 }
 
 .flag-row {
@@ -431,7 +439,7 @@ button {
   width: 100%;
   margin-top: 8px;
   background: var(--accent);
-  color: #0b0d10;
+  color: #fff;
   border: none;
   font-weight: 600;
   padding: 8px;
@@ -505,7 +513,7 @@ button {
 
 .restore-result code {
   display: block;
-  background: #0b0d10;
+  background: #efe8da;
   border: 1px solid var(--border);
   border-radius: 4px;
   padding: 6px;
@@ -520,7 +528,7 @@ button {
   height: 100%;
   display: block;
   background:
-    radial-gradient(circle at 1px 1px, #1a212c 1px, transparent 0) 0 0 / 28px 28px,
+    radial-gradient(circle at 1px 1px, rgba(42, 37, 32, 0.12) 1px, transparent 0) 0 0 / 28px 28px,
     var(--bg);
   cursor: grab;
 }
@@ -539,7 +547,7 @@ button {
 
 .graph-edge {
   fill: none;
-  stroke: #3d4757;
+  stroke: #b7ab93;
   stroke-width: 1.5;
   transition:
     stroke 140ms ease,
@@ -768,4 +776,341 @@ button {
 
 .sojourn-node.receded {
   opacity: 0.55;
+}
+
+/* ——— The Journey Map (expedition-map view) ——— */
+
+.map-pane {
+  flex: 1;
+  min-width: 0;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+
+.map-svg {
+  width: 100%;
+  height: 100%;
+  flex: 1;
+  display: block;
+  cursor: grab;
+  background:
+    radial-gradient(ellipse at 30% 20%, rgba(255, 252, 245, 0.7), transparent 60%),
+    var(--bg);
+}
+
+.map-svg:active {
+  cursor: grabbing;
+}
+
+.map-contours path {
+  fill: none;
+  stroke: var(--paper-line);
+  stroke-width: 1.5;
+}
+
+.map-session-label {
+  font-family: var(--serif);
+  font-style: italic;
+  font-size: 15px;
+  fill: var(--text);
+}
+
+.map-session-sub {
+  font-family: var(--mono);
+  font-size: 10px;
+  fill: var(--text-dim);
+}
+
+.map-route {
+  fill: none;
+  stroke-linecap: round;
+  stroke-dasharray: 1 7;
+  transition: opacity 140ms ease;
+}
+
+.map-route-claude {
+  stroke: var(--route-claude);
+}
+
+.map-route-opencode {
+  stroke: var(--route-opencode);
+}
+
+.map-route.faded {
+  opacity: 0.25;
+}
+
+.map-waypoint {
+  cursor: pointer;
+  transition: opacity 140ms ease;
+}
+
+.map-waypoint.faded {
+  opacity: 0.3;
+}
+
+.map-waypoint-ring {
+  fill: var(--panel);
+  stroke: var(--route-claude);
+  stroke-width: 2.5;
+}
+
+.map-waypoint-opencode .map-waypoint-ring {
+  stroke: var(--route-opencode);
+  stroke-dasharray: 4 3;
+}
+
+.map-waypoint:hover .map-waypoint-ring {
+  stroke-width: 3.5;
+}
+
+.map-waypoint.selected .map-waypoint-ring {
+  fill: #fff;
+  stroke-width: 4;
+  filter: drop-shadow(0 1px 6px var(--trail-glow));
+}
+
+.map-waypoint.match .map-waypoint-ring {
+  stroke: var(--trail);
+  stroke-width: 4;
+  filter: drop-shadow(0 0 8px var(--trail-glow));
+}
+
+.map-waypoint-number {
+  font-family: var(--serif);
+  font-size: 13px;
+  font-weight: 700;
+  fill: var(--text);
+  text-anchor: middle;
+  pointer-events: none;
+}
+
+.map-waypoint-ask {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  fill: var(--text-dim);
+  text-anchor: middle;
+  pointer-events: none;
+}
+
+.map-waypoint.selected .map-waypoint-ask,
+.map-waypoint:hover .map-waypoint-ask {
+  fill: var(--text);
+}
+
+.map-hazard circle {
+  fill: var(--verified-red);
+  stroke: var(--panel);
+  stroke-width: 1.5;
+}
+
+.map-hazard text {
+  fill: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  text-anchor: middle;
+  pointer-events: none;
+}
+
+.map-advisory circle {
+  fill: var(--panel);
+  stroke: var(--advisory-amber);
+  stroke-width: 1.5;
+}
+
+.map-advisory text {
+  fill: var(--advisory-amber);
+  font-size: 9px;
+  font-weight: 700;
+  text-anchor: middle;
+  pointer-events: none;
+}
+
+.map-pennant {
+  fill: none;
+  stroke: var(--kind-decision);
+  stroke-width: 2;
+  stroke-linejoin: round;
+}
+
+.map-here path {
+  fill: var(--accent);
+  stroke: #fff;
+  stroke-width: 1;
+}
+
+.map-here circle {
+  fill: #fff;
+}
+
+/* Turn drawer */
+
+.turn-drawer {
+  border-top: 1px solid var(--border);
+  background: var(--panel);
+  max-height: 200px;
+  display: flex;
+  flex-direction: column;
+}
+
+.turn-drawer-head {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 8px 14px 4px;
+}
+
+.turn-drawer-title {
+  font-family: var(--serif);
+  font-style: italic;
+  font-size: 14px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.turn-drawer-meta {
+  color: var(--text-dim);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.turn-drawer-close {
+  margin-left: auto;
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  font-size: 16px;
+  line-height: 1;
+  padding: 2px 6px;
+}
+
+.turn-drawer-chips {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+  padding: 6px 14px 12px;
+}
+
+.turn-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  max-width: 260px;
+  background: var(--panel-alt);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.turn-chip:hover {
+  border-color: var(--text-dim);
+  color: var(--text);
+}
+
+.turn-chip.selected {
+  border-color: var(--accent);
+  color: var(--text);
+  box-shadow: 0 0 0 1px var(--trail-glow);
+}
+
+.turn-chip-kind {
+  text-transform: uppercase;
+  font-size: 8.5px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  flex-shrink: 0;
+}
+
+.turn-chip-gist {
+  font-family: var(--mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* View switch */
+
+.view-switch {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.view-switch button {
+  background: var(--panel);
+  border: none;
+  color: var(--text-dim);
+  padding: 5px 14px;
+  font-size: 12px;
+}
+
+.view-switch button.active {
+  background: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+
+/* Legend glyphs for the map */
+
+.legend-glyph {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  flex-shrink: 0;
+}
+
+.legend-glyph-waypoint {
+  border: 2px solid var(--route-claude);
+  border-radius: 999px;
+  background: var(--panel);
+}
+
+.legend-glyph-hazard {
+  border-radius: 999px;
+  background: var(--verified-red);
+}
+
+.legend-glyph-advisory {
+  border-radius: 999px;
+  border: 1.5px solid var(--advisory-amber);
+  background: transparent;
+}
+
+.legend-glyph-pennant {
+  color: var(--kind-decision);
+  width: auto;
+  height: auto;
+  font-size: 12px;
+  line-height: 1;
+}
+
+.legend-glyph-here {
+  background: var(--accent);
+  border-radius: 999px 999px 999px 0;
+  transform: rotate(-45deg);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .map-route,
+  .map-waypoint {
+    transition: none;
+  }
+}
+
+.map-band-rule {
+  stroke: var(--border);
+  stroke-width: 1;
+  stroke-dasharray: 2 4;
+}
+
+/* In the map view the drawer owns the bottom edge — controls go top-left. */
+.map-pane .graph-controls {
+  bottom: auto;
+  top: 12px;
 }

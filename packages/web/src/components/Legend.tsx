@@ -6,24 +6,55 @@ const KINDS = Object.keys(KIND_LABEL) as ChronoNode["kind"][];
 export interface LegendProps {
   nodeCount: number;
   sessionCount: number;
+  view: "map" | "graph";
 }
 
-/** Wayfinding strip: what the colors mean and how to read the edges. */
-export function Legend({ nodeCount, sessionCount }: LegendProps) {
+/** Wayfinding strip: what the marks mean and how to read the view. */
+export function Legend({ nodeCount, sessionCount, view }: LegendProps) {
   return (
     <div className="legend" data-testid="legend">
-      {KINDS.map((kind) => (
-        <span key={kind} className="legend-chip">
-          <span className="legend-dot" style={{ background: `var(--kind-${kind})` }} />
-          {KIND_LABEL[kind]}
-        </span>
-      ))}
-      <span className="legend-hint">
-        time flows left → right · stacked nodes = parallel tool calls · hover a node to light its
-        path
-      </span>
+      {view === "map" ? (
+        <>
+          <span className="legend-chip">
+            <span className="legend-glyph legend-glyph-waypoint" />
+            waypoint = one turn (sized by work)
+          </span>
+          <span className="legend-chip">
+            <span className="legend-glyph legend-glyph-hazard" />
+            verified flags
+          </span>
+          <span className="legend-chip">
+            <span className="legend-glyph legend-glyph-advisory" />
+            advisory
+          </span>
+          <span className="legend-chip">
+            <span className="legend-glyph legend-glyph-pennant">⚑</span>
+            decision / checkpoint
+          </span>
+          <span className="legend-chip">
+            <span className="legend-glyph legend-glyph-here" />
+            you are here
+          </span>
+          <span className="legend-hint">
+            each trail is a session · click a waypoint to open its turn
+          </span>
+        </>
+      ) : (
+        <>
+          {KINDS.map((kind) => (
+            <span key={kind} className="legend-chip">
+              <span className="legend-dot" style={{ background: `var(--kind-${kind})` }} />
+              {KIND_LABEL[kind]}
+            </span>
+          ))}
+          <span className="legend-hint">
+            time flows left → right · stacked nodes = parallel tool calls · hover a node to light
+            its path
+          </span>
+        </>
+      )}
       <span className="legend-count">
-        {nodeCount} nodes · {sessionCount} session{sessionCount === 1 ? "" : "s"}
+        {nodeCount} steps · {sessionCount} session{sessionCount === 1 ? "" : "s"}
       </span>
     </div>
   );

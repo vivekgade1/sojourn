@@ -4,6 +4,8 @@ export interface ToolbarProps {
   projects: Project[];
   selectedProjectId: string | null;
   onSelectProject: (id: string) => void;
+  view: "map" | "graph";
+  onSetView: (view: "map" | "graph") => void;
   decisionLens: boolean;
   onToggleDecisionLens: () => void;
   flaggedOnly: boolean;
@@ -20,6 +22,8 @@ export function Toolbar({
   projects,
   selectedProjectId,
   onSelectProject,
+  view,
+  onSetView,
   decisionLens,
   onToggleDecisionLens,
   flaggedOnly,
@@ -50,6 +54,23 @@ export function Toolbar({
           </option>
         ))}
       </select>
+
+      <div className="view-switch" role="group" aria-label="View">
+        <button
+          className={view === "map" ? "active" : ""}
+          onClick={() => onSetView("map")}
+          aria-pressed={view === "map"}
+        >
+          Map
+        </button>
+        <button
+          className={view === "graph" ? "active" : ""}
+          onClick={() => onSetView("graph")}
+          aria-pressed={view === "graph"}
+        >
+          Graph
+        </button>
+      </div>
 
       <div className={`toolbar-search${searching ? " active" : ""}`}>
         <input

@@ -2,10 +2,12 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "./api";
 import { GraphCanvas } from "./components/GraphCanvas";
 import { Inspector } from "./components/Inspector";
+import { JourneyMap } from "./components/JourneyMap";
 import { Legend } from "./components/Legend";
 import { Toolbar } from "./components/Toolbar";
 import { trailOf } from "./layout";
 import { searchNodes } from "./search";
+import { buildJourneys, nodeToTurnIndex } from "./turns";
 import type { Annotation, ChronoNode, Project, StoredFlag } from "./types";
 import { connectWs } from "./ws";
 
@@ -17,11 +19,15 @@ function hasActiveFlags(node: ChronoNode): boolean {
   return (node.flags ?? []).some((f) => !f.dismissed && !f.autoResolved);
 }
 
+export type ViewMode = "map" | "graph";
+
 export function App() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
   const [nodes, setNodes] = useState<ChronoNode[]>([]);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [selectedTurnId, setSelectedTurnId] = useState<string | null>(null);
+  const [view, setView] = useState<ViewMode>("map");
   const [decisionLens, setDecisionLens] = useState(false);
   const [flaggedOnly, setFlaggedOnly] = useState(false);
   const [wsConnected, setWsConnected] = useState(false);
@@ -90,6 +96,9 @@ export function App() {
     return unsubscribe;
   }, []);
 
+  // Graph view REMOVES filtered-out nodes. The map instead keeps every turn
+  // and fades the ones without signal (emphasis, not removal) — a journey
+  // with missing waypoints wouldn't read as a journey.
   const visibleNodes = useMemo(() => {
     let filtered = nodes;
     if (decisionLens) {
@@ -101,36 +110,66 @@ export function App() {
     return filtered;
   }, [nodes, decisionLens, flaggedOnly]);
 
+  const journeys = useMemo(() => buildJourneys(nodes), [nodes]);
+  const turnIndex = useMemo(() => nodeToTurnIndex(journeys), [journeys]);
+
   const searchActive = searchQuery.trim().length > 0;
+  const searchScope = view === "map" ? nodes : visibleNodes;
   const matchIds = useMemo(
-    () => (searchActive ? searchNodes(visibleNodes, searchQuery) : []),
-    [visibleNodes, searchQuery, searchActive],
+    () => (searchActive ? searchNodes(searchScope, searchQuery) : []),
+    [searchScope, searchQuery, searchActive],
   );
   const searchHits = useMemo(
     () => (searchActive ? new Set(matchIds) : null),
     [matchIds, searchActive],
   );
+  const matchedTurnIds = useMemo(() => {
+    if (!searchActive) return null;
+    return new Set(matchIds.map((id) => turnIndex.get(id)).filter((t): t is string => !!t));
+  }, [matchIds, turnIndex, searchActive]);
+
+  // In map view, cycle through matched TURNS (deduped, in match order).
+  const matchCycle = useMemo(() => {
+    if (view === "graph") return matchIds;
+    const seen = new Set<string>();
+    const turns: string[] = [];
+    for (const id of matchIds) {
+      const turnId = turnIndex.get(id);
+      if (turnId && !seen.has(turnId)) {
+        seen.add(turnId);
+        turns.push(turnId);
+      }
+    }
+    return turns;
+  }, [matchIds, turnIndex, view]);
 
   // Reset match cursor whenever the query or result set changes.
   useEffect(() => {
-    setActiveMatchIndex(matchIds.length > 0 ? 0 : -1);
-    if (matchIds.length > 0) {
-      setFocus((f) => ({ id: matchIds[0], nonce: f.nonce + 1 }));
+    setActiveMatchIndex(matchCycle.length > 0 ? 0 : -1);
+    if (matchCycle.length > 0) {
+      setFocus((f) => ({ id: matchCycle[0], nonce: f.nonce + 1 }));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [searchQuery, matchIds.join("\n")]);
+  }, [searchQuery, matchCycle.join("\n")]);
 
   function cycleMatch(direction: 1 | -1) {
-    if (matchIds.length === 0) return;
-    const next = (activeMatchIndex + direction + matchIds.length) % matchIds.length;
+    if (matchCycle.length === 0) return;
+    const next = (activeMatchIndex + direction + matchCycle.length) % matchCycle.length;
     setActiveMatchIndex(next);
-    setSelectedNodeId(matchIds[next]);
-    setFocus((f) => ({ id: matchIds[next], nonce: f.nonce + 1 }));
+    const target = matchCycle[next];
+    if (view === "graph") {
+      setSelectedNodeId(target);
+    } else {
+      setSelectedTurnId(target);
+    }
+    setFocus((f) => ({ id: target, nonce: f.nonce + 1 }));
   }
 
   function selectAndFocus(id: string) {
     setSelectedNodeId(id);
-    setFocus((f) => ({ id, nonce: f.nonce + 1 }));
+    const turnId = turnIndex.get(id);
+    if (turnId) setSelectedTurnId(turnId);
+    setFocus((f) => ({ id: view === "map" ? (turnId ?? null) : id, nonce: f.nonce + 1 }));
   }
 
   const selectedNode = useMemo(
@@ -146,7 +185,7 @@ export function App() {
       .filter((n): n is ChronoNode => Boolean(n));
   }, [selectedNodeId, nodes]);
 
-  const sessionCount = useMemo(() => new Set(visibleNodes.map((n) => n.sessionId)).size, [visibleNodes]);
+  const sessionCount = journeys.length;
 
   function handleFlagDismissed(nodeId: string, flagId: number) {
     setNodes((prev) =>
@@ -177,7 +216,13 @@ export function App() {
       <Toolbar
         projects={projects}
         selectedProjectId={selectedProjectId}
-        onSelectProject={setSelectedProjectId}
+        onSelectProject={(id) => {
+          setSelectedProjectId(id);
+          setSelectedTurnId(null);
+          setSelectedNodeId(null);
+        }}
+        view={view}
+        onSetView={setView}
         decisionLens={decisionLens}
         onToggleDecisionLens={() => setDecisionLens((v) => !v)}
         flaggedOnly={flaggedOnly}
@@ -185,21 +230,35 @@ export function App() {
         wsConnected={wsConnected}
         searchQuery={searchQuery}
         onSearchQueryChange={setSearchQuery}
-        matchCount={matchIds.length}
+        matchCount={matchCycle.length}
         activeMatchIndex={activeMatchIndex}
         onCycleMatch={cycleMatch}
       />
-      <Legend nodeCount={visibleNodes.length} sessionCount={sessionCount} />
+      <Legend nodeCount={nodes.length} sessionCount={sessionCount} view={view} />
       {error && <div className="inspector-meta" style={{ padding: 8 }}>{error}</div>}
       <div className="app-body">
-        <GraphCanvas
-          nodes={visibleNodes}
-          selectedNodeId={selectedNodeId}
-          onSelectNode={setSelectedNodeId}
-          searchHits={searchHits}
-          focusNodeId={focus.id}
-          focusNonce={focus.nonce}
-        />
+        {view === "map" ? (
+          <JourneyMap
+            journeys={journeys}
+            selectedTurnId={selectedTurnId}
+            onSelectTurn={setSelectedTurnId}
+            onSelectNode={setSelectedNodeId}
+            selectedNodeId={selectedNodeId}
+            matchedTurnIds={matchedTurnIds}
+            emphasizeSignal={decisionLens || flaggedOnly}
+            focusTurnId={focus.id}
+            focusNonce={focus.nonce}
+          />
+        ) : (
+          <GraphCanvas
+            nodes={visibleNodes}
+            selectedNodeId={selectedNodeId}
+            onSelectNode={setSelectedNodeId}
+            searchHits={searchHits}
+            focusNodeId={focus.id}
+            focusNonce={focus.nonce}
+          />
+        )}
         <Inspector
           node={selectedNode}
           onFlagDismissed={handleFlagDismissed}
