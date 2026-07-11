@@ -59,18 +59,34 @@ export function realFetchJson(): FetchJson {
   };
 }
 
-/** Builds a `snapshotterFor` function that inits a `ShadowSnapshotter`
- * exactly once per project and caches it thereafter. */
+/**
+ * Builds a `snapshotterFor` function that inits a `ShadowSnapshotter`
+ * exactly once per (project id, root) pair and caches it thereafter.
+ *
+ * Keyed by id+root, NOT id alone: worktree-project aliasing (V2 Task 7)
+ * calls this with a synthetic project that carries the ORIGIN project's id
+ * but a WORKTREE root, so the daemon writes into the origin's shadow git
+ * object store (shared, since snapshotsDir() is keyed by id alone) while
+ * reading files from the worktree. A `ShadowSnapshotter` instance pins its
+ * `projectRoot` at construction time, so a cache keyed by id alone would
+ * hand back whichever root got there first — e.g. the mainline-rooted
+ * instance for a worktree request — silently snapshotting the wrong
+ * directory. Keying by id+root lets a mainline snapshotter and any number
+ * of worktree snapshotters for the same project id coexist, each pinned to
+ * its own root, while still sharing one shadowDir (and therefore one
+ * object database, so tree hashes from either root stay mutually valid).
+ */
 function makeSnapshotterFor(): (project: Project) => SnapshotterLike {
   const cache = new Map<string, SnapshotterLike>();
   return (project: Project): SnapshotterLike => {
-    const existing = cache.get(project.id);
+    const key = `${project.id}::${project.root}`;
+    const existing = cache.get(key);
     if (existing) return existing;
     const snapshotter = new ShadowSnapshotter({
       projectRoot: project.root,
       shadowDir: snapshotsDir(project.id),
     });
-    cache.set(project.id, snapshotter);
+    cache.set(key, snapshotter);
     return snapshotter;
   };
 }

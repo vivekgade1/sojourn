@@ -126,6 +126,12 @@ export function looksLikeRelativeFilePath(token: string): boolean {
   if (/^(https?|ftp|git|ssh):/i.test(t)) return false;
   if (t.startsWith("/")) return false; // absolute path
   if (t.startsWith("~")) return false;
+  // Import-alias specifiers are module ids, not repo paths — reject them as
+  // claim subjects. Keep in sync with packages.ts `isAliasedImport`, which
+  // skips the same prefixes for imports: `@/…` (bundler/tsconfig alias),
+  // `~/…` (covered by the `~` reject above), `#…` (Node subpath imports).
+  if (t.startsWith("@/")) return false;
+  if (t.startsWith("#")) return false;
   if (t.includes("*") || t.includes("?") || t.includes("[")) return false; // globs
   if (!(t.includes(".") || t.includes("/"))) return false;
   // reject things that are clearly not paths, e.g. "e.g." or "i.e." (no
@@ -138,9 +144,56 @@ export function looksLikeRelativeFilePath(token: string): boolean {
   return true;
 }
 
+// --- Hedge / negation suppression ------------------------------------------
+// Mirrors the sentence-scoped hedge approach in tests.ts (`isHedgedMatch`):
+// a claim verb preceded, within the same sentence, by a genuine future/
+// conditional marker ("Once tests pass, I will have updated `x`") states an
+// intention, not a completed edit, and must not be read as a claim. Only
+// true hedge markers count — common narrative words ("after", "before",
+// "then") are deliberately excluded because they appear constantly in
+// genuine completed-work claims. `'ll` covers contractions ("I'll have
+// updated"); "will|would|…" cover future-perfect "<modal> have <verb>".
+const SENTENCE_BOUNDARY = /[.!?;\n]/;
+const HEDGE_MARKER =
+  /\b(will|would|should|could|may|might|shall|once|unless|until|going to|plan(?:ning)? to|about to|intend(?:s|ed)? to)\b|'ll\b/i;
+
+// Negation is scoped tighter — to the clause (commas also end the window):
+// "I haven't updated `x`" is a truthful non-claim, but "I didn't touch the
+// tests, but I updated `x`" still asserts the edit in its own clause.
+const CLAUSE_BOUNDARY = /[.!?;:\n,]/;
+const NEGATION_MARKER = /\b(not|never|no longer)\b|n't\b/i;
+
+/** Index of the first character after the nearest `boundary` character
+ * before `index` (or 0 if none) — the start of the sentence/clause that
+ * contains `index`. Same scoping as tests.ts's `sentenceStartBefore`. */
+function windowStartBefore(text: string, index: number, boundary: RegExp): number {
+  for (let i = index - 1; i >= 0; i--) {
+    if (boundary.test(text[i])) return i + 1;
+  }
+  return 0;
+}
+
+/**
+ * True when the claim verb at `verbIndex` is hedged (future/conditional,
+ * incl. future-perfect "will have updated") or negated ("haven't updated",
+ * "didn't change") and therefore must not count as a completed-edit claim.
+ * Suppression favors precision per the design principles: a suppressed
+ * claim can never become a false flag.
+ */
+function isSuppressedClaimVerb(text: string, verbIndex: number): boolean {
+  const sentenceWindow = text.slice(
+    windowStartBefore(text, verbIndex, SENTENCE_BOUNDARY),
+    verbIndex,
+  );
+  if (HEDGE_MARKER.test(sentenceWindow)) return true;
+  const clauseWindow = text.slice(windowStartBefore(text, verbIndex, CLAUSE_BOUNDARY), verbIndex);
+  return NEGATION_MARKER.test(clauseWindow);
+}
+
 /**
  * Extract edit-claims from assistant text: a claim verb within 60 chars
- * before a backticked path-looking token.
+ * before a backticked path-looking token. Verbs that are hedged (future/
+ * conditional) or negated in their own sentence/clause are not claims.
  */
 export function extractEditClaims(text: string): EditClaim[] {
   const claims: EditClaim[] = [];
@@ -171,6 +224,7 @@ export function extractEditClaims(text: string): EditClaim[] {
       }
     }
     if (!best) continue;
+    if (isSuppressedClaimVerb(text, best.index)) continue;
     claims.push({ kind: verbToKind(best.verb), path: token.trim(), index: best.index });
   }
   return claims;

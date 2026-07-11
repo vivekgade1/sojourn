@@ -29,6 +29,17 @@ const EXCLUDE_ENTRIES = [
   "*.key",
   ".sojourn/",
   ".DS_Store",
+  "*.p12",
+  "*.keystore",
+  "id_rsa",
+  "id_rsa.*",
+  "*.token",
+  "credentials",
+  "credentials.*",
+  ".aws/",
+  ".ssh/",
+  "*.secret",
+  "*.pfx",
 ];
 
 export interface ShadowSnapshotterOptions {

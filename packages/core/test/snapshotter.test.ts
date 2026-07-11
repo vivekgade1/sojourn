@@ -49,8 +49,60 @@ describe("ShadowSnapshotter", () => {
       "*.key",
       ".sojourn/",
       ".DS_Store",
+      "*.p12",
+      "*.keystore",
+      "id_rsa",
+      "id_rsa.*",
+      "*.token",
+      "credentials",
+      "credentials.*",
+      ".aws/",
+      ".ssh/",
+      "*.secret",
+      "*.pfx",
     ]) {
       expect(excludeContents).toContain(entry);
+    }
+  });
+
+  it("never lets planted secrets (.env, id_rsa, .aws/credentials, and friends) into listFiles()", async () => {
+    await fsp.writeFile(path.join(projectRoot, ".env"), "SECRET=shh");
+    await fsp.writeFile(path.join(projectRoot, ".env.production"), "SECRET=shh-prod");
+    await fsp.writeFile(path.join(projectRoot, "id_rsa"), "-----BEGIN OPENSSH PRIVATE KEY-----");
+    await fsp.writeFile(path.join(projectRoot, "id_rsa.pub"), "ssh-rsa AAAA...");
+    await fsp.writeFile(path.join(projectRoot, "server.p12"), "binary-cert-bytes");
+    await fsp.writeFile(path.join(projectRoot, "app.keystore"), "binary-keystore-bytes");
+    await fsp.writeFile(path.join(projectRoot, "app.pfx"), "binary-pfx-bytes");
+    await fsp.writeFile(path.join(projectRoot, "api.token"), "tok_abc123");
+    await fsp.writeFile(path.join(projectRoot, "credentials"), "aws_access_key_id=AKIA...");
+    await fsp.writeFile(path.join(projectRoot, "credentials.json"), '{"key":"secret"}');
+    await fsp.writeFile(path.join(projectRoot, "notes.secret"), "shh");
+    await fsp.mkdir(path.join(projectRoot, ".aws"), { recursive: true });
+    await fsp.writeFile(path.join(projectRoot, ".aws", "credentials"), "aws_secret_access_key=...");
+    await fsp.mkdir(path.join(projectRoot, ".ssh"), { recursive: true });
+    await fsp.writeFile(path.join(projectRoot, ".ssh", "id_rsa"), "-----BEGIN OPENSSH PRIVATE KEY-----");
+    await fsp.writeFile(path.join(projectRoot, "real.txt"), "tracked, not a secret");
+
+    const tree = await snapshotter.snapshot();
+    const files = await snapshotter.listFiles(tree);
+
+    expect(files).toContain("real.txt");
+    for (const secretPath of [
+      ".env",
+      ".env.production",
+      "id_rsa",
+      "id_rsa.pub",
+      "server.p12",
+      "app.keystore",
+      "app.pfx",
+      "api.token",
+      "credentials",
+      "credentials.json",
+      "notes.secret",
+      ".aws/credentials",
+      ".ssh/id_rsa",
+    ]) {
+      expect(files).not.toContain(secretPath);
     }
   });
 

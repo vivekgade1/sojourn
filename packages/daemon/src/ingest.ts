@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import path from "node:path";
 import type {
   ChronoNode,
   FetchJson,
@@ -42,6 +43,107 @@ function projectRootExists(root: string): boolean {
   }
 }
 
+const RESTORE_MANIFEST_FILENAME = ".sojourn-restore.json";
+
+interface WorktreeRestoreManifest {
+  nodeId: string;
+}
+
+/**
+ * Reads and validates `<root>/.sojourn-restore.json` (written by
+ * `RestoreEngine.restore`). Returns `null` — after at most one stderr log
+ * line — when the file is absent (the overwhelmingly common case, so a
+ * missing file logs nothing), unreadable, not valid JSON, or missing a
+ * non-empty `nodeId` string.
+ */
+function readRestoreManifest(root: string): WorktreeRestoreManifest | null {
+  const manifestPath = path.join(root, RESTORE_MANIFEST_FILENAME);
+  let raw: string;
+  try {
+    raw = fs.readFileSync(manifestPath, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      console.error(
+        `[sojourn] ingest: failed to read worktree restore manifest at ${manifestPath}:`,
+        err,
+      );
+    }
+    return null;
+  }
+
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    const nodeId =
+      parsed !== null && typeof parsed === "object"
+        ? (parsed as { nodeId?: unknown }).nodeId
+        : undefined;
+    if (typeof nodeId === "string" && nodeId.length > 0) {
+      return { nodeId };
+    }
+    console.error(
+      `[sojourn] ingest: invalid worktree restore manifest at ${manifestPath}: missing "nodeId"`,
+    );
+    return null;
+  } catch (err) {
+    console.error(
+      `[sojourn] ingest: failed to parse worktree restore manifest at ${manifestPath}:`,
+      err,
+    );
+    return null;
+  }
+}
+
+/** First 8 characters of a node id AFTER its `${cli}:` prefix, e.g.
+ * `"claude:abc123def456"` -> `"abc123de"`. Falls back to the first 8 chars
+ * of the whole id when there's no colon. */
+function shortNodeId(nodeId: string): string {
+  const idx = nodeId.indexOf(":");
+  const rest = idx >= 0 ? nodeId.slice(idx + 1) : nodeId;
+  return rest.slice(0, 8);
+}
+
+/**
+ * Worktree-project aliasing (V2 Task 7): a session run INSIDE a restored
+ * worktree carries `<worktreeRoot>/.sojourn-restore.json`. When that
+ * manifest's `nodeId` resolves to a real node whose project still exists,
+ * the worktree's session must join that ORIGIN project's graph instead of
+ * forking a phantom project keyed by the worktree's own (throwaway) path —
+ * otherwise every restore silently breaks the cross-session story for
+ * exactly the users who restore most.
+ *
+ * Fails soft: any missing/unreadable/invalid manifest, or an origin node/
+ * project that no longer exists, returns `null` (the caller falls back to
+ * normal, non-aliased ingest) after at most one stderr log line.
+ */
+function resolveWorktreeAlias(
+  store: GraphStore,
+  diskRoot: string,
+): { project: Project; originNodeId: string } | null {
+  const manifest = readRestoreManifest(diskRoot);
+  if (!manifest) return null;
+
+  const originNode = store.getNode(manifest.nodeId);
+  if (!originNode) {
+    console.error(
+      `[sojourn] ingest: worktree restore manifest at ${diskRoot} references unknown node ` +
+        `${manifest.nodeId}; ingesting as a normal (non-aliased) project`,
+    );
+    return null;
+  }
+
+  const originProject = store.getProject(originNode.projectId);
+  if (!originProject) {
+    console.error(
+      `[sojourn] ingest: worktree restore manifest at ${diskRoot} references node ` +
+        `${manifest.nodeId} whose project ${originNode.projectId} no longer exists; ingesting ` +
+        `as a normal (non-aliased) project`,
+    );
+    return null;
+  }
+
+  return { project: originProject, originNodeId: manifest.nodeId };
+}
+
 /**
  * Runs one ingestion pass for a parsed batch of nodes (typically an entire
  * transcript file, since adapters/watcher re-parse the whole file on every
@@ -60,9 +162,21 @@ export async function ingestBatch(
   const { store } = deps;
   const added: string[] = [];
 
+  // The transcript's own recorded root — always the filesystem location to
+  // check for on-disk existence and to snapshot FROM, whether or not the
+  // batch ends up aliased into another project's graph.
+  const diskRoot = batch.project.root;
+
   let project: Project;
+  let originNodeId: string | null = null;
   try {
-    project = store.upsertProject(batch.project.root, batch.project.name);
+    const alias = resolveWorktreeAlias(store, diskRoot);
+    if (alias) {
+      project = alias.project;
+      originNodeId = alias.originNodeId;
+    } else {
+      project = store.upsertProject(batch.project.root, batch.project.name);
+    }
   } catch (err) {
     console.error("[sojourn] ingest: failed to upsert project:", err);
     return { added };
@@ -73,19 +187,47 @@ export async function ingestBatch(
       id: batch.session.id,
       projectId: project.id,
       cli: batch.session.cli,
-      title: batch.session.title,
+      title: originNodeId !== null ? `worktree:${shortNodeId(originNodeId)}` : batch.session.title,
     });
   } catch (err) {
     console.error("[sojourn] ingest: failed to upsert session:", err);
   }
 
   const newNodes: ChronoNode[] = [];
+  // Aliased batches get exactly one fork edge per batch: the first node
+  // whose parent doesn't resolve (the transcript's own session root, whose
+  // parser-assigned parentId is always null — or an orphaned reference) is
+  // reparented to the origin node, with meta.forkedFrom recording the
+  // branch-to-origin edge.
+  //
+  // This is NOT gated on the node being new to the store: adapters re-parse
+  // the whole transcript file on every batch (see the doc comment on this
+  // function), so the SAME root node arrives with its parser-natural
+  // parentId (null) on every subsequent ingest too, and store.upsertNode()
+  // unconditionally overwrites parent_id — gating this on isNew would let
+  // the second batch silently overwrite the fork edge back to null. Since
+  // only the transcript's true root (or a genuinely unresolvable reference)
+  // ever satisfies the condition below, re-applying it on every batch is
+  // idempotent and harmless for every other (already-parented) node in the
+  // session, which is what actually gives "subsequent batches keep natural
+  // parentage" for the REST of the graph.
+  let forkEdgeApplied = false;
 
   for (const rawNode of batch.nodes) {
     const node: ChronoNode = { ...rawNode, projectId: project.id };
     try {
       const existing = store.getNode(node.id);
       const isNew = existing === null;
+
+      if (
+        originNodeId !== null &&
+        !forkEdgeApplied &&
+        (node.parentId === null || store.getNode(node.parentId) === null)
+      ) {
+        node.parentId = originNodeId;
+        node.meta = { ...node.meta, forkedFrom: originNodeId };
+        forkEdgeApplied = true;
+      }
 
       store.upsertNode(node);
 
@@ -105,12 +247,21 @@ export async function ingestBatch(
     (n) => n.kind === "tool_result" || n.kind === "assistant",
   );
 
+  // For aliased (worktree) batches, the snapshot must capture the
+  // WORKTREE's files. Pass a synthetic project that carries the ORIGIN's id
+  // (so blobs/trees land in the origin's shadow git object store, staying
+  // valid against — and diffable with — the origin's history) but the
+  // worktree's root (so the git work-tree actually read from is the
+  // restored worktree, not the mainline checkout).
+  const snapshotProject: Project =
+    originNodeId !== null ? { ...project, root: diskRoot } : project;
+
   let snapshotter: SnapshotterLike | null = null;
   let nodeTree: string | null = null;
 
-  if (snapshotAnchors.length > 0 && projectRootExists(project.root)) {
+  if (snapshotAnchors.length > 0 && projectRootExists(diskRoot)) {
     try {
-      snapshotter = deps.snapshotterFor(project);
+      snapshotter = deps.snapshotterFor(snapshotProject);
       await snapshotter.init();
       nodeTree = await snapshotter.snapshot();
       const last = newNodes[newNodes.length - 1];
@@ -147,7 +298,7 @@ export async function ingestBatch(
           diff,
           parentTree,
           nodeTree: effectiveNodeTree,
-          projectRoot: project.root,
+          projectRoot: diskRoot,
           snapshotter,
           fetchJson: deps.fetchJson,
         };

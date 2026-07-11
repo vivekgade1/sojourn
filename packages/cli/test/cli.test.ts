@@ -1,10 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildProgram, defaultDeps, type ProgramDeps } from "../src/program.js";
-import { projectIdFor } from "@sojourn/core";
+import { projectIdFor, GraphStore, ShadowSnapshotter, runGit, type ShadowGitEnv } from "@sojourn/core";
 import type { Command } from "commander";
 
 type RouteHandler = (req: IncomingMessage, body: unknown) => { status: number; body: unknown };
@@ -533,6 +533,206 @@ describe("soj CLI", () => {
       await run(program, ["restore", "opencode:abc-def"]);
       expect(stub.requests[0]?.url).toBe("/api/nodes/opencode%3Aabc-def/preflight");
       expect(exitCodes).toEqual([1]);
+    });
+  });
+
+  describe("gc", () => {
+    /** Builds a real (tiny) shadow repo directly on disk under `home`,
+     * exactly where the gc command expects to find it
+     * (`<home>/snapshots/<projectId>`), with two snapshots: one far outside
+     * any reasonable retention window and one recent. Bypasses
+     * ShadowSnapshotter.snapshot() (which always uses "now") to control
+     * commit dates via GIT_COMMITTER_DATE/GIT_AUTHOR_DATE, the same way
+     * core's gc.test.ts does. Also registers the project in a real
+     * sojourn.db under `home` so the CLI command's store lookup succeeds. */
+    async function buildShadowRepo(
+      sojournHome: string,
+      cwd: string,
+    ): Promise<{ projectId: string; shadowDir: string; projectRoot: string; oldTree: string; recentTree: string }> {
+      const projectId = projectIdFor(cwd);
+      const shadowDir = join(sojournHome, "snapshots", projectId);
+      const projectRoot = mkdtempSync(join(tmpdir(), "sojourn-gc-cli-project-"));
+      const snapshotter = new ShadowSnapshotter({ projectRoot, shadowDir });
+      await snapshotter.init();
+
+      const env: ShadowGitEnv = {
+        GIT_DIR: shadowDir,
+        GIT_WORK_TREE: projectRoot,
+        GIT_INDEX_FILE: join(shadowDir, "sojourn-index"),
+      };
+      const nowSec = Math.floor(Date.now() / 1000);
+      const dates = [nowSec - 40 * 86400, nowSec - 1 * 86400];
+      const trees: string[] = [];
+      let parent: string | null = null;
+      for (let i = 0; i < 2; i++) {
+        writeFileSync(join(projectRoot, "f.txt"), `v${i}`);
+        await runGit(["add", "-A"], env);
+        const tree = (await runGit(["write-tree"], env)).trim();
+        const commitArgs = ["commit-tree", tree, "-m", `snap-${i}`];
+        if (parent) commitArgs.push("-p", parent);
+        const commitEnv: ShadowGitEnv = {
+          ...env,
+          GIT_COMMITTER_DATE: `${dates[i]} +0000`,
+          GIT_AUTHOR_DATE: `${dates[i]} +0000`,
+        };
+        const commit = (await runGit(commitArgs, commitEnv)).trim();
+        await runGit(["update-ref", "refs/sojourn/head", commit], env);
+        parent = commit;
+        trees.push(tree);
+      }
+
+      const dbFile = join(sojournHome, "sojourn.db");
+      const store = new GraphStore(dbFile);
+      store.upsertProject(cwd, "GC Test Project");
+      store.close();
+
+      return { projectId, shadowDir, projectRoot, oldTree: trees[0], recentTree: trees[1] };
+    }
+
+    it("prints a friendly message and does nothing when there is no sojourn database yet", async () => {
+      const { deps, out } = makeDeps({ baseUrl: stub.baseUrl, sojournHome: home });
+      const program = buildProgram(deps);
+      await run(program, ["gc"]);
+      expect(out.join("\n")).toContain("no sojourn database found");
+    });
+
+    it("prints a friendly message when the project has no shadow snapshot repo yet", async () => {
+      const cwd = "/repo/gc-no-shadow";
+      const dbFile = join(home, "sojourn.db");
+      const store = new GraphStore(dbFile);
+      store.upsertProject(cwd, "No Shadow");
+      store.close();
+
+      const { deps, out } = makeDeps({ baseUrl: stub.baseUrl, sojournHome: home, cwd });
+      const program = buildProgram(deps);
+      await run(program, ["gc"]);
+      expect(out.join("\n")).toContain("no shadow snapshot repo");
+    });
+
+    it("errors on a non-numeric --days and exits 1", async () => {
+      const { deps, err, exitCodes } = makeDeps({ baseUrl: stub.baseUrl, sojournHome: home });
+      const program = buildProgram(deps);
+      await run(program, ["gc", "--days", "banana"]);
+      expect(err.join("\n")).toContain("--days must be a non-negative integer");
+      expect(exitCodes).toEqual([1]);
+    });
+
+    it("dry run (default): previews kept/pruned counts + reclaim estimate + a re-run hint, and mutates nothing", async () => {
+      const cwd = "/repo/gc-dry-run";
+      const { shadowDir, projectRoot, oldTree, recentTree } = await buildShadowRepo(home, cwd);
+      const verifyEnv: ShadowGitEnv = {
+        GIT_DIR: shadowDir,
+        GIT_WORK_TREE: shadowDir,
+        GIT_INDEX_FILE: join(shadowDir, "verify-index"),
+      };
+      const before = (await runGit(["rev-parse", "refs/sojourn/head"], verifyEnv)).trim();
+
+      const { deps, out, exitCodes } = makeDeps({ baseUrl: stub.baseUrl, sojournHome: home, cwd });
+      const program = buildProgram(deps);
+      await run(program, ["gc", "--days", "10"]);
+
+      const text = out.join("\n");
+      expect(text).toContain("kept");
+      expect(text).toContain("pruned");
+      expect(text).toContain("pinned trees: 0");
+      expect(text).toMatch(/reclaimable \(estimate\): /);
+      expect(text).toContain("dry run only — nothing was deleted. Re-run with --run to execute.");
+      expect(exitCodes).toEqual([]);
+
+      const after = (await runGit(["rev-parse", "refs/sojourn/head"], verifyEnv)).trim();
+      expect(after).toBe(before);
+      const snapshotter = new ShadowSnapshotter({ projectRoot, shadowDir });
+      expect(await snapshotter.hasTree(oldTree)).toBe(true);
+      expect(await snapshotter.hasTree(recentTree)).toBe(true);
+    });
+
+    it("--run actually prunes: the old snapshot's tree becomes unreachable, prints gc complete", async () => {
+      const cwd = "/repo/gc-run";
+      const { shadowDir, projectRoot, oldTree, recentTree } = await buildShadowRepo(home, cwd);
+
+      const { deps, out } = makeDeps({ baseUrl: stub.baseUrl, sojournHome: home, cwd });
+      const program = buildProgram(deps);
+      await run(program, ["gc", "--days", "10", "--run"]);
+
+      expect(out.join("\n")).toContain("gc complete.");
+
+      const snapshotter = new ShadowSnapshotter({ projectRoot, shadowDir });
+      expect(await snapshotter.hasTree(oldTree)).toBe(false);
+      expect(await snapshotter.hasTree(recentTree)).toBe(true);
+    });
+
+    it("--archive-dir writes a backup bundle before pruning and reports its path", async () => {
+      const cwd = "/repo/gc-archive";
+      await buildShadowRepo(home, cwd);
+      const archiveDir = mkdtempSync(join(tmpdir(), "sojourn-gc-cli-archive-"));
+
+      const { deps, out } = makeDeps({ baseUrl: stub.baseUrl, sojournHome: home, cwd });
+      const program = buildProgram(deps);
+      await run(program, ["gc", "--days", "10", "--run", "--archive-dir", archiveDir]);
+
+      const match = out.join("\n").match(/archived pruned history to: (.+\.bundle)/);
+      expect(match).not.toBeNull();
+      expect(existsSync(match![1])).toBe(true);
+      rmSync(archiveDir, { recursive: true, force: true });
+    });
+
+    it("respects an explicit --project flag over cwd", async () => {
+      const cwd = "/repo/gc-explicit-cwd";
+      const explicitCwd = "/repo/gc-explicit-target";
+      const { projectId } = await buildShadowRepo(home, explicitCwd);
+
+      const { deps, out, exitCodes } = makeDeps({ baseUrl: stub.baseUrl, sojournHome: home, cwd });
+      const program = buildProgram(deps);
+      await run(program, ["gc", "--project", projectId]);
+
+      expect(out.join("\n")).toContain(projectId);
+      expect(exitCodes).toEqual([]);
+    });
+
+    it("prints an informational (non-blocking) note when the daemon appears to be running", async () => {
+      const cwd = "/repo/gc-daemon-note";
+      await buildShadowRepo(home, cwd);
+      const { writePid } = await import("../src/daemonCtl.js");
+      writePid(home, process.pid); // current test process: definitely alive
+
+      const { deps, out, exitCodes } = makeDeps({ baseUrl: stub.baseUrl, sojournHome: home, cwd });
+      const program = buildProgram(deps);
+      await run(program, ["gc"]);
+
+      const text = out.join("\n");
+      expect(text).toContain(`daemon is running (pid ${process.pid})`);
+      expect(text).toContain("safe to do concurrently with capture");
+      expect(exitCodes).toEqual([]);
+    });
+
+    it("protects a tree referenced by a live worktree's .sojourn-restore.json manifest from pruning", async () => {
+      const cwd = "/repo/gc-worktree-pin";
+      const { projectId, shadowDir, projectRoot, oldTree, recentTree } = await buildShadowRepo(home, cwd);
+
+      const worktreeDir = join(home, "worktrees", projectId, "abc12345-20260101000000");
+      mkdirSync(worktreeDir, { recursive: true });
+      writeFileSync(
+        join(worktreeDir, ".sojourn-restore.json"),
+        JSON.stringify(
+          {
+            nodeId: "claude:x",
+            treeHash: oldTree,
+            safetySnapshotRef: "deadbeef",
+            restoredAt: "2026-01-01T00:00:00.000Z",
+            resumeCommand: null,
+          },
+          null,
+          2,
+        ),
+      );
+
+      const { deps } = makeDeps({ baseUrl: stub.baseUrl, sojournHome: home, cwd });
+      const program = buildProgram(deps);
+      await run(program, ["gc", "--days", "10", "--run"]);
+
+      const snapshotter = new ShadowSnapshotter({ projectRoot, shadowDir });
+      expect(await snapshotter.hasTree(oldTree)).toBe(true); // protected by the worktree manifest
+      expect(await snapshotter.hasTree(recentTree)).toBe(true);
     });
   });
 

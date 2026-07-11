@@ -63,14 +63,22 @@ describe("ingestBatch", () => {
       flagEngine,
       events: sink,
       fetchJson,
+      // Keyed by id+root (mirrors wire.ts's makeSnapshotterFor fix for V2
+      // Task 7): a worktree-aliased batch calls this with a synthetic
+      // project carrying the ORIGIN's id but the WORKTREE's root, and that
+      // must get its OWN ShadowSnapshotter instance (pinned to the
+      // worktree root) rather than reusing whatever instance was cached
+      // first for that id — while still sharing the same shadowDir (keyed
+      // by id alone) so tree hashes from either root stay valid together.
       snapshotterFor(project: Project): SnapshotterLike {
-        const existing = snapshotters.get(project.id);
+        const key = `${project.id}::${project.root}`;
+        const existing = snapshotters.get(key);
         if (existing) return existing;
         const snapshotter = new ShadowSnapshotter({
           projectRoot: project.root,
           shadowDir: path.join(shadowRoot, project.id),
         });
-        snapshotters.set(project.id, snapshotter);
+        snapshotters.set(key, snapshotter);
         return snapshotter;
       },
     };
@@ -393,5 +401,316 @@ describe("ingestBatch", () => {
     expect(result.added).not.toContain("claude:bad1");
     expect(store.getNode("claude:bad1")).toBeNull();
     expect(store.getNode("claude:good1")).not.toBeNull();
+  });
+
+  describe("worktree-project aliasing (V2 Task 7)", () => {
+    it("aliases a batch from a restored worktree into the origin project's graph, titling the session worktree:<node8> and parenting the first node to the origin with meta.forkedFrom", async () => {
+      await fsp.writeFile(path.join(projectRoot, "a.txt"), "origin content");
+      const deps = makeDeps();
+
+      // Origin session, in the mainline project.
+      const originPrompt = node(
+        "aaaaaaaa1111",
+        null,
+        "prompt",
+        "s-origin",
+        "2026-01-01T00:00:00.000Z",
+        "hi",
+      );
+      const originReply = node(
+        "origin-reply",
+        "aaaaaaaa1111",
+        "assistant",
+        "s-origin",
+        "2026-01-01T00:00:01.000Z",
+        { type: "text", text: "hello" },
+      );
+      await ingestBatch(deps, {
+        project: { root: projectRoot, name: "mainline" },
+        session: { id: "s-origin", cli: "claude" },
+        nodes: [originPrompt, originReply],
+      });
+      const originNodeId = "claude:aaaaaaaa1111";
+      expect(store.getNode(originNodeId)).not.toBeNull();
+
+      // Simulate a restored worktree: a fresh directory carrying the
+      // .sojourn-restore.json manifest RestoreEngine.restore() writes,
+      // pointing back at the origin node.
+      const worktreeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "sojourn-ingest-worktree-"));
+      try {
+        await fsp.writeFile(
+          path.join(worktreeRoot, ".sojourn-restore.json"),
+          JSON.stringify({
+            nodeId: originNodeId,
+            treeHash: "deadbeef",
+            safetySnapshotRef: "cafebabe",
+            restoredAt: "2026-01-02T00:00:00.000Z",
+            resumeCommand: null,
+          }),
+          "utf8",
+        );
+
+        const wtRoot = node(
+          "wt-root",
+          null,
+          "prompt",
+          "s-worktree",
+          "2026-01-02T00:00:01.000Z",
+          "continue here",
+        );
+        const wtChild = node(
+          "wt-child",
+          "wt-root",
+          "assistant",
+          "s-worktree",
+          "2026-01-02T00:00:02.000Z",
+          { type: "text", text: "sure" },
+        );
+
+        const result = await ingestBatch(deps, {
+          project: { root: worktreeRoot, name: "worktree-phantom" },
+          session: { id: "s-worktree", cli: "claude" },
+          nodes: [wtRoot, wtChild],
+        });
+        expect(result.added).toEqual(["claude:wt-root", "claude:wt-child"]);
+
+        // No new project was created for the worktree root — it aliased
+        // into the (only) origin project.
+        const projects = store.getProjects();
+        expect(projects).toHaveLength(1);
+        const originProjectId = projects[0].id;
+
+        // The worktree session lands under the origin project, titled
+        // worktree:<first 8 chars of the origin node id AFTER its colon>.
+        const sessions = store.getSessions(originProjectId);
+        const wtSession = sessions.find((s) => s.id === "s-worktree");
+        expect(wtSession).toBeDefined();
+        expect(wtSession!.title).toBe("worktree:aaaaaaaa");
+
+        // The worktree's root node is reparented to the origin node, with
+        // the branch-to-origin fork edge recorded in meta.forkedFrom.
+        const storedRoot = store.getNode("claude:wt-root")!;
+        expect(storedRoot.projectId).toBe(originProjectId);
+        expect(storedRoot.parentId).toBe(originNodeId);
+        expect(storedRoot.meta.forkedFrom).toBe(originNodeId);
+
+        // Natural parentage is preserved for the rest of the worktree's
+        // nodes — only the root gets the fork edge.
+        const storedChild = store.getNode("claude:wt-child")!;
+        expect(storedChild.parentId).toBe("claude:wt-root");
+        expect(storedChild.meta.forkedFrom).toBeUndefined();
+      } finally {
+        fs.rmSync(worktreeRoot, { recursive: true, force: true });
+      }
+    });
+
+    it("keeps natural parentage on subsequent batches for an already-aliased session (fork edge applied only once)", async () => {
+      await fsp.writeFile(path.join(projectRoot, "a.txt"), "origin content");
+      const deps = makeDeps();
+
+      const originPrompt = node(
+        "sub-origin-p",
+        null,
+        "prompt",
+        "s-sub-origin",
+        "2026-01-01T00:00:00.000Z",
+        "hi",
+      );
+      await ingestBatch(deps, {
+        project: { root: projectRoot, name: "mainline" },
+        session: { id: "s-sub-origin", cli: "claude" },
+        nodes: [originPrompt],
+      });
+      const originNodeId = "claude:sub-origin-p";
+
+      const worktreeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "sojourn-ingest-worktree-sub-"));
+      try {
+        await fsp.writeFile(
+          path.join(worktreeRoot, ".sojourn-restore.json"),
+          JSON.stringify({ nodeId: originNodeId }),
+          "utf8",
+        );
+
+        const wtRoot = node(
+          "sub-wt-root",
+          null,
+          "prompt",
+          "s-sub-wt",
+          "2026-01-02T00:00:00.000Z",
+          "continue",
+        );
+        await ingestBatch(deps, {
+          project: { root: worktreeRoot, name: "worktree-phantom" },
+          session: { id: "s-sub-wt", cli: "claude" },
+          nodes: [wtRoot],
+        });
+        expect(store.getNode("claude:sub-wt-root")!.parentId).toBe(originNodeId);
+
+        // A later batch re-parses the whole session file: wtRoot again,
+        // plus a genuinely new child. wtRoot is no longer NEW, so its
+        // parent/forkedFrom must be untouched, and the new child must keep
+        // its natural parent (wtRoot) rather than getting reparented to
+        // the origin.
+        const wtChild = node(
+          "sub-wt-child",
+          "sub-wt-root",
+          "assistant",
+          "s-sub-wt",
+          "2026-01-02T00:00:01.000Z",
+          { type: "text", text: "ok" },
+        );
+        await ingestBatch(deps, {
+          project: { root: worktreeRoot, name: "worktree-phantom" },
+          session: { id: "s-sub-wt", cli: "claude" },
+          nodes: [wtRoot, wtChild],
+        });
+
+        const storedRoot = store.getNode("claude:sub-wt-root")!;
+        expect(storedRoot.parentId).toBe(originNodeId);
+        expect(storedRoot.meta.forkedFrom).toBe(originNodeId);
+
+        const storedChild = store.getNode("claude:sub-wt-child")!;
+        expect(storedChild.parentId).toBe("claude:sub-wt-root");
+        expect(storedChild.meta.forkedFrom).toBeUndefined();
+      } finally {
+        fs.rmSync(worktreeRoot, { recursive: true, force: true });
+      }
+    });
+
+    it("falls back to normal (non-aliased) ingest when the manifest is invalid JSON or references an unknown origin node — fail soft, no throw", async () => {
+      const deps = makeDeps();
+
+      const badRoot1 = fs.mkdtempSync(path.join(os.tmpdir(), "sojourn-ingest-badmanifest-"));
+      const badRoot2 = fs.mkdtempSync(path.join(os.tmpdir(), "sojourn-ingest-unknownorigin-"));
+      try {
+        await fsp.writeFile(path.join(badRoot1, ".sojourn-restore.json"), "{ not valid json", "utf8");
+        await fsp.writeFile(
+          path.join(badRoot2, ".sojourn-restore.json"),
+          JSON.stringify({ nodeId: "claude:does-not-exist" }),
+          "utf8",
+        );
+
+        const n1 = node("bad1", null, "prompt", "s-bad1", "2026-01-01T00:00:00.000Z", "hi");
+        const n2 = node("bad2", null, "prompt", "s-bad2", "2026-01-01T00:00:00.000Z", "hi");
+
+        await expect(
+          ingestBatch(deps, {
+            project: { root: badRoot1, name: "bad1" },
+            session: { id: "s-bad1", cli: "claude" },
+            nodes: [n1],
+          }),
+        ).resolves.toEqual({ added: ["claude:bad1"] });
+
+        await expect(
+          ingestBatch(deps, {
+            project: { root: badRoot2, name: "bad2" },
+            session: { id: "s-bad2", cli: "claude" },
+            nodes: [n2],
+          }),
+        ).resolves.toEqual({ added: ["claude:bad2"] });
+
+        const roots = store.getProjects().map((p) => p.root);
+        expect(roots).toContain(badRoot1);
+        expect(roots).toContain(badRoot2);
+
+        // Neither node was reparented/forked — each is a normal session root
+        // in its own (separate, non-aliased) project.
+        expect(store.getNode("claude:bad1")!.parentId).toBeNull();
+        expect(store.getNode("claude:bad1")!.meta.forkedFrom).toBeUndefined();
+        expect(store.getNode("claude:bad2")!.parentId).toBeNull();
+        expect(store.getNode("claude:bad2")!.meta.forkedFrom).toBeUndefined();
+      } finally {
+        fs.rmSync(badRoot1, { recursive: true, force: true });
+        fs.rmSync(badRoot2, { recursive: true, force: true });
+      }
+    });
+
+    it("captures the WORKTREE's file content in an aliased batch's snapshot, not the origin's", async () => {
+      await fsp.writeFile(path.join(projectRoot, "a.txt"), "origin content");
+      const deps = makeDeps();
+
+      const originPrompt = node(
+        "snap-origin-p",
+        null,
+        "prompt",
+        "s-snap-origin",
+        "2026-01-01T00:00:00.000Z",
+        "hi",
+      );
+      const originReply = node(
+        "snap-origin-r",
+        "snap-origin-p",
+        "assistant",
+        "s-snap-origin",
+        "2026-01-01T00:00:01.000Z",
+        { type: "text", text: "hello" },
+      );
+      await ingestBatch(deps, {
+        project: { root: projectRoot, name: "mainline" },
+        session: { id: "s-snap-origin", cli: "claude" },
+        nodes: [originPrompt, originReply],
+      });
+      const originNodeId = "claude:snap-origin-r";
+
+      const worktreeRoot = fs.mkdtempSync(
+        path.join(os.tmpdir(), "sojourn-ingest-worktree-snap-"),
+      );
+      try {
+        await fsp.writeFile(
+          path.join(worktreeRoot, "worktree-only.txt"),
+          "worktree content",
+        );
+        await fsp.writeFile(
+          path.join(worktreeRoot, ".sojourn-restore.json"),
+          JSON.stringify({ nodeId: originNodeId }),
+          "utf8",
+        );
+
+        const wtPrompt = node(
+          "snap-wt-p",
+          null,
+          "prompt",
+          "s-snap-wt",
+          "2026-01-02T00:00:00.000Z",
+          "continue",
+        );
+        const wtReply = node(
+          "snap-wt-r",
+          "snap-wt-p",
+          "assistant",
+          "s-snap-wt",
+          "2026-01-02T00:00:01.000Z",
+          { type: "text", text: "sure" },
+        );
+        await ingestBatch(deps, {
+          project: { root: worktreeRoot, name: "worktree-phantom" },
+          session: { id: "s-snap-wt", cli: "claude" },
+          nodes: [wtPrompt, wtReply],
+        });
+
+        const storedReply = store.getNode("claude:snap-wt-r")!;
+        expect(storedReply.snapshotRef).not.toBeNull();
+
+        const projects = store.getProjects();
+        expect(projects).toHaveLength(1); // still just the origin project
+        const originProject = projects[0];
+
+        // Read the aliased batch's snapshot back via the snapshotter for
+        // the origin project id + the worktree root (what the real daemon
+        // hands to flag checks for this batch) — it must reflect the
+        // WORKTREE's files, not the mainline's.
+        const snapshotter = deps.snapshotterFor({ ...originProject, root: worktreeRoot });
+        const content = await snapshotter.readFile(storedReply.snapshotRef!, "worktree-only.txt");
+        expect(content).toBe("worktree content");
+
+        // a.txt only exists in the mainline checkout, not the worktree —
+        // its absence here is further proof the snapshot was taken from
+        // the worktree's working directory, not the origin's.
+        const originOnlyContent = await snapshotter.readFile(storedReply.snapshotRef!, "a.txt");
+        expect(originOnlyContent).toBeNull();
+      } finally {
+        fs.rmSync(worktreeRoot, { recursive: true, force: true });
+      }
+    });
   });
 });

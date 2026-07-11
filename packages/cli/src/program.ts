@@ -1,6 +1,8 @@
 import { Command } from "commander";
 import { spawn } from "node:child_process";
-import { sojournHome, projectIdFor } from "@sojourn/core";
+import fs from "node:fs";
+import path from "node:path";
+import { sojournHome, projectIdFor, GraphStore, gcShadowRepo, collectPins } from "@sojourn/core";
 import type {
   Project,
   SessionRow,
@@ -379,6 +381,99 @@ export function buildProgram(deps: ProgramDeps): Command {
       }),
     );
 
+  program
+    .command("gc")
+    .description(
+      "prune old snapshot history from a project's shadow repo (dry-run by default). " +
+        "Operates directly on $SOJOURN_HOME — the daemon does not need to be running. " +
+        "Safe to run alongside a live daemon: gc only rewrites refs/sojourn/head and " +
+        "refs/sojourn/keep/* inside the project's SHADOW repo (never the daemon's shared " +
+        "capture index or the user's own working tree/.git), the same isolation the " +
+        "snapshotter itself relies on.",
+    )
+    .option("--project <id>", "project id (default: project for cwd)")
+    .option("--days <n>", "keep snapshots younger than this many days", "30")
+    .option("--archive-dir <path>", "write a backup bundle of pruned history here before deleting")
+    .option("--run", "actually perform the prune (default: dry-run preview only)", false)
+    .action(
+      async (opts: { project?: string; days: string; archiveDir?: string; run: boolean }) => {
+        const projectId = opts.project ?? projectIdFor(deps.cwd);
+        const keepDays = Number.parseInt(opts.days, 10);
+        if (!Number.isFinite(keepDays) || keepDays < 0) {
+          deps.stderr(`error: --days must be a non-negative integer (got "${opts.days}")`);
+          deps.exit(1);
+          return;
+        }
+
+        const dbFile = path.join(deps.sojournHome, "sojourn.db");
+        if (!fs.existsSync(dbFile)) {
+          deps.stdout(`no sojourn database found at ${dbFile} — nothing to do.`);
+          return;
+        }
+
+        const daemonPid = readPid(deps.sojournHome);
+        if (daemonPid !== null && isPidAlive(daemonPid)) {
+          deps.stdout(
+            `note: daemon is running (pid ${daemonPid}) — gc only touches this project's shadow-repo refs, which is safe to do concurrently with capture.`,
+          );
+        }
+
+        const store = new GraphStore(dbFile);
+        try {
+          const project = store.getProject(projectId);
+          if (!project) {
+            deps.stderr(`error: no project ${projectId} found in ${dbFile}`);
+            deps.exit(1);
+            return;
+          }
+
+          const shadowDir = path.join(deps.sojournHome, "snapshots", projectId);
+          if (!fs.existsSync(shadowDir)) {
+            deps.stdout(`no shadow snapshot repo for project ${projectId} at ${shadowDir} — nothing to do.`);
+            return;
+          }
+
+          const worktreesRoot = path.join(deps.sojournHome, "worktrees", projectId);
+          const extraPins = scanWorktreeManifestPins(worktreesRoot);
+          const pins = collectPins(store, projectId, extraPins);
+
+          const result = await gcShadowRepo(
+            { shadowDir },
+            { keepDays, pins, dryRun: !opts.run, archiveDir: opts.archiveDir },
+          );
+
+          deps.stdout(`project: ${project.name} (${project.id})`);
+          deps.stdout(`keep window: ${keepDays} day(s)   pinned trees: ${pins.size}`);
+          deps.stdout(
+            renderTable(
+              ["", "commits"],
+              [
+                ["kept", String(result.keptCommits)],
+                ["pruned", String(result.prunedCommits)],
+              ],
+            ),
+          );
+          deps.stdout(
+            `reclaim${result.dryRun ? "able (estimate)" : "ed"}: ${formatBytes(result.reclaimedBytes)}`,
+          );
+          if (result.archived) {
+            deps.stdout(`archived pruned history to: ${result.archived}`);
+          }
+          if (result.dryRun) {
+            deps.stdout(
+              result.prunedCommits > 0
+                ? "dry run only — nothing was deleted. Re-run with --run to execute."
+                : "nothing to prune.",
+            );
+          } else {
+            deps.stdout("gc complete.");
+          }
+        } finally {
+          store.close();
+        }
+      },
+    );
+
   return program;
 }
 
@@ -460,6 +555,51 @@ function formatFlagsTable(flags: Array<StoredFlag & { nodeId: string }>): string
     f.evidence,
   ]);
   return renderTable(header, rows);
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let value = bytes / 1024;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex++;
+  }
+  return `${value.toFixed(1)} ${units[unitIndex]}`;
+}
+
+/**
+ * Reads `.sojourn-restore.json` out of each `<worktreesRoot>/<worktree>/`
+ * directory (restoreEngine's manifest, written on every restore) and
+ * returns the set of tree hashes they reference, so `gc` never prunes a
+ * snapshot a live restored worktree still depends on. `worktreesRoot` is
+ * expected to be `<sojournHome>/worktrees/<projectId>` (restoreEngine nests
+ * one directory per project, one subdirectory per restore).
+ */
+function scanWorktreeManifestPins(worktreesRoot: string): Set<string> {
+  const pins = new Set<string>();
+  if (!fs.existsSync(worktreesRoot)) return pins;
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(worktreesRoot, { withFileTypes: true });
+  } catch {
+    return pins;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const manifestPath = path.join(worktreesRoot, entry.name, ".sojourn-restore.json");
+    if (!fs.existsSync(manifestPath)) continue;
+    try {
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as { treeHash?: unknown };
+      if (typeof manifest.treeHash === "string" && manifest.treeHash.length > 0) {
+        pins.add(manifest.treeHash);
+      }
+    } catch {
+      // malformed/partial manifest — skip it rather than failing the whole gc run
+    }
+  }
+  return pins;
 }
 
 function renderTable(header: string[], rows: string[][]): string {

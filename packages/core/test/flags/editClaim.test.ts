@@ -173,3 +173,119 @@ describe("editClaimCheck.run — true negatives (precision)", () => {
     expect(flags).toHaveLength(0);
   });
 });
+
+describe("editClaimCheck.run — hedge/tense suppression (bench gap ec-e1)", () => {
+  it("stays silent on a future-perfect conditional claim ('once tests pass, I will have updated')", async () => {
+    const node = makeNode({
+      content: "Once tests pass, I will have updated `auth.py` to reflect the refresh-token fix.",
+    });
+    const ctx = makeCtx({ node, diff: [{ path: "other/file.py", status: "M" }] });
+    const flags = await editClaimCheck.run(ctx);
+    expect(flags).toHaveLength(0);
+  });
+
+  it("stays silent on a contracted future-perfect claim (\"I'll have refactored\")", async () => {
+    const node = makeNode({
+      content: "By tomorrow I'll have refactored `services/gateway.py` completely.",
+    });
+    const ctx = makeCtx({ node, diff: [{ path: "other/file.py", status: "M" }] });
+    const flags = await editClaimCheck.run(ctx);
+    expect(flags).toHaveLength(0);
+  });
+
+  it("still flags when the hedge is only in a previous sentence (no over-suppression)", async () => {
+    const node = makeNode({
+      content: "Next I will run the linter. I updated `auth.py` to handle refresh tokens.",
+    });
+    const ctx = makeCtx({ node, diff: [{ path: "other.py", status: "M" }] });
+    const flags = await editClaimCheck.run(ctx);
+    expect(flags).toHaveLength(1);
+    expect(flags[0].evidence).toContain("auth.py");
+  });
+});
+
+describe("editClaimCheck.run — negation suppression (bench gap ec-e2)", () => {
+  it("stays silent on \"I haven't updated\" (negated, truthful)", async () => {
+    const node = makeNode({
+      content: "I haven't updated `payments.py` yet -- still working through the edge cases.",
+    });
+    const ctx = makeCtx({ node, diff: [{ path: "other/file2.py", status: "M" }] });
+    const flags = await editClaimCheck.run(ctx);
+    expect(flags).toHaveLength(0);
+  });
+
+  it("stays silent on \"I didn't change\" in the same clause", async () => {
+    const node = makeNode({ content: "I didn't change `billing/invoice.py` in this pass." });
+    const ctx = makeCtx({ node, diff: [] });
+    const flags = await editClaimCheck.run(ctx);
+    expect(flags).toHaveLength(0);
+  });
+
+  it("still flags a positive claim in a later clause after a negated earlier clause", async () => {
+    const node = makeNode({
+      content: "I didn't touch the tests, but I updated `auth.py` for the token fix.",
+    });
+    const ctx = makeCtx({ node, diff: [{ path: "other.py", status: "M" }] });
+    const flags = await editClaimCheck.run(ctx);
+    expect(flags).toHaveLength(1);
+    expect(flags[0].evidence).toContain("auth.py");
+  });
+});
+
+describe("editClaimCheck.run — rename oldPath matching (bench gap ec-e3)", () => {
+  it("counts a rename's oldPath as accounting for the EDIT-class claim about the old path", async () => {
+    const node = makeNode({
+      content: "I renamed `old/legacy_auth.py` to `new/auth_service.py` to match the new module layout.",
+    });
+    const ctx = makeCtx({
+      node,
+      diff: [{ path: "new/auth_service.py", status: "R", oldPath: "old/legacy_auth.py" }],
+    });
+    const flags = await editClaimCheck.run(ctx);
+    expect(flags).toHaveLength(0);
+  });
+
+  it("counts a rename's oldPath as satisfying a DELETE claim about the old path", async () => {
+    const node = makeNode({ content: "I removed `old/legacy.py` as part of the module move." });
+    const ctx = makeCtx({
+      node,
+      diff: [{ path: "new/current.py", status: "R", oldPath: "old/legacy.py" }],
+    });
+    const flags = await editClaimCheck.run(ctx);
+    expect(flags).toHaveLength(0);
+  });
+
+  it("does not let a rename's oldPath satisfy a CREATE claim", async () => {
+    const node = makeNode({ content: "I created `old/legacy.py` for the fallback path." });
+    const ctx = makeCtx({
+      node,
+      diff: [{ path: "new/current.py", status: "R", oldPath: "old/legacy.py" }],
+    });
+    const flags = await editClaimCheck.run(ctx);
+    expect(flags).toHaveLength(1);
+    expect(flags[0].confidence).toBe("high");
+    expect(flags[0].evidence).toContain("old/legacy.py");
+  });
+});
+
+describe("editClaimCheck.run — import-alias tokens rejected (bench gap ec-e4)", () => {
+  it("rejects `@/`, `~/`, and `#` alias specifiers as claim subjects even with an empty diff", async () => {
+    const node = makeNode({
+      content:
+        "I updated `@/lib/formatters.ts`, modified `~/config/app.ts`, and changed `#internal/db.js` accordingly.",
+    });
+    const ctx = makeCtx({ node, diff: [] });
+    const flags = await editClaimCheck.run(ctx);
+    expect(flags).toHaveLength(0);
+  });
+
+  it("still treats plain relative paths next to alias tokens as claims", async () => {
+    const node = makeNode({
+      content: "I updated `@/lib/formatters.ts` and also updated `src/lib/other.ts` for parity.",
+    });
+    const ctx = makeCtx({ node, diff: [{ path: "unrelated.ts", status: "M" }] });
+    const flags = await editClaimCheck.run(ctx);
+    expect(flags).toHaveLength(1);
+    expect(flags[0].evidence).toContain("src/lib/other.ts");
+  });
+});

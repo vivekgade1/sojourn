@@ -9,9 +9,14 @@ function basename(p: string): string {
 
 /** Find diff entries matching a claimed path, allowing a basename fallback
  * only when the claim itself is a bare filename (no `/`) and exactly one
- * diff path shares that basename. */
-function resolveDiffMatches(claimPath: string, diff: FileChange[]): FileChange[] {
-  const exact = diff.filter((d) => d.path === claimPath);
+ * diff path shares that basename. For EDIT/DELETE claims a rename's
+ * `oldPath` also counts — the file at that path genuinely changed/went
+ * away ("the old path should still show up as changed in some way in the
+ * diff"). CREATE claims still require the new path itself. */
+function resolveDiffMatches(claimPath: string, diff: FileChange[], kind: ClaimKind): FileChange[] {
+  const exact = diff.filter(
+    (d) => d.path === claimPath || (kind !== "CREATE" && d.oldPath === claimPath),
+  );
   if (exact.length > 0) return exact;
 
   if (!claimPath.includes("/")) {
@@ -41,7 +46,7 @@ export const editClaimCheck: FlagCheck = {
     const flags: Flag[] = [];
 
     for (const claim of claims) {
-      const matches = resolveDiffMatches(claim.path, ctx.diff);
+      const matches = resolveDiffMatches(claim.path, ctx.diff, claim.kind);
 
       if (ctx.diff.length === 0) {
         // No diff at all: every edit claim gets a high flag naming its path.
@@ -80,7 +85,11 @@ export const editClaimCheck: FlagCheck = {
       }
 
       if (claim.kind === "DELETE") {
-        const deleted = matches.filter((m) => m.status === "D");
+        // A rename whose oldPath is the claimed file satisfies a DELETE
+        // claim: the file no longer exists at that path.
+        const deleted = matches.filter(
+          (m) => m.status === "D" || (m.status === "R" && m.oldPath === claim.path),
+        );
         if (deleted.length > 0) continue;
         flags.push(
           mismatchFlag(claim.kind, claim.path, "high", "snapshot diff shows no deletion of that file"),
