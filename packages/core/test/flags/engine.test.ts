@@ -300,3 +300,261 @@ describe("autoResolveFlags", () => {
     expect(store.resolved).toEqual([]);
   });
 });
+
+describe("autoResolveFlags with turnBaseOf (span re-evaluation)", () => {
+  const BASE_OLD = "base-old-turn";
+  const BASE_CURRENT = "base-current-turn";
+  const TREE_CURRENT = "tree-current";
+
+  function makeStoredFlag(nodeId: string, id: number, overrides: Partial<Flag> = {}): StoredFlag {
+    return {
+      ...makeFlag(overrides),
+      id,
+      nodeId,
+      dismissed: false,
+      createdAt: new Date().toISOString(),
+    };
+  }
+
+  it("does NOT auto-resolve a package flag when a later turn only touches an unrelated file (span diff still shows the bogus import)", async () => {
+    // Turn 4: node A introduced `import totallybogus` in src/deps.py — flagged.
+    const nodeA = makeNode({ content: "Added `src/deps.py` with the imports we need." });
+    const storedFlag = makeStoredFlag(nodeA.id, 301, {
+      kind: "package_hallucination",
+      evidence:
+        "claimed/used import of package `totallybogus`; PyPI returned 404 (not found) for that package name",
+    });
+    // Turn 10: current node's own diff only contains src/auth.py.
+    const nodeCurrent = makeNode({ content: "Refactored `src/auth.py` for clarity." });
+
+    const flagsByNode = new Map<string, StoredFlag[]>([[nodeA.id, [storedFlag]]]);
+    const store = makeFakeStore(flagsByNode, [nodeA, nodeCurrent]);
+
+    const diffSpy = vi.fn(async (treeA: string | null, _treeB: string) => {
+      if (treeA === BASE_OLD) {
+        // Span diff (node A's turn base -> current tree) still covers deps.py.
+        return [
+          { path: "src/deps.py", status: "A" as const },
+          { path: "src/auth.py", status: "M" as const },
+        ];
+      }
+      return [{ path: "src/auth.py", status: "M" as const }];
+    });
+    const snapshotter = {
+      diff: diffSpy,
+      readFile: async (_tree: string, path: string) =>
+        path === "src/deps.py" ? "import totallybogus\n" : null,
+      listFiles: async () => ["src/deps.py", "src/auth.py"],
+    };
+    const fetchJson: FetchJson = async () => ({ status: 404, body: {} });
+
+    const ctx = makeCtx(nodeCurrent, {
+      priorNodes: [nodeA, nodeCurrent],
+      diff: [{ path: "src/auth.py", status: "M" }],
+      parentTree: BASE_CURRENT,
+      nodeTree: TREE_CURRENT,
+      snapshotter: snapshotter as unknown as CheckContext["snapshotter"],
+      fetchJson,
+    });
+
+    const count = await autoResolveFlags(store, nodeCurrent, ctx, undefined, (n) =>
+      n.id === nodeA.id ? BASE_OLD : BASE_CURRENT,
+    );
+
+    expect(count).toBe(0);
+    expect(store.resolved).toEqual([]);
+  });
+
+  it("DOES auto-resolve a package flag when the bogus import is gone at the current tree", async () => {
+    const nodeA = makeNode({ content: "Added `src/deps.py` with the imports we need." });
+    const storedFlag = makeStoredFlag(nodeA.id, 302, {
+      kind: "package_hallucination",
+      evidence:
+        "claimed/used import of package `totallybogus`; PyPI returned 404 (not found) for that package name",
+    });
+    const nodeCurrent = makeNode({ content: "Refactored `src/auth.py` for clarity." });
+
+    const flagsByNode = new Map<string, StoredFlag[]>([[nodeA.id, [storedFlag]]]);
+    const store = makeFakeStore(flagsByNode, [nodeA, nodeCurrent]);
+
+    const snapshotter = {
+      diff: async (treeA: string | null, _treeB: string) =>
+        treeA === BASE_OLD
+          ? [
+              { path: "src/deps.py", status: "A" as const },
+              { path: "src/auth.py", status: "M" as const },
+            ]
+          : [{ path: "src/auth.py", status: "M" as const }],
+      // The import was removed in an intermediate turn: at the CURRENT tree
+      // deps.py no longer contains the bogus import.
+      readFile: async (_tree: string, path: string) =>
+        path === "src/deps.py" ? "import os\n" : null,
+      listFiles: async () => ["src/deps.py", "src/auth.py"],
+    };
+    const fetchJson: FetchJson = async () => ({ status: 404, body: {} });
+
+    const ctx = makeCtx(nodeCurrent, {
+      priorNodes: [nodeA, nodeCurrent],
+      diff: [{ path: "src/auth.py", status: "M" }],
+      parentTree: BASE_CURRENT,
+      nodeTree: TREE_CURRENT,
+      snapshotter: snapshotter as unknown as CheckContext["snapshotter"],
+      fetchJson,
+    });
+
+    const count = await autoResolveFlags(store, nodeCurrent, ctx, undefined, (n) =>
+      n.id === nodeA.id ? BASE_OLD : BASE_CURRENT,
+    );
+
+    expect(count).toBe(1);
+    expect(store.resolved).toEqual([302]);
+  });
+
+  it("resolves an edit claim fixed TWO turns earlier even though the current turn's own diff misses the file", async () => {
+    const nodeA = makeNode({ content: "I updated `src/x.py` to fix the parser." });
+    const storedFlag = makeStoredFlag(nodeA.id, 303, {
+      kind: "edit_claim_mismatch",
+      evidence: "claimed edit to `src/x.py`; snapshot diff shows no change to that file",
+    });
+    const nodeCurrent = makeNode({ content: "Unrelated follow-up." });
+
+    const flagsByNode = new Map<string, StoredFlag[]>([[nodeA.id, [storedFlag]]]);
+    const store = makeFakeStore(flagsByNode, [nodeA, nodeCurrent]);
+
+    const snapshotter = {
+      // Span diff (baseOld -> current) includes x.py, fixed in turn 8;
+      // the CURRENT turn's own diff (below) does not.
+      diff: async (treeA: string | null, _treeB: string) =>
+        treeA === BASE_OLD
+          ? [
+              { path: "src/x.py", status: "M" as const },
+              { path: "src/other.py", status: "M" as const },
+            ]
+          : [{ path: "src/other.py", status: "M" as const }],
+    };
+
+    const ctx = makeCtx(nodeCurrent, {
+      priorNodes: [nodeA, nodeCurrent],
+      diff: [{ path: "src/other.py", status: "M" }],
+      parentTree: BASE_CURRENT,
+      nodeTree: TREE_CURRENT,
+      snapshotter: snapshotter as unknown as CheckContext["snapshotter"],
+    });
+
+    const count = await autoResolveFlags(store, nodeCurrent, ctx, undefined, (n) =>
+      n.id === nodeA.id ? BASE_OLD : BASE_CURRENT,
+    );
+
+    expect(count).toBe(1);
+    expect(store.resolved).toEqual([303]);
+  });
+
+  it("caches the span diff by base value across flags sharing a turn base, and reuses ctx.diff when the base equals ctx.parentTree", async () => {
+    const nodeA = makeNode({ content: "I updated `src/x.py` to fix the parser." });
+    const nodeB = makeNode({ content: "I updated `src/y.py` for the new schema." });
+    // Node C shares the CURRENT turn base — its span diff is just ctx.diff.
+    const nodeC = makeNode({ content: "I updated `src/z.py` as well." });
+    const flagA = makeStoredFlag(nodeA.id, 401, {
+      kind: "edit_claim_mismatch",
+      evidence: "claimed edit to `src/x.py`; snapshot diff shows no change to that file",
+    });
+    const flagB = makeStoredFlag(nodeB.id, 402, {
+      kind: "edit_claim_mismatch",
+      evidence: "claimed edit to `src/y.py`; snapshot diff shows no change to that file",
+    });
+    const flagC = makeStoredFlag(nodeC.id, 403, {
+      kind: "edit_claim_mismatch",
+      evidence: "claimed edit to `src/z.py`; snapshot diff shows no change to that file",
+    });
+    const nodeCurrent = makeNode({ content: "Unrelated follow-up." });
+
+    const flagsByNode = new Map<string, StoredFlag[]>([
+      [nodeA.id, [flagA]],
+      [nodeB.id, [flagB]],
+      [nodeC.id, [flagC]],
+    ]);
+    const store = makeFakeStore(flagsByNode, [nodeA, nodeB, nodeC, nodeCurrent]);
+
+    const diffSpy = vi.fn(async (_treeA: string | null, _treeB: string) => [
+      { path: "src/x.py", status: "M" as const },
+      { path: "src/y.py", status: "M" as const },
+    ]);
+    const snapshotter = { diff: diffSpy };
+
+    const ctx = makeCtx(nodeCurrent, {
+      priorNodes: [nodeA, nodeB, nodeC, nodeCurrent],
+      diff: [{ path: "src/z.py", status: "M" }],
+      parentTree: BASE_CURRENT,
+      nodeTree: TREE_CURRENT,
+      snapshotter: snapshotter as unknown as CheckContext["snapshotter"],
+    });
+
+    const count = await autoResolveFlags(store, nodeCurrent, ctx, undefined, (n) =>
+      n.id === nodeC.id ? BASE_CURRENT : BASE_OLD,
+    );
+
+    expect(count).toBe(3);
+    expect(store.resolved.sort()).toEqual([401, 402, 403]);
+    // A and B share BASE_OLD -> one diff call; C's base === ctx.parentTree ->
+    // ctx.diff reused, no extra diff call.
+    expect(diffSpy).toHaveBeenCalledTimes(1);
+    expect(diffSpy).toHaveBeenCalledWith(BASE_OLD, TREE_CURRENT);
+  });
+
+  it("fails SOFT when the span diff errors: the flag is kept active and nothing throws", async () => {
+    const nodeA = makeNode({ content: "I updated `src/x.py` to fix the parser." });
+    const storedFlag = makeStoredFlag(nodeA.id, 501, {
+      kind: "edit_claim_mismatch",
+      evidence: "claimed edit to `src/x.py`; snapshot diff shows no change to that file",
+    });
+    const nodeCurrent = makeNode({ content: "Unrelated follow-up." });
+
+    const flagsByNode = new Map<string, StoredFlag[]>([[nodeA.id, [storedFlag]]]);
+    const store = makeFakeStore(flagsByNode, [nodeA, nodeCurrent]);
+
+    const snapshotter = {
+      diff: async () => {
+        throw new Error("git object missing");
+      },
+    };
+
+    const ctx = makeCtx(nodeCurrent, {
+      priorNodes: [nodeA, nodeCurrent],
+      diff: [{ path: "src/x.py", status: "M" }],
+      parentTree: BASE_CURRENT,
+      nodeTree: TREE_CURRENT,
+      snapshotter: snapshotter as unknown as CheckContext["snapshotter"],
+    });
+
+    const count = await autoResolveFlags(store, nodeCurrent, ctx, undefined, () => BASE_OLD);
+
+    expect(count).toBe(0);
+    expect(store.resolved).toEqual([]);
+  });
+
+  it("preserves old turn-scoped behavior when turnBaseOf is absent (ctx.diff used, no span diff computed)", async () => {
+    const nodeA = makeNode({ content: "I updated `auth.py` to handle refresh tokens." });
+    const storedFlag = makeStoredFlag(nodeA.id, 601, {
+      kind: "edit_claim_mismatch",
+      evidence: "claimed edit to `auth.py`; snapshot diff shows no change to that file",
+    });
+    const nodeB = makeNode({ content: "Following up." });
+    const flagsByNode = new Map<string, StoredFlag[]>([[nodeA.id, [storedFlag]]]);
+    const store = makeFakeStore(flagsByNode, [nodeA, nodeB]);
+
+    const diffSpy = vi.fn(async () => [] as { path: string; status: "M" }[]);
+    const snapshotter = { diff: diffSpy };
+
+    const ctxB = makeCtx(nodeB, {
+      diff: [{ path: "auth.py", status: "M" }],
+      parentTree: BASE_CURRENT,
+      nodeTree: TREE_CURRENT,
+      snapshotter: snapshotter as unknown as CheckContext["snapshotter"],
+    });
+
+    const count = await autoResolveFlags(store, nodeB, ctxB);
+    expect(count).toBe(1);
+    expect(store.resolved).toEqual([601]);
+    expect(diffSpy).not.toHaveBeenCalled();
+  });
+});

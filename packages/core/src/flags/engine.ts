@@ -1,4 +1,4 @@
-import type { ChronoNode, Flag, FlagKind, StoredFlag } from "../types.js";
+import type { ChronoNode, FileChange, Flag, FlagKind, StoredFlag } from "../types.js";
 import { allBacktickedTokens } from "./claims.js";
 import type { CheckContext, FlagCheck } from "../interfaces.js";
 import { editClaimCheck } from "./editClaim.js";
@@ -73,9 +73,20 @@ function flagsMatchSameClaim(a: Flag, b: Flag): boolean {
  * check no longer reproduces that flag kind for the original node's claim,
  * the flag is considered fixed and resolveFlag(id) is called.
  *
- * `ctx` is the CURRENT node's CheckContext, so the re-evaluation uses the
- * same turn-scoped grounding base (parentTree = snapshot before the current
- * turn's prompt) that the T1 run for `node` used.
+ * RE-EVALUATION SPAN: diff-scoped checks (edit-claim, packages) only have
+ * jurisdiction over files present in `ctx.diff`. Re-running them against the
+ * CURRENT node's turn-scoped diff is wrong in both directions — a flag about
+ * a file the latest turn didn't touch would spuriously auto-resolve (the
+ * check sees no candidate files, so "the condition no longer holds"), and a
+ * claim fixed two turns ago would never resolve (the fix isn't in the
+ * current turn's diff, so the old claim re-flags). The correct span is the
+ * OLD flag's turn base -> the CURRENT tree, so everything that happened
+ * since the claim is visible. Callers supply `turnBaseOf` to map each prior
+ * node to its own turn base tree; when it is absent, `ctx.parentTree` is
+ * used (the legacy turn-scoped behavior). Span diffs are cached per base
+ * across the loop, `ctx.diff` is reused when the base equals
+ * `ctx.parentTree`, and a failing `snapshotter.diff` fails SOFT: resolution
+ * is skipped for the affected flags (kept active), never thrown out.
  *
  * Returns the number of flags resolved. When `onResolved` is provided it is
  * called once per resolved flag with the flag's node id and flag id, so
@@ -87,11 +98,31 @@ export async function autoResolveFlags(
   node: ChronoNode,
   ctx: CheckContext,
   onResolved?: (nodeId: string, flagId: number) => void,
+  turnBaseOf?: (node: ChronoNode) => string | null,
 ): Promise<number> {
   const sessionNodes = await store.getSessionNodes(node.sessionId);
   const checksByKind = new Map<FlagKind, FlagCheck>(allT1Checks().map((c) => [c.kind, c]));
 
   let resolvedCount = 0;
+
+  // Span-diff cache keyed by turn-base tree (many prior nodes share a turn
+  // base). `null` marks a failed diff for that base: fail soft — skip
+  // resolution for every flag grounded on it, keep the flags active.
+  const spanDiffByBase = new Map<string | null, FileChange[] | null>();
+
+  async function spanDiffFor(base: string | null): Promise<FileChange[] | null> {
+    if (base === ctx.parentTree) return ctx.diff;
+    if (ctx.snapshotter === null || ctx.nodeTree === null) return ctx.diff;
+    if (spanDiffByBase.has(base)) return spanDiffByBase.get(base) ?? null;
+    let result: FileChange[] | null;
+    try {
+      result = await ctx.snapshotter.diff(base, ctx.nodeTree);
+    } catch {
+      result = null;
+    }
+    spanDiffByBase.set(base, result);
+    return result;
+  }
 
   for (const priorNode of sessionNodes) {
     if (priorNode.id === node.id) continue;
@@ -105,12 +136,18 @@ export async function autoResolveFlags(
       if (!check) continue;
       if (!check.appliesTo(priorNode)) continue;
 
-      // Re-run the check for the originally-flagged node, but against the
-      // ground truth (diff/tree/snapshotter/fetchJson) available at the
-      // current node — this is what lets a later fix clear an earlier flag.
+      // Re-run the check for the originally-flagged node against the ground
+      // truth at the current node, spanning from the PRIOR node's own turn
+      // base so intermediate turns' changes are visible.
+      const base = turnBaseOf ? turnBaseOf(priorNode) : ctx.parentTree;
+      const spanDiff = await spanDiffFor(base);
+      if (spanDiff === null) continue; // diff failed: never resolve blind
+
       const reEvalCtx: CheckContext = {
         ...ctx,
         node: priorNode,
+        parentTree: base,
+        diff: spanDiff,
         priorNodes: ctx.priorNodes,
       };
 

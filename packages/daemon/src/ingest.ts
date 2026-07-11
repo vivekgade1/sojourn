@@ -155,14 +155,22 @@ export async function ingestBatch(
         const flags = await deps.flagEngine.runOnNode(ctx);
         const stored = flags.map((f) => store.addFlag(node.id, f));
 
-        // autoResolveFlags re-evaluates earlier flags against the SAME
-        // turn-scoped ctx built above; collect which nodes actually had a
-        // flag resolved so their (full) flag lists can be re-broadcast.
+        // autoResolveFlags re-evaluates each earlier flag over the span from
+        // that flag's OWN turn base to the current tree (via turnBaseOf), so
+        // flags about files the current turn didn't touch neither spuriously
+        // resolve nor stay stuck; collect which nodes actually had a flag
+        // resolved so their (full) flag lists can be re-broadcast.
         const resolvedNodeIds = new Set<string>();
         try {
-          await autoResolveFlags(store, node, ctx, (resolvedNodeId) => {
-            resolvedNodeIds.add(resolvedNodeId);
-          });
+          await autoResolveFlags(
+            store,
+            node,
+            ctx,
+            (resolvedNodeId) => {
+              resolvedNodeIds.add(resolvedNodeId);
+            },
+            (n) => resolveTurnBaseTree(store, n),
+          );
         } catch (err) {
           console.error("[sojourn] ingest: autoResolveFlags failed:", err);
         }
