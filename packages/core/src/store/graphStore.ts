@@ -1,5 +1,6 @@
 import Database from "better-sqlite3";
 import { applySchema } from "./schema.js";
+import { runMigrations } from "./migrations.js";
 import { projectIdFor } from "../paths.js";
 import type {
   Annotation,
@@ -122,6 +123,7 @@ export class GraphStore {
   constructor(dbPath: string) {
     this.db = new Database(dbPath);
     applySchema(this.db);
+    runMigrations(this.db);
   }
 
   upsertProject(root: string, name?: string): Project {
