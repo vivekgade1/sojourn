@@ -35,6 +35,9 @@ export interface StoredFlag extends Flag {
   nodeId: string;
   dismissed: boolean;
   createdAt: string;
+  /** >0 marks a DIGEST flag: evidence is a sample and this many additional
+   * identical-claim flags of the same kind/tier were suppressed by budgets. */
+  suppressedCount?: number;
 }
 
 export interface Annotation {
@@ -106,4 +109,53 @@ export interface RestoreResult {
   safetySnapshotRef: string;
   resumeCommand: string | null;
   warnings: string[];
+}
+
+// ——— V2 contracts (plan: docs/superpowers/plans/2026-07-11-sojourn-v2.md) ———
+
+/** Pure counts — never a probabilistic "grade" (verified/advisory stay distinct). */
+export interface SessionHealth {
+  sessionId: string;
+  turns: number;
+  verifiedActive: number;
+  verifiedResolved: number;
+  advisoryActive: number;
+  dismissed: number;
+  suppressed: number;
+}
+
+export interface HarvestPreflight {
+  worktreePath: string;
+  originNodeId: string;
+  baseTree: string;
+  branchTree: string;
+  files: Array<{ path: string; status: "clean" | "conflict" | "identical" }>;
+  mainlineDirty: boolean;
+  warnings: string[];
+}
+
+export interface HarvestResult {
+  applied: string[];
+  /** files written WITH conflict markers (allowConflicts mode only) */
+  conflicted: string[];
+  skippedIdentical: string[];
+  safetySnapshotRef: string;
+  patchPath: string | null;
+  mergeNodeId: string | null;
+}
+
+export interface RewindPlan {
+  /** exact = synthesized truncated transcript; tip = native fork fallback */
+  mode: "exact" | "tip";
+  newSessionId: string | null;
+  transcriptPath: string | null;
+  /** why exact mode was refused (e.g. compaction boundary) — honesty surface */
+  refusedReason: string | null;
+  resumeCommand: string;
+}
+
+export interface SearchHit {
+  node: ChronoNode;
+  score: number;
+  snippet: string;
 }

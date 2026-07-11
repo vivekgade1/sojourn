@@ -21,6 +21,14 @@ Base: `http://localhost:4177` (env `SOJOURN_PORT`). All JSON. Types refer to `@s
 | POST | `/api/hooks/claude` | Claude hook payload (`{session_id, transcript_path, cwd, hook_event_name}`) | `{ ok: true }` — triggers immediate re-scan of that transcript |
 | POST | `/api/hooks/opencode` | `{ sessionId: string }` | `{ ok: true }` — triggers a fire-and-forget re-scan of that OpenCode session (session + messages pulled from the local OpenCode server; fail-soft if unreachable) |
 
+| GET | `/api/sessions/:id/health` | — | `SessionHealth` (pure counts) |
+| GET | `/api/search?projectId=&q=&file=` | — | `{ hits: SearchHit[] }` — FTS over gists/labels/annotations + files-touched index |
+| POST | `/api/nodes/:id/rewind-plan` | — | `RewindPlan` (pure — no side effects) |
+| POST | `/api/nodes/:id/rewind` | — | `RewindPlan` executed (writes a NEW synthesized transcript when mode=exact; never mutates originals) |
+| POST | `/api/worktrees/harvest/preflight` | `{ worktreePath }` | `HarvestPreflight` |
+| POST | `/api/worktrees/harvest` | `{ worktreePath, mode: "apply" \| "patch", allowConflicts? }` | `HarvestResult` (mainline safety snapshot ALWAYS first) |
+| GET | `/api/sessions/:id/turn-flags?sinceNodeId=` | — | `{ lines: string[] }` — compact, budgeted, verified-only |
+
 Static: serves `packages/web/dist` at `/` when built.
 
 ## WebSocket `/ws`
