@@ -1,17 +1,20 @@
 import fs from "node:fs";
 import path from "node:path";
 import type {
+  CheckContext,
   ChronoNode,
   FetchJson,
   FileChange,
+  Flag,
   FlagEngine,
   GraphStore,
   IngestBatch,
   Project,
   SnapshotterLike,
 } from "@sojourn/core";
-import { autoResolveFlags } from "@sojourn/core";
+import { applyBudgets, autoResolveFlags } from "@sojourn/core";
 import type { SojournEvent } from "./events.js";
+import type { TranscriptIndex } from "./transcripts.js";
 
 export interface EventsSink {
   broadcast(event: SojournEvent): void;
@@ -25,6 +28,12 @@ export interface IngestDeps {
   events: EventsSink;
   /** fetch-with-timeout used by T1 checks that hit package registries. */
   fetchJson: FetchJson;
+  /**
+   * Session -> transcript-path/disk-root mapping, maintained by the
+   * transcript-driven callers (watcher scans, hook rescans). `ingestBatch`
+   * itself never writes it — it receives parsed batches, not file paths.
+   */
+  transcripts?: TranscriptIndex;
 }
 
 export interface IngestResult {
@@ -45,18 +54,26 @@ function projectRootExists(root: string): boolean {
 
 const RESTORE_MANIFEST_FILENAME = ".sojourn-restore.json";
 
-interface WorktreeRestoreManifest {
+export interface WorktreeRestoreManifest {
   nodeId: string;
 }
 
 /**
  * Reads and validates `<root>/.sojourn-restore.json` (written by
  * `RestoreEngine.restore`). Returns `null` — after at most one stderr log
- * line — when the file is absent (the overwhelmingly common case, so a
- * missing file logs nothing), unreadable, not valid JSON, or missing a
- * non-empty `nodeId` string.
+ * line — when the root is empty, the file is absent (the overwhelmingly
+ * common case, so a missing file logs nothing), unreadable, not valid
+ * JSON, or missing a non-empty `nodeId` string.
+ *
+ * Exported for the daemon's harvest/flags routes, which need the same
+ * "is this directory a Sojourn restore worktree, and of which node?"
+ * answer at request time.
  */
-function readRestoreManifest(root: string): WorktreeRestoreManifest | null {
+export function readRestoreManifest(root: string): WorktreeRestoreManifest | null {
+  // Guard the empty root: path.join("", RESTORE_MANIFEST_FILENAME) is a
+  // RELATIVE path (".sojourn-restore.json"), which would probe the DAEMON
+  // PROCESS's cwd — a directory that has nothing to do with the batch.
+  if (!root) return null;
   const manifestPath = path.join(root, RESTORE_MANIFEST_FILENAME);
   let raw: string;
   try {
@@ -219,17 +236,23 @@ export async function ingestBatch(
       const existing = store.getNode(node.id);
       const isNew = existing === null;
 
-      if (
+      const takesForkEdge =
         originNodeId !== null &&
         !forkEdgeApplied &&
-        (node.parentId === null || store.getNode(node.parentId) === null)
-      ) {
+        (node.parentId === null || store.getNode(node.parentId) === null);
+      if (takesForkEdge && originNodeId !== null) {
         node.parentId = originNodeId;
         node.meta = { ...node.meta, forkedFrom: originNodeId };
-        forkEdgeApplied = true;
       }
 
       store.upsertNode(node);
+
+      // Only mark the fork edge consumed AFTER the upsert actually landed:
+      // if this node's upsert throws (e.g. unserializable content), the
+      // edge was never persisted, and the next node whose parent doesn't
+      // resolve must still get its chance — otherwise the batch's fork
+      // edge would be silently lost for good.
+      if (takesForkEdge) forkEdgeApplied = true;
 
       if (isNew) {
         newNodes.push(node);
@@ -274,25 +297,42 @@ export async function ingestBatch(
     }
   }
 
-  // Run T1 flags on new assistant nodes.
+  // Run T1 flags on new assistant nodes, budgeted per turn segment.
   const newAssistantNodes = newNodes.filter((n) => n.kind === "assistant");
   if (newAssistantNodes.length > 0) {
+    interface FlagProduction {
+      node: ChronoNode;
+      ctx: CheckContext;
+      flags: Flag[];
+      /** grouping key: the turn prompt's id ("" when no ancestor prompt) */
+      turnKey: string;
+      turnPromptId: string | null;
+      /** true only when the turn diff was actually computed (not a failure fallback) */
+      diffComputed: boolean;
+    }
+
+    // Phase 1: run the checks per node — nothing is persisted yet, so
+    // budgets below can see one whole turn segment's flags at once.
+    const productions: FlagProduction[] = [];
     for (const node of newAssistantNodes) {
       try {
         const sessionNodes = store.getSessionNodes(node.sessionId);
+        const turnPrompt = resolveTurnPrompt(store, node);
         const parentTree = resolveTurnBaseTree(store, node);
         const effectiveNodeTree = node.snapshotRef ?? nodeTree;
 
         let diff: FileChange[] = [];
+        let diffComputed = false;
         if (snapshotter && effectiveNodeTree !== null) {
           try {
             diff = await snapshotter.diff(parentTree, effectiveNodeTree);
+            diffComputed = true;
           } catch (err) {
             console.error("[sojourn] ingest: diff failed for flag context:", err);
           }
         }
 
-        const ctx = {
+        const ctx: CheckContext = {
           node,
           priorNodes: sessionNodes,
           diff,
@@ -304,19 +344,120 @@ export async function ingestBatch(
         };
 
         const flags = await deps.flagEngine.runOnNode(ctx);
-        const stored = flags.map((f) => store.addFlag(node.id, f));
+        productions.push({
+          node,
+          ctx,
+          flags,
+          turnKey: turnPrompt?.id ?? "",
+          turnPromptId: turnPrompt?.id ?? null,
+          diffComputed,
+        });
+      } catch (err) {
+        console.error(`[sojourn] ingest: flag run failed for node ${node.id}:`, err);
+      }
+    }
 
-        // autoResolveFlags re-evaluates each earlier flag over the span from
-        // that flag's OWN turn base to the current tree (via turnBaseOf), so
-        // flags about files the current turn didn't touch neither spuriously
-        // resolve nor stay stuck; collect which nodes actually had a flag
-        // resolved so their (full) flag lists can be re-broadcast.
-        const resolvedNodeIds = new Set<string>();
+    // Phase 2: split into consecutive same-turn segments (nodes arrive in
+    // transcript order, so a turn's nodes are contiguous within a batch).
+    //
+    // BUDGET GRANULARITY — honest limits: `applyBudgets` runs over the
+    // flags freshly produced for THIS batch's new assistant nodes, one turn
+    // segment at a time. Flags only ever run on NEW nodes, so a turn that
+    // spans several debounced batches is budgeted per batch segment, not
+    // across the whole turn: an earlier segment's kept flags don't count
+    // against a later segment's budget (worst case, a turn split across N
+    // batches can keep up to N× the per-turn budget). Identical claims
+    // re-produced across segments still collapse at the store level via
+    // the (node_id, kind, evidence) uniqueness key.
+    const segments: FlagProduction[][] = [];
+    for (const p of productions) {
+      const last = segments[segments.length - 1];
+      if (last && last[0].turnKey === p.turnKey) last.push(p);
+      else segments.push([p]);
+    }
+
+    const batchTail = newNodes[newNodes.length - 1];
+
+    for (const segment of segments) {
+      // Phase 3: budgets over the segment's flags, then persist kept +
+      // digests. `applyBudgets` preserves object identity in `kept`, so
+      // each kept flag can be routed back to the node that produced it.
+      const changedFlagNodeIds = new Set<string>();
+      try {
+        const allFlags: Flag[] = [];
+        const ownerOf = new Map<Flag, ChronoNode>();
+        for (const p of segment) {
+          for (const f of p.flags) {
+            allFlags.push(f);
+            ownerOf.set(f, p.node);
+          }
+        }
+
+        if (allFlags.length > 0) {
+          const { kept, digests } = applyBudgets(allFlags);
+
+          for (const f of kept) {
+            const owner = ownerOf.get(f) ?? segment[segment.length - 1].node;
+            store.addFlag(owner.id, f);
+            changedFlagNodeIds.add(owner.id);
+          }
+
+          // Each digest lands on the node that produced the LAST flag of
+          // its (kind, tier, source) group — a stable anchor within the
+          // segment, and addFlag's digest upsert (count-free evidence)
+          // keeps re-runs updating the same row in place.
+          for (const digest of digests) {
+            let owner: ChronoNode = segment[segment.length - 1].node;
+            for (let i = allFlags.length - 1; i >= 0; i--) {
+              const f = allFlags[i];
+              if (
+                f.kind === digest.kind &&
+                f.tier === digest.tier &&
+                f.source === digest.source
+              ) {
+                owner = ownerOf.get(f) ?? owner;
+                break;
+              }
+            }
+            store.addFlag(owner.id, digest);
+            changedFlagNodeIds.add(owner.id);
+          }
+        }
+      } catch (err) {
+        console.error("[sojourn] ingest: flag budgeting/persist failed:", err);
+      }
+
+      // Phase 4: index the turn's files (decision-memory `node_files`) onto
+      // the turn's prompt node and the batch-tail node. Uses the segment's
+      // LAST successfully computed turn diff (the fullest view of the turn
+      // so far); indexNodeFiles REPLACES a node's rows, so later batches of
+      // the same turn overwrite with the fuller diff. Skipped when the turn
+      // has no grounded base (parentTree null — diff(null, tree) lists the
+      // entire tree, which is not a turn diff).
+      try {
+        for (let i = segment.length - 1; i >= 0; i--) {
+          const p = segment[i];
+          if (!p.diffComputed || p.ctx.parentTree === null) continue;
+          if (p.turnPromptId !== null) store.indexNodeFiles(p.turnPromptId, p.ctx.diff);
+          if (batchTail) store.indexNodeFiles(batchTail.id, p.ctx.diff);
+          break;
+        }
+      } catch (err) {
+        console.error("[sojourn] ingest: indexNodeFiles failed:", err);
+      }
+
+      // Phase 5: auto-resolve earlier flags against each node's ground
+      // truth. autoResolveFlags re-evaluates each earlier flag over the
+      // span from that flag's OWN turn base to the current tree (via
+      // turnBaseOf), so flags about files the current turn didn't touch
+      // neither spuriously resolve nor stay stuck.
+      const resolvedNodeIds = new Set<string>();
+      for (const p of segment) {
         try {
           await autoResolveFlags(
             store,
-            node,
-            ctx,
+            p.node,
+            p.ctx,
             (resolvedNodeId) => {
               resolvedNodeIds.add(resolvedNodeId);
             },
@@ -325,37 +466,20 @@ export async function ingestBatch(
         } catch (err) {
           console.error("[sojourn] ingest: autoResolveFlags failed:", err);
         }
+      }
 
-        if (stored.length > 0) {
-          try {
-            // Always broadcast the node's FULL current flag list (not just
-            // the newly added flags) so clients can replace, never merge.
-            deps.events.broadcast({
-              type: "flags_updated",
-              nodeId: node.id,
-              flags: store.getFlags(node.id),
-            });
-          } catch (err) {
-            console.error("[sojourn] ingest: failed to broadcast flags_updated:", err);
-          }
+      // Always broadcast a node's FULL current flag list (never just the
+      // delta) so clients can replace, never merge.
+      for (const nodeId of new Set([...changedFlagNodeIds, ...resolvedNodeIds])) {
+        try {
+          deps.events.broadcast({
+            type: "flags_updated",
+            nodeId,
+            flags: store.getFlags(nodeId),
+          });
+        } catch (err) {
+          console.error("[sojourn] ingest: failed to broadcast flags_updated:", err);
         }
-
-        for (const resolvedNodeId of resolvedNodeIds) {
-          try {
-            deps.events.broadcast({
-              type: "flags_updated",
-              nodeId: resolvedNodeId,
-              flags: store.getFlags(resolvedNodeId),
-            });
-          } catch (err) {
-            console.error(
-              "[sojourn] ingest: failed to broadcast flags_updated after auto-resolve:",
-              err,
-            );
-          }
-        }
-      } catch (err) {
-        console.error(`[sojourn] ingest: flag run failed for node ${node.id}:`, err);
       }
     }
   }
@@ -381,6 +505,25 @@ export async function ingestBatch(
 }
 
 /**
+ * Nearest ancestor PROMPT node (strictly above `node`) — the start of the
+ * node's turn. Cycle-guarded; null when the chain reaches a root (or a
+ * missing/cyclic parent) without meeting a prompt.
+ */
+export function resolveTurnPrompt(store: GraphStore, node: ChronoNode): ChronoNode | null {
+  const seen = new Set<string>([node.id]);
+  let current: ChronoNode | null = node;
+  while (current && current.parentId !== null) {
+    if (seen.has(current.parentId)) break;
+    seen.add(current.parentId);
+    const parent = store.getNode(current.parentId);
+    if (!parent) break;
+    if (parent.kind === "prompt") return parent;
+    current = parent;
+  }
+  return null;
+}
+
+/**
  * Turn-scoped grounding base for a node's CheckContext (`parentTree`).
  *
  * Walks the parentId chain to the nearest ANCESTOR PROMPT node (the start of
@@ -399,20 +542,7 @@ export async function ingestBatch(
  */
 export function resolveTurnBaseTree(store: GraphStore, node: ChronoNode): string | null {
   // 1) Find the nearest ancestor prompt node (strictly above `node`).
-  const seen = new Set<string>([node.id]);
-  let current: ChronoNode | null = node;
-  let turnPrompt: ChronoNode | null = null;
-  while (current && current.parentId !== null) {
-    if (seen.has(current.parentId)) break;
-    seen.add(current.parentId);
-    const parent = store.getNode(current.parentId);
-    if (!parent) break;
-    if (parent.kind === "prompt") {
-      turnPrompt = parent;
-      break;
-    }
-    current = parent;
-  }
+  const turnPrompt = resolveTurnPrompt(store, node);
   if (!turnPrompt) return null;
 
   // 2) Nearest snapshot at-or-before the prompt: the prompt itself first,

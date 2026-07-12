@@ -35,6 +35,13 @@ export function startWatcher(deps: IngestDeps, dir: string = claudeProjectsDir()
       const raw = await fs.readFile(filePath, "utf8");
       const batch = parseSessionJsonl(filePath, raw);
       if (batch === null) return;
+      // Record where this session's transcript lives (and the cwd it ran
+      // in) so the rewind routes can load raw lines and the flag routes can
+      // resolve a worktree-aliased session's actual disk root.
+      deps.transcripts?.record(batch.session.id, {
+        transcriptPath: filePath,
+        diskRoot: batch.project.root,
+      });
       // Route every ingestBatch call through the per-project serializer:
       // the debounce above only dedupes the TIMER per file, not an
       // in-flight scan, so without this a debounced watcher scan could

@@ -20,6 +20,8 @@ if (process.env.SOJOURN_OPENCODE === "1") {
   console.log("[sojourn] OpenCode SSE subscriber enabled (SOJOURN_OPENCODE=1)");
 }
 
-server.listen(port, () => {
+// Loopback only: the API now carries write routes (harvest/rewind) and the
+// trust model is single-user localhost — never expose them to the LAN.
+server.listen(port, "127.0.0.1", () => {
   console.log(`[sojourn] daemon listening on http://localhost:${port} (ws: /ws)`);
 });

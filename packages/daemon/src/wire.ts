@@ -18,6 +18,7 @@ import type { FetchJson, Project, SnapshotterLike } from "@sojourn/core";
 import { claudeProjectsDir, parseSessionJsonl } from "@sojourn/adapter-claude";
 import { createApp } from "./server.js";
 import { ingestBatch, type IngestDeps } from "./ingest.js";
+import { TranscriptIndex } from "./transcripts.js";
 import { EventsHub } from "./events.js";
 import { startWatcher, type WatcherHandle } from "./watcher.js";
 import { runSerialized } from "./serialize.js";
@@ -134,6 +135,7 @@ export function buildDaemon(): BuiltDaemon {
   });
   const fetchJson = realFetchJson();
   const version = readOwnVersion();
+  const transcripts = new TranscriptIndex();
 
   let events: EventsHub | undefined;
   let ingestDeps: IngestDeps | undefined;
@@ -141,7 +143,7 @@ export function buildDaemon(): BuiltDaemon {
   function ensureWired(server: HttpServer): IngestDeps {
     if (!ingestDeps) {
       events = new EventsHub(server);
-      ingestDeps = { store, snapshotterFor, flagEngine, events, fetchJson };
+      ingestDeps = { store, snapshotterFor, flagEngine, events, fetchJson, transcripts };
     }
     return ingestDeps;
   }
@@ -166,6 +168,10 @@ export function buildDaemon(): BuiltDaemon {
     const raw = await fsp.readFile(transcriptPath, "utf8");
     const batch = parseSessionJsonl(transcriptPath, raw);
     if (batch === null) return;
+    transcripts.record(batch.session.id, {
+      transcriptPath,
+      diskRoot: batch.project.root,
+    });
     const key = path.resolve(batch.project.root);
     await runSerialized(key, () => ingestBatch(ingestDeps!, batch));
   }
@@ -182,6 +188,7 @@ export function buildDaemon(): BuiltDaemon {
         events: deps.events,
         version,
         fetchJson,
+        transcripts,
         rescanClaudeTranscript,
         // Fail-soft by construction (rescanOpenCodeSession never throws);
         // the project root comes from the parsed batch, and the call goes

@@ -1,5 +1,6 @@
 import path from "node:path";
 import fs from "node:fs";
+import fsp from "node:fs/promises";
 import { createRequire } from "node:module";
 import express, { type Express, type NextFunction, type Request, type Response } from "express";
 import type {
@@ -8,13 +9,27 @@ import type {
   CriticLLM,
   FlagEngine,
   GraphStore,
+  HarvestDeps,
+  NodeKind,
   Project,
   RestoreEngine,
+  RewindPlan,
   SnapshotterLike,
+  StoredFlag,
 } from "@sojourn/core";
-import { runCritic, SojournRestoreError } from "@sojourn/core";
-import { resolveTurnBaseTree, type EventsSink } from "./ingest.js";
+import {
+  getSessionHealth,
+  harvest as coreHarvest,
+  harvestPreflight as coreHarvestPreflight,
+  runCritic,
+  SojournHarvestError,
+  SojournRestoreError,
+} from "@sojourn/core";
+import { executeRewind, planRewind, SojournRewindError } from "@sojourn/adapter-claude";
+import type { ClaudeRewindPlan } from "@sojourn/adapter-claude";
+import { readRestoreManifest, resolveTurnBaseTree, type EventsSink } from "./ingest.js";
 import type { FetchJson } from "@sojourn/core";
+import type { TranscriptIndexLike } from "./transcripts.js";
 import { anthropicCritic } from "./critic.js";
 
 export interface ServerDeps {
@@ -45,6 +60,24 @@ export interface ServerDeps {
    * server (or assert the call) without a live OpenCode install.
    */
   rescanOpenCodeSession?: (sessionId: string) => Promise<void> | void;
+  /**
+   * Session -> transcript-location index maintained by the transcript
+   * scanners (see transcripts.ts). Powers the rewind routes (raw transcript
+   * lines) and worktree-aliased flag runs (the session's actual disk root).
+   * Optional: without it, rewind routes 404 ("transcript not known") and
+   * flag runs use the project's own root.
+   */
+  transcripts?: TranscriptIndexLike;
+  /**
+   * Harvest engine entry points. Injected so tests can exercise the route's
+   * typed error mapping (partial_apply/mainline_drift payloads) without
+   * staging a real mid-apply failure; defaults to @sojourn/core's real
+   * harvest/harvestPreflight.
+   */
+  harvestEngine?: {
+    preflight: typeof coreHarvestPreflight;
+    harvest: typeof coreHarvest;
+  };
 }
 
 /** Decodes a `:id` route param — node ids contain `:` (e.g. `claude:uuid`)
@@ -91,6 +124,28 @@ function resolveWebDist(): string | null {
   }
 }
 
+/**
+ * The disk root ground-truth checks should read for `node`. Normally the
+ * project's own root — EXCEPT for worktree-aliased sessions (V2 Task 7):
+ * those are stored under the ORIGIN project but actually ran inside a
+ * restored worktree, so disk-reading checks (e.g. package-hallucination's
+ * node_modules probe) must look at the worktree, not the mainline. The
+ * divergent root is only trusted when the transcript index reports it AND
+ * the restore manifest is actually present there, resolving back into this
+ * same project — the same evidence ingest used to alias the session.
+ */
+function resolveNodeDiskRoot(deps: ServerDeps, node: ChronoNode, project: Project): string {
+  const rec = deps.transcripts?.get(node.sessionId);
+  if (!rec || !rec.diskRoot) return project.root;
+  if (path.resolve(rec.diskRoot) === path.resolve(project.root)) return project.root;
+
+  const manifest = readRestoreManifest(rec.diskRoot);
+  if (!manifest) return project.root;
+  const origin = deps.store.getNode(manifest.nodeId);
+  if (!origin || origin.projectId !== project.id) return project.root;
+  return rec.diskRoot;
+}
+
 /** Builds the same `CheckContext` shape used by both the T1 deterministic
  * checks and the T2 advisory critic — TURN-scoped diff (snapshot before the
  * node's turn prompt -> node snapshot, see `resolveTurnBaseTree`),
@@ -108,11 +163,18 @@ async function buildCheckContext(
       : findParentSnapshotRef(deps.store, node);
   const nodeTree = node.snapshotRef;
 
+  // Worktree-aliased nodes: run checks against the session's ACTUAL disk
+  // root. The snapshotter keeps the origin project's id (shared shadow
+  // object DB, so tree reads/diffs stay valid) but pins the aliased root.
+  const diskRoot = project ? resolveNodeDiskRoot(deps, node, project) : "";
+
   let diff: Awaited<ReturnType<SnapshotterLike["diff"]>> = [];
   let snapshotter: SnapshotterLike | null = null;
   if (project && nodeTree !== null) {
     try {
-      snapshotter = deps.snapshotterFor(project);
+      snapshotter = deps.snapshotterFor(
+        diskRoot === project.root ? project : { ...project, root: diskRoot },
+      );
       diff = await snapshotter.diff(parentTree, nodeTree);
     } catch (err) {
       console.error("[sojourn] flags/run: diff failed:", err);
@@ -125,10 +187,194 @@ async function buildCheckContext(
     diff,
     parentTree,
     nodeTree,
-    projectRoot: project?.root ?? "",
+    projectRoot: diskRoot,
     snapshotter,
     fetchJson,
   };
+}
+
+/** The daemon-facing (public) subset of a rewind plan — internal synthesis
+ * fields (line indexes/uuids, projections) never leave the process. */
+function publicRewindPlan(plan: RewindPlan): RewindPlan {
+  return {
+    mode: plan.mode,
+    newSessionId: plan.newSessionId,
+    transcriptPath: plan.transcriptPath,
+    refusedReason: plan.refusedReason,
+    resumeCommand: plan.resumeCommand,
+  };
+}
+
+type PlannedRewind =
+  | { ok: true; plan: ClaudeRewindPlan; rawLines: string[] }
+  | { ok: false; status: number; error: string };
+
+/**
+ * Loads the node's session transcript (via the transcript index) and plans
+ * a rewind to it — ALWAYS server-side, from a single file read whose lines
+ * feed both the plan and (for the rewind route) the execute step. Client
+ * bodies are never consulted: a POSTed "plan" is ignored by design.
+ */
+async function planNodeRewind(deps: ServerDeps, node: ChronoNode): Promise<PlannedRewind> {
+  const rec = deps.transcripts?.get(node.sessionId);
+  if (!rec) {
+    return {
+      ok: false,
+      status: 404,
+      error:
+        `No transcript known for session ${node.sessionId} — the daemon has not ` +
+        `seen this session's transcript file yet`,
+    };
+  }
+
+  let raw: string;
+  try {
+    raw = await fsp.readFile(rec.transcriptPath, "utf8");
+  } catch {
+    return {
+      ok: false,
+      status: 404,
+      error: `Transcript for session ${node.sessionId} could not be read at ${rec.transcriptPath}`,
+    };
+  }
+
+  const rawLines = raw.split("\n");
+  const plan = planRewind({
+    nodes: deps.store.getSessionNodes(node.sessionId),
+    targetNodeId: node.id,
+    rawLines,
+    projectsSubdir: path.dirname(rec.transcriptPath),
+    sessionId: node.sessionId,
+  });
+  return { ok: true, plan, rawLines };
+}
+
+/**
+ * Best-effort exact-conversation companion for a successful filesystem
+ * restore: plans (and, when exact, executes) a rewind for the restored
+ * node. Returns null — never throws — when the node isn't a claude node,
+ * the transcript isn't known/readable, or the rewind itself fails: a
+ * completed restore must never be turned into an error by its companion.
+ */
+async function maybeRewindForRestore(deps: ServerDeps, nodeId: string): Promise<RewindPlan | null> {
+  try {
+    const node = deps.store.getNode(nodeId);
+    if (!node || node.cli !== "claude") return null;
+    const planned = await planNodeRewind(deps, node);
+    if (!planned.ok) return null;
+    const executed = await executeRewind(planned.plan, planned.rawLines);
+    return publicRewindPlan(executed);
+  } catch (err) {
+    console.error(`[sojourn] restore: rewind companion failed for node ${nodeId}:`, err);
+    return null;
+  }
+}
+
+const THINNED_SNAPSHOT_PHRASE = "snapshot missing or thinned by retention policy (soj gc)";
+
+const TURN_FLAG_LINE_MAX = 3;
+const TURN_FLAG_LINE_CHAR_MAX = 200;
+
+/** One compact line per flag: kind + whitespace-collapsed evidence, with a
+ * digest's suppressed count surfaced explicitly. */
+function formatFlagLine(flag: StoredFlag): string {
+  const evidence = flag.evidence.replace(/\s+/g, " ").trim();
+  const suffix =
+    (flag.suppressedCount ?? 0) > 0 ? ` [+${flag.suppressedCount} similar suppressed]` : "";
+  const line = `${flag.kind}: ${evidence}${suffix}`;
+  return line.length > TURN_FLAG_LINE_CHAR_MAX
+    ? `${line.slice(0, TURN_FLAG_LINE_CHAR_MAX - 1)}…`
+    : line;
+}
+
+type HarvestContext =
+  | { ok: true; mainlineRoot: string; harvestDeps: HarvestDeps }
+  | { ok: false; status: number; body: Record<string, unknown> };
+
+/**
+ * Resolves a harvest request's mainline root + snapshotter factory from the
+ * worktree's restore manifest: manifest nodeId -> origin node -> origin
+ * project. `snapshotterForRoot` hands out snapshotters keyed to the ORIGIN
+ * project's id with the requested root (wire.ts's id::root cache), so the
+ * worktree's branch tree, the manifest's base tree, and the mainline safety
+ * snapshot all live in one shadow object database.
+ */
+function resolveHarvestContext(deps: ServerDeps, worktreePath: string): HarvestContext {
+  const manifest = readRestoreManifest(worktreePath);
+  if (!manifest) {
+    return {
+      ok: false,
+      status: 400,
+      body: {
+        error:
+          `No valid .sojourn-restore.json manifest found in ${worktreePath} — ` +
+          `not a Sojourn restore worktree.`,
+        code: "no_manifest",
+      },
+    };
+  }
+
+  const originNode = deps.store.getNode(manifest.nodeId);
+  if (!originNode) {
+    return {
+      ok: false,
+      status: 400,
+      body: {
+        error: `Restore manifest in ${worktreePath} references unknown node ${manifest.nodeId}.`,
+        code: "no_manifest",
+      },
+    };
+  }
+
+  const originProject = deps.store.getProject(originNode.projectId);
+  if (!originProject) {
+    return {
+      ok: false,
+      status: 400,
+      body: {
+        error:
+          `Restore manifest in ${worktreePath} references node ${manifest.nodeId} whose ` +
+          `project ${originNode.projectId} no longer exists.`,
+        code: "no_manifest",
+      },
+    };
+  }
+
+  return {
+    ok: true,
+    mainlineRoot: originProject.root,
+    harvestDeps: {
+      snapshotterForRoot: (root: string) =>
+        deps.snapshotterFor(
+          path.resolve(root) === path.resolve(originProject.root)
+            ? originProject
+            : { ...originProject, root: path.resolve(root) },
+        ),
+      store: deps.store,
+    },
+  };
+}
+
+/** Typed error mapping for the harvest routes: 400 for pre-write refusals
+ * (no_manifest/stale_base/conflicts/patch_incomplete), 500 — with the
+ * honest `.partial` payload — for mid-apply failures. */
+function handleHarvestError(err: unknown, res: Response): void {
+  if (err instanceof SojournHarvestError) {
+    const body: Record<string, unknown> = {
+      error: err.message,
+      code: err.code,
+      files: err.files,
+    };
+    if (err.partial) body.partial = err.partial;
+    const status = err.code === "partial_apply" || err.code === "mainline_drift" ? 500 : 400;
+    if (status >= 500) {
+      console.error("[sojourn] harvest failed mid-apply:", err);
+    }
+    res.status(status).json(body);
+    return;
+  }
+  console.error("[sojourn] harvest route failed:", err);
+  res.status(500).json({ error: "Internal error" });
 }
 
 export function createApp(deps: ServerDeps): Express {
@@ -305,7 +551,17 @@ export function createApp(deps: ServerDeps): Express {
   app.post("/api/nodes/:id/preflight", async (req: Request, res: Response) => {
     const id = decodeId(req.params.id);
     try {
-      res.json(await deps.restoreEngine.preflight(id));
+      const preflight = await deps.restoreEngine.preflight(id);
+      if (!preflight.treeValid) {
+        // Say WHY restore is unavailable, in retention-aware terms: after
+        // `soj gc`, a pruned tree fails hasTree() exactly like a
+        // never-snapshotted node would.
+        preflight.warnings = [
+          `Restore unavailable: ${THINNED_SNAPSHOT_PHRASE}.`,
+          ...preflight.warnings,
+        ];
+      }
+      res.json(preflight);
     } catch (err) {
       handleRestoreError(err, id, res);
     }
@@ -314,9 +570,238 @@ export function createApp(deps: ServerDeps): Express {
   app.post("/api/nodes/:id/restore", async (req: Request, res: Response) => {
     const id = decodeId(req.params.id);
     try {
-      res.json(await deps.restoreEngine.restore(id));
+      const result = await deps.restoreEngine.restore(id);
+      // Exact-conversation companion (V2 Task 5): when the session's
+      // transcript is available, the response gains a `rewind` field — the
+      // plan is executed (synthesized transcript written) when exact, or
+      // returned as the honest tip-mode fallback otherwise. Never fails the
+      // restore itself.
+      const rewind = await maybeRewindForRestore(deps, id);
+      res.json(rewind !== null ? { ...result, rewind } : result);
     } catch (err) {
       handleRestoreError(err, id, res);
+    }
+  });
+
+  // Pure planning: no side effects, safe to call repeatedly. Claude nodes
+  // only — rewind synthesizes Claude transcript files.
+  app.post("/api/nodes/:id/rewind-plan", async (req: Request, res: Response) => {
+    const id = decodeId(req.params.id);
+    const node = deps.store.getNode(id);
+    if (!node) {
+      res.status(404).json({ error: `Node not found: ${id}` });
+      return;
+    }
+    if (node.cli !== "claude") {
+      res
+        .status(400)
+        .json({ error: `Rewind supports claude nodes only (node ${id} is cli "${node.cli}")` });
+      return;
+    }
+    const planned = await planNodeRewind(deps, node);
+    if (!planned.ok) {
+      res.status(planned.status).json({ error: planned.error });
+      return;
+    }
+    res.json(publicRewindPlan(planned.plan));
+  });
+
+  // Executes a rewind. The plan is ALWAYS recomputed server-side from the
+  // same transcript read that feeds the execute step — a client-supplied
+  // plan body is never trusted (and is ignored entirely).
+  app.post("/api/nodes/:id/rewind", async (req: Request, res: Response) => {
+    const id = decodeId(req.params.id);
+    const node = deps.store.getNode(id);
+    if (!node) {
+      res.status(404).json({ error: `Node not found: ${id}` });
+      return;
+    }
+    if (node.cli !== "claude") {
+      res
+        .status(400)
+        .json({ error: `Rewind supports claude nodes only (node ${id} is cli "${node.cli}")` });
+      return;
+    }
+    const planned = await planNodeRewind(deps, node);
+    if (!planned.ok) {
+      res.status(planned.status).json({ error: planned.error });
+      return;
+    }
+    try {
+      const executed = await executeRewind(planned.plan, planned.rawLines);
+      res.json(publicRewindPlan(executed));
+    } catch (err) {
+      if (err instanceof SojournRewindError) {
+        const status = err.code === "transcript_exists" ? 409 : 500;
+        if (status >= 500) {
+          console.error(`[sojourn] rewind failed for node ${id}:`, err);
+        }
+        res.status(status).json({ error: err.message, code: err.code });
+        return;
+      }
+      console.error(`[sojourn] rewind failed for node ${id}:`, err);
+      res.status(500).json({ error: "Rewind failed" });
+    }
+  });
+
+  app.get("/api/sessions/:id/health", (req: Request, res: Response) => {
+    const id = decodeId(req.params.id);
+    if (deps.store.getSessionNodes(id).length === 0) {
+      res.status(404).json({ error: `Session not found: ${id}` });
+      return;
+    }
+    res.json(getSessionHealth(deps.store, id));
+  });
+
+  // Last turn's ACTIVE verified flags as compact one-line strings — max 3
+  // plus a "+n more" marker. Verified only, ALWAYS: advisory flags never
+  // reach this surface (the hook prints these lines straight into the
+  // user's terminal, where hedging would be invisible).
+  app.get("/api/sessions/:id/turn-flags", (req: Request, res: Response) => {
+    const id = decodeId(req.params.id);
+    const nodes = deps.store.getSessionNodes(id);
+    if (nodes.length === 0) {
+      res.status(404).json({ error: `Session not found: ${id}` });
+      return;
+    }
+
+    const sinceNodeId =
+      typeof req.query.sinceNodeId === "string" && req.query.sinceNodeId.length > 0
+        ? req.query.sinceNodeId
+        : null;
+
+    let startIdx = 0;
+    if (sinceNodeId !== null) {
+      const idx = nodes.findIndex((n) => n.id === sinceNodeId);
+      if (idx === -1) {
+        res.status(404).json({ error: `Node not found in session ${id}: ${sinceNodeId}` });
+        return;
+      }
+      startIdx = idx + 1;
+    } else {
+      // The Stop hook omits sinceNodeId: default to the session's LAST
+      // turn — everything from its final prompt node onward.
+      for (let i = nodes.length - 1; i >= 0; i--) {
+        if (nodes[i].kind === "prompt") {
+          startIdx = i;
+          break;
+        }
+      }
+    }
+
+    const active: StoredFlag[] = [];
+    for (const n of nodes.slice(startIdx)) {
+      for (const f of n.flags ?? []) {
+        if (f.tier !== "verified") continue;
+        if (f.dismissed || f.autoResolved) continue;
+        active.push(f);
+      }
+    }
+
+    const lines = active.slice(0, TURN_FLAG_LINE_MAX).map(formatFlagLine);
+    if (active.length > TURN_FLAG_LINE_MAX) {
+      lines.push(`+${active.length - TURN_FLAG_LINE_MAX} more`);
+    }
+    res.json({ lines });
+  });
+
+  app.get("/api/search", (req: Request, res: Response) => {
+    const projectId = typeof req.query.projectId === "string" ? req.query.projectId : "";
+    if (projectId.length === 0) {
+      res.status(400).json({ error: "Query param `projectId` is required" });
+      return;
+    }
+    const q = typeof req.query.q === "string" && req.query.q.length > 0 ? req.query.q : undefined;
+    const file =
+      typeof req.query.file === "string" && req.query.file.length > 0
+        ? req.query.file
+        : undefined;
+    const kindsRaw = typeof req.query.kinds === "string" ? req.query.kinds : "";
+    const kinds = kindsRaw
+      .split(",")
+      .map((k) => k.trim())
+      .filter((k) => k.length > 0) as NodeKind[];
+
+    try {
+      const hits = deps.store.search(projectId, {
+        q,
+        file,
+        kinds: kinds.length > 0 ? kinds : undefined,
+      });
+      res.json({ hits });
+    } catch (err) {
+      console.error("[sojourn] search route failed:", err);
+      res.status(500).json({ error: "Search failed" });
+    }
+  });
+
+  const harvestFns = deps.harvestEngine ?? {
+    preflight: coreHarvestPreflight,
+    harvest: coreHarvest,
+  };
+
+  app.post("/api/worktrees/harvest/preflight", async (req: Request, res: Response) => {
+    const worktreePath =
+      req.body && typeof req.body.worktreePath === "string" ? req.body.worktreePath : "";
+    if (worktreePath.length === 0) {
+      res.status(400).json({ error: "Body must include a string `worktreePath` field" });
+      return;
+    }
+    const ctx = resolveHarvestContext(deps, worktreePath);
+    if (!ctx.ok) {
+      res.status(ctx.status).json(ctx.body);
+      return;
+    }
+    try {
+      res.json(await harvestFns.preflight(ctx.harvestDeps, worktreePath, ctx.mainlineRoot));
+    } catch (err) {
+      handleHarvestError(err, res);
+    }
+  });
+
+  app.post("/api/worktrees/harvest", async (req: Request, res: Response) => {
+    const body = req.body ?? {};
+    const worktreePath = typeof body.worktreePath === "string" ? body.worktreePath : "";
+    if (worktreePath.length === 0) {
+      res.status(400).json({ error: "Body must include a string `worktreePath` field" });
+      return;
+    }
+    const mode = body.mode;
+    if (mode !== "apply" && mode !== "patch") {
+      res.status(400).json({ error: "Body's `mode` must be one of apply|patch" });
+      return;
+    }
+    const allowConflicts = body.allowConflicts === true;
+
+    const ctx = resolveHarvestContext(deps, worktreePath);
+    if (!ctx.ok) {
+      res.status(ctx.status).json(ctx.body);
+      return;
+    }
+    try {
+      const outcome = await harvestFns.harvest(ctx.harvestDeps, worktreePath, ctx.mainlineRoot, {
+        mode,
+        allowConflicts,
+      });
+
+      // Graph closure: harvest() inserted the merge node directly through
+      // the store, so broadcast it (and the project update) the same way
+      // the ingest pipeline would.
+      if (outcome.mergeNodeId !== null) {
+        const mergeNode = deps.store.getNode(outcome.mergeNodeId);
+        if (mergeNode) {
+          try {
+            deps.events.broadcast({ type: "node_added", node: mergeNode });
+            deps.events.broadcast({ type: "project_updated", projectId: mergeNode.projectId });
+          } catch (err) {
+            console.error("[sojourn] harvest: failed to broadcast merge node:", err);
+          }
+        }
+      }
+
+      res.json(outcome);
+    } catch (err) {
+      handleHarvestError(err, res);
     }
   });
 
@@ -507,7 +992,9 @@ function handleRestoreError(err: unknown, nodeId: string, res: Response): void {
         res.status(404).json({ error: message });
         return;
       case "invalid_tree":
-        res.status(400).json({ error: message });
+        // Retention-aware phrasing: after `soj gc`, a pruned tree fails
+        // hasTree() exactly like a never-snapshotted node would.
+        res.status(400).json({ error: `${message} (${THINNED_SNAPSHOT_PHRASE})` });
         return;
       case "dest_exhausted":
         console.error(`[sojourn] restore-related route failed for node ${nodeId}:`, err);

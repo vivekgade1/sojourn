@@ -499,6 +499,92 @@ describe("ingestBatch", () => {
         const storedChild = store.getNode("claude:wt-child")!;
         expect(storedChild.parentId).toBe("claude:wt-root");
         expect(storedChild.meta.forkedFrom).toBeUndefined();
+
+        // WS events for the aliased batch must carry the ORIGIN project id:
+        // a client subscribed to the origin project's graph has to see the
+        // worktree's nodes arrive — an event keyed to the worktree's own
+        // (phantom) project id would be invisible to it.
+        const nodeAdded = sink.events.filter(
+          (e): e is Extract<SojournEvent, { type: "node_added" }> => e.type === "node_added",
+        );
+        const wtAdded = nodeAdded.filter((e) => e.node.id.startsWith("claude:wt-"));
+        expect(wtAdded).toHaveLength(2);
+        for (const e of wtAdded) {
+          expect(e.node.projectId).toBe(originProjectId);
+        }
+        const projectUpdated = sink.events.filter(
+          (e): e is Extract<SojournEvent, { type: "project_updated" }> =>
+            e.type === "project_updated",
+        );
+        expect(projectUpdated.length).toBeGreaterThan(0);
+        expect(projectUpdated[projectUpdated.length - 1].projectId).toBe(originProjectId);
+      } finally {
+        fs.rmSync(worktreeRoot, { recursive: true, force: true });
+      }
+    });
+
+    it("does not consume the fork edge when the would-be root's upsert fails — the edge lands on the next node whose parent doesn't resolve", async () => {
+      await fsp.writeFile(path.join(projectRoot, "a.txt"), "origin content");
+      const deps = makeDeps();
+
+      const originPrompt = node(
+        "edge-origin-p",
+        null,
+        "prompt",
+        "s-edge-origin",
+        "2026-01-01T00:00:00.000Z",
+        "hi",
+      );
+      await ingestBatch(deps, {
+        project: { root: projectRoot, name: "mainline" },
+        session: { id: "s-edge-origin", cli: "claude" },
+        nodes: [originPrompt],
+      });
+      const originNodeId = "claude:edge-origin-p";
+
+      const worktreeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "sojourn-ingest-worktree-edge-"));
+      try {
+        await fsp.writeFile(
+          path.join(worktreeRoot, ".sojourn-restore.json"),
+          JSON.stringify({ nodeId: originNodeId }),
+          "utf8",
+        );
+
+        // The batch's true root has unserializable content, so its upsert
+        // throws AFTER the fork-edge condition matched it. The edge must
+        // not be consumed by that failure: the child (whose recorded parent
+        // now resolves to nothing, since the root never landed) must still
+        // get reparented to the origin.
+        const circular: Record<string, unknown> = {};
+        circular.self = circular;
+        const badRoot = node(
+          "edge-bad-root",
+          null,
+          "prompt",
+          "s-edge-wt",
+          "2026-01-02T00:00:00.000Z",
+          "placeholder",
+        );
+        badRoot.content = circular;
+        const child = node(
+          "edge-child",
+          "edge-bad-root",
+          "assistant",
+          "s-edge-wt",
+          "2026-01-02T00:00:01.000Z",
+          { type: "text", text: "ok" },
+        );
+
+        await ingestBatch(deps, {
+          project: { root: worktreeRoot, name: "worktree-phantom" },
+          session: { id: "s-edge-wt", cli: "claude" },
+          nodes: [badRoot, child],
+        });
+
+        expect(store.getNode("claude:edge-bad-root")).toBeNull();
+        const storedChild = store.getNode("claude:edge-child")!;
+        expect(storedChild.parentId).toBe(originNodeId);
+        expect(storedChild.meta.forkedFrom).toBe(originNodeId);
       } finally {
         fs.rmSync(worktreeRoot, { recursive: true, force: true });
       }
@@ -711,6 +797,162 @@ describe("ingestBatch", () => {
       } finally {
         fs.rmSync(worktreeRoot, { recursive: true, force: true });
       }
+    });
+  });
+
+  describe("per-turn flag budgets + decision-memory file index (V2 wiring)", () => {
+    /** Ingests a two-turn session where turn 2's assistant `claimText` is a
+     * lie (nothing on disk changed during the turn), returning the claim
+     * node's id. */
+    async function ingestFalseClaimTurn(deps: IngestDeps, sess: string, claimText: string) {
+      const prompt1 = node(`${sess}-p1`, null, "prompt", sess, "2026-01-01T00:00:00.000Z", "hi");
+      const prior = node(`${sess}-prior`, `${sess}-p1`, "assistant", sess, "2026-01-01T00:00:01.000Z", {
+        type: "text",
+        text: "Sure.",
+      });
+      await ingestBatch(deps, {
+        project: { root: projectRoot, name: "test" },
+        session: { id: sess, cli: "claude" },
+        nodes: [prompt1, prior],
+      });
+
+      const prompt2 = node(`${sess}-p2`, `${sess}-prior`, "prompt", sess, "2026-01-01T00:00:02.000Z", "go");
+      const claim = node(`${sess}-claim`, `${sess}-p2`, "assistant", sess, "2026-01-01T00:00:03.000Z", {
+        type: "text",
+        text: claimText,
+      });
+      await ingestBatch(deps, {
+        project: { root: projectRoot, name: "test" },
+        session: { id: sess, cli: "claude" },
+        nodes: [prompt1, prior, prompt2, claim],
+      });
+      return `claude:${sess}-claim`;
+    }
+
+    it("collapses a flag storm: 12 distinct false edit claims in one turn keep the flagship budget (10) plus ONE digest carrying suppressedCount", async () => {
+      await fsp.writeFile(path.join(projectRoot, "a.txt"), "hello");
+      const deps = makeDeps();
+
+      const stormText = Array.from({ length: 12 }, (_, i) => `I updated \`f${i}.py\`.`).join(" ");
+      const claimId = await ingestFalseClaimTurn(deps, "s-storm", stormText);
+
+      const stored = store.getNode(claimId)!;
+      const editFlags = (stored.flags ?? []).filter((f) => f.kind === "edit_claim_mismatch");
+      const ordinary = editFlags.filter((f) => (f.suppressedCount ?? 0) === 0);
+      const digests = editFlags.filter((f) => (f.suppressedCount ?? 0) > 0);
+
+      // 12 distinct claims -> flagship budget keeps 10, the 2 overflow
+      // claims collapse into exactly ONE digest row.
+      expect(ordinary).toHaveLength(10);
+      expect(digests).toHaveLength(1);
+      expect(digests[0].suppressedCount).toBe(2);
+      expect(digests[0].tier).toBe("verified");
+      expect(digests[0].evidence).toContain("…and similar claims suppressed");
+
+      // Digest rows are budget bookkeeping, never a tier blur: everything
+      // stored is still the deterministic verified kind.
+      for (const f of editFlags) {
+        expect(f.tier).toBe("verified");
+        expect(f.source).toBe("deterministic");
+      }
+    });
+
+    it("dedups identical claims across nodes of the SAME turn in one batch (only the first occurrence is persisted)", async () => {
+      await fsp.writeFile(path.join(projectRoot, "a.txt"), "hello");
+      const deps = makeDeps();
+      const sess = "s-dedup";
+
+      const prompt1 = node("d-p1", null, "prompt", sess, "2026-01-01T00:00:00.000Z", "hi");
+      const prior = node("d-prior", "d-p1", "assistant", sess, "2026-01-01T00:00:01.000Z", {
+        type: "text",
+        text: "Sure.",
+      });
+      await ingestBatch(deps, {
+        project: { root: projectRoot, name: "test" },
+        session: { id: sess, cli: "claude" },
+        nodes: [prompt1, prior],
+      });
+
+      // Turn 2: TWO assistant nodes make the SAME false claim.
+      const prompt2 = node("d-p2", "d-prior", "prompt", sess, "2026-01-01T00:00:02.000Z", "go");
+      const a1 = node("d-a1", "d-p2", "assistant", sess, "2026-01-01T00:00:03.000Z", {
+        type: "text",
+        text: "I updated `dup.py` to fix the bug.",
+      });
+      const a2 = node("d-a2", "d-a1", "assistant", sess, "2026-01-01T00:00:04.000Z", {
+        type: "text",
+        text: "I updated `dup.py` to fix the bug.",
+      });
+      await ingestBatch(deps, {
+        project: { root: projectRoot, name: "test" },
+        session: { id: sess, cli: "claude" },
+        nodes: [prompt1, prior, prompt2, a1, a2],
+      });
+
+      const flagsA1 = (store.getNode("claude:d-a1")!.flags ?? []).filter(
+        (f) => f.kind === "edit_claim_mismatch",
+      );
+      const flagsA2 = (store.getNode("claude:d-a2")!.flags ?? []).filter(
+        (f) => f.kind === "edit_claim_mismatch",
+      );
+      expect(flagsA1).toHaveLength(1);
+      expect(flagsA2).toHaveLength(0);
+    });
+
+    it("stays under budget untouched: a single false claim persists exactly one flag and no digest", async () => {
+      await fsp.writeFile(path.join(projectRoot, "a.txt"), "hello");
+      const deps = makeDeps();
+      const claimId = await ingestFalseClaimTurn(
+        deps,
+        "s-under",
+        "I updated `solo.py` to handle the edge case.",
+      );
+
+      const editFlags = (store.getNode(claimId)!.flags ?? []).filter(
+        (f) => f.kind === "edit_claim_mismatch",
+      );
+      expect(editFlags).toHaveLength(1);
+      expect(editFlags[0].suppressedCount ?? 0).toBe(0);
+    });
+
+    it("indexes the turn's diff files onto the turn's prompt node and the batch-tail node (searchable by file)", async () => {
+      await fsp.writeFile(path.join(projectRoot, "a.txt"), "hello");
+      const deps = makeDeps();
+      const sess = "s-files";
+
+      // Turn 1 anchors the pre-turn snapshot.
+      const prompt1 = node("nf-p1", null, "prompt", sess, "2026-01-01T00:00:00.000Z", "hi");
+      const prior = node("nf-prior", "nf-p1", "assistant", sess, "2026-01-01T00:00:01.000Z", {
+        type: "text",
+        text: "Hello!",
+      });
+      await ingestBatch(deps, {
+        project: { root: projectRoot, name: "test" },
+        session: { id: sess, cli: "claude" },
+        nodes: [prompt1, prior],
+      });
+
+      // The turn's real change happens before turn 2's batch lands.
+      await fsp.writeFile(path.join(projectRoot, "auth.py"), "def refresh(): pass\n");
+
+      const prompt2 = node("nf-p2", "nf-prior", "prompt", sess, "2026-01-01T00:00:02.000Z", "fix auth");
+      const claim = node("nf-claim", "nf-p2", "assistant", sess, "2026-01-01T00:00:03.000Z", {
+        type: "text",
+        text: "I updated `auth.py` to handle refresh tokens.",
+      });
+      await ingestBatch(deps, {
+        project: { root: projectRoot, name: "test" },
+        session: { id: sess, cli: "claude" },
+        nodes: [prompt1, prior, prompt2, claim],
+      });
+
+      const projectId = store.getProjects()[0].id;
+      const hits = store.search(projectId, { file: "auth.py" });
+      const hitIds = hits.map((h) => h.node.id);
+      // The turn's diff (contains auth.py) is indexed onto BOTH the turn's
+      // prompt node and the batch-tail node.
+      expect(hitIds).toContain("claude:nf-p2");
+      expect(hitIds).toContain("claude:nf-claim");
     });
   });
 });

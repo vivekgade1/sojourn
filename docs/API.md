@@ -13,21 +13,21 @@ Base: `http://localhost:4177` (env `SOJOURN_PORT`). All JSON. Types refer to `@s
 | GET | `/api/nodes/:id/diff` | — | `{ changes: FileChange[] }` — parent snapshot → node snapshot; `{ changes: [] }` when no snapshots |
 | GET | `/api/nodes/:id/diff/file?path=P` | — | `{ patch: string }` |
 | POST | `/api/nodes/:id/flags/run` | `{ tier?: "T1" \| "T2" }` (default T1) | `{ flags: StoredFlag[] }` (the node's FULL current flag list). T2 (advisory LLM critic) is implemented: 400 when `ANTHROPIC_API_KEY` is not set on the daemon, 502 when the critic call fails |
-| POST | `/api/nodes/:id/preflight` | — | `RestorePreflight` |
-| POST | `/api/nodes/:id/restore` | — | `RestoreResult` (400 when preflight `treeValid` is false) |
+| POST | `/api/nodes/:id/preflight` | — | `RestorePreflight` (when `treeValid` is false, `warnings[0]` explains: snapshot missing or thinned by retention policy — `soj gc`) |
+| POST | `/api/nodes/:id/restore` | — | `RestoreResult` (400 when preflight `treeValid` is false); response gains a `rewind: RewindPlan` field when the session's transcript is known to the daemon — the plan is EXECUTED (synthesized transcript written) when `mode` is `exact`, or the honest tip-mode fallback otherwise; rewind failures never fail the restore (field simply omitted) |
 | POST | `/api/nodes/:id/annotations` | `{ text: string }` | `Annotation` |
 | POST | `/api/flags/:id/dismiss` | — | `{ ok: true }` |
 | POST | `/api/mark` | `{ sessionId: string, label: string, kind: "decision" \| "assumption" \| "checkpoint" }` | `ChronoNode` (parented to `latestNode(sessionId)`) |
 | POST | `/api/hooks/claude` | Claude hook payload (`{session_id, transcript_path, cwd, hook_event_name}`) | `{ ok: true }` — triggers immediate re-scan of that transcript |
 | POST | `/api/hooks/opencode` | `{ sessionId: string }` | `{ ok: true }` — triggers a fire-and-forget re-scan of that OpenCode session (session + messages pulled from the local OpenCode server; fail-soft if unreachable) |
 
-| GET | `/api/sessions/:id/health` | — | `SessionHealth` (pure counts) |
-| GET | `/api/search?projectId=&q=&file=` | — | `{ hits: SearchHit[] }` — FTS over gists/labels/annotations + files-touched index |
-| POST | `/api/nodes/:id/rewind-plan` | — | `RewindPlan` (pure — no side effects) |
-| POST | `/api/nodes/:id/rewind` | — | `RewindPlan` executed (writes a NEW synthesized transcript when mode=exact; never mutates originals) |
-| POST | `/api/worktrees/harvest/preflight` | `{ worktreePath }` | `HarvestPreflight` |
-| POST | `/api/worktrees/harvest` | `{ worktreePath, mode: "apply" \| "patch", allowConflicts? }` | `HarvestResult` (mainline safety snapshot ALWAYS first) |
-| GET | `/api/sessions/:id/turn-flags?sinceNodeId=` | — | `{ lines: string[] }` — compact, budgeted, verified-only |
+| GET | `/api/sessions/:id/health` | — | `SessionHealth` (pure counts); 404 JSON for an unknown session |
+| GET | `/api/search?projectId=&q=&file=&kinds=` | — | `{ hits: SearchHit[] }` — FTS over gists/labels/annotations + files-touched index; `kinds` is a CSV of `NodeKind`s; 400 without `projectId` |
+| POST | `/api/nodes/:id/rewind-plan` | — | `RewindPlan` (pure — no side effects). Claude nodes only (400 otherwise); 404 when the daemon has not yet seen the session's transcript file. Only the public `RewindPlan` fields are returned |
+| POST | `/api/nodes/:id/rewind` | — | `RewindPlan` executed (writes a NEW synthesized transcript when mode=exact; never mutates originals). The plan is ALWAYS recomputed server-side from one transcript read — any client-posted plan body is ignored. Claude-only 400 / unknown-transcript 404 as above; 409 when the target transcript path already exists |
+| POST | `/api/worktrees/harvest/preflight` | `{ worktreePath }` | `HarvestPreflight`. The worktree's `.sojourn-restore.json` resolves the origin project (mainline root + shared shadow repo); 400 `{ error, code: "no_manifest" }` when absent/unresolvable |
+| POST | `/api/worktrees/harvest` | `{ worktreePath, mode: "apply" \| "patch", allowConflicts? }` | `HarvestResult` + `warnings: string[]` (mainline safety snapshot ALWAYS first). Typed errors: `{ error, code, files }` with 400 for `no_manifest`/`stale_base`/`conflicts`/`patch_incomplete`; 500 for `partial_apply`/`mainline_drift` with the honest `partial` payload (`{ applied, conflicted, remaining, safetySnapshotRef }`) in the body |
+| GET | `/api/sessions/:id/turn-flags?sinceNodeId=` | — | `{ lines: string[] }` — the turn's ACTIVE verified flags as compact one-liners, max 3 + a `"+n more"` marker; advisory flags never appear. When `sinceNodeId` is omitted (the Stop hook omits it), defaults to the session's LAST turn (from its final prompt node onward); 404 for an unknown session or a `sinceNodeId` not in the session |
 
 Static: serves `packages/web/dist` at `/` when built.
 
