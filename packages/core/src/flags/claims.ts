@@ -74,7 +74,7 @@ export function allBacktickedTokens(text: string): string[] {
   return tokens;
 }
 
-export type ClaimKind = "EDIT" | "CREATE" | "DELETE";
+export type ClaimKind = "EDIT" | "CREATE" | "DELETE" | "RENAME";
 
 export interface EditClaim {
   kind: ClaimKind;
@@ -95,15 +95,19 @@ const EDIT_VERBS = [
 ];
 const CREATE_VERBS = ["created", "added", "wrote"];
 const DELETE_VERBS = ["deleted", "removed"];
-// "renamed" is a claim verb per the brief's verb list but doesn't map cleanly
-// to EDIT/CREATE/DELETE; treat it as an EDIT-style claim (the old path should
-// still show up as changed in some way in the diff).
-const ALL_VERBS = [...EDIT_VERBS, ...CREATE_VERBS, ...DELETE_VERBS, "renamed"];
+// RENAME-class verbs claim the file MOVED, so a rename diff entry satisfies
+// them via either side (`oldPath` for the source, `path` for the target).
+// Split out of EDIT (round 2) so a plain EDIT claim can no longer be
+// silently satisfied by an unrelated rename whose `oldPath` happens to
+// match the claimed file (see resolveDiffMatches in editClaim.ts).
+const RENAME_VERBS = ["renamed", "moved"];
+const ALL_VERBS = [...EDIT_VERBS, ...CREATE_VERBS, ...DELETE_VERBS, ...RENAME_VERBS];
 
 function verbToKind(verb: string): ClaimKind {
   const v = verb.toLowerCase();
   if (CREATE_VERBS.includes(v)) return "CREATE";
   if (DELETE_VERBS.includes(v)) return "DELETE";
+  if (RENAME_VERBS.includes(v)) return "RENAME";
   return "EDIT";
 }
 
@@ -130,6 +134,14 @@ export function looksLikeRelativeFilePath(token: string): boolean {
   // claim subjects. Keep in sync with packages.ts `isAliasedImport`, which
   // skips the same prefixes for imports: `@/…` (bundler/tsconfig alias),
   // `~/…` (covered by the `~` reject above), `#…` (Node subpath imports).
+  //
+  // KNOWN PRECISION-FIRST LIMITATION (round 2, deliberate): alias resolution
+  // is out of scope — silence over guessing. Mapping `@/lib/x.ts` or
+  // `#internal/db.js` to a real repo path requires tsconfig/package.json
+  // context the checker does not have, and a wrong guess would false-flag
+  // TRUTHFUL alias-spelled claims (corpus ec-e4). The accepted cost is that
+  // a FALSE alias-spelled claim also stays silent (corpus ec-o6): these
+  // tokens are never claim subjects, in either direction.
   if (t.startsWith("@/")) return false;
   if (t.startsWith("#")) return false;
   if (t.includes("*") || t.includes("?") || t.includes("[")) return false; // globs
@@ -145,23 +157,53 @@ export function looksLikeRelativeFilePath(token: string): boolean {
 }
 
 // --- Hedge / negation suppression ------------------------------------------
-// Mirrors the sentence-scoped hedge approach in tests.ts (`isHedgedMatch`):
-// a claim verb preceded, within the same sentence, by a genuine future/
-// conditional marker ("Once tests pass, I will have updated `x`") states an
-// intention, not a completed edit, and must not be read as a claim. Only
-// true hedge markers count — common narrative words ("after", "before",
-// "then") are deliberately excluded because they appear constantly in
-// genuine completed-work claims. `'ll` covers contractions ("I'll have
-// updated"); "will|would|…" cover future-perfect "<modal> have <verb>".
+// Mirrors the sentence-scoped hedge approach in tests.ts (`isHedgedMatch`),
+// but scoping is CLAUSE-aware (round 2): a hedge or negation only reaches a
+// claim verb inside its own clause — except clause-initial conditionals
+// ("Once tests pass, I will have updated `x`"), which govern the rest of
+// their sentence. Suppression favors precision per the design principles: a
+// suppressed claim can never become a false flag — but round 2 tightened
+// the windows because over-suppression was letting materially FALSE claims
+// ("This should fix the flaky test, and I updated `x.py`") pass silently.
 const SENTENCE_BOUNDARY = /[.!?;\n]/;
-const HEDGE_MARKER =
-  /\b(will|would|should|could|may|might|shall|once|unless|until|going to|plan(?:ning)? to|about to|intend(?:s|ed)? to)\b|'ll\b/i;
 
-// Negation is scoped tighter — to the clause (commas also end the window):
-// "I haven't updated `x`" is a truthful non-claim, but "I didn't touch the
-// tests, but I updated `x`" still asserts the edit in its own clause.
-const CLAUSE_BOUNDARY = /[.!?;:\n,]/;
+// Clause boundaries: commas/colons end a clause, and so does the dash
+// family — em dash (—), en dash (–), and a hyphen used as a dash, i.e.
+// flanked by spaces (" - ", " -- "). "I didn't just tweak it — I rewrote
+// `x.py`" asserts the rewrite in its own clause; the negation before the
+// dash must not leak across it. Spaced hyphens are multi-char, so they are
+// handled by `clauseWindowBefore`'s truncation pass, not this char class
+// (an unspaced hyphen, as in `re-ran` or a `-v` flag, is NOT a boundary).
+const CLAUSE_BOUNDARY = /[.!?;:\n,–—]/;
+const SPACED_DASH = /[ \t]-+[ \t]/g;
+
+// Negation is clause-scoped: "I haven't updated `x`" is a truthful
+// non-claim, but "I didn't touch the tests, but I updated `x`" (comma) and
+// "I didn't just tweak it — I rewrote `x.py`" (dash) still assert the edit
+// in its own clause.
 const NEGATION_MARKER = /\b(not|never|no longer)\b|n't\b/i;
+
+// Future/modal markers state intention or possibility, not completion — but
+// they suppress ONLY when directly governing the claim verb: marker +
+// optional adverbs + optional "have" + verb ("will have updated", "I'll
+// probably have refactored"). An intervening other verb breaks governance:
+// "I will note that I updated `x.py`" asserts an already-completed edit and
+// must stay a claim.
+const FUTURE_MARKER =
+  /\b(?:will|would|should|could|may|might|shall|going to|plan(?:ning)? to|about to|intend(?:s|ed)? to)\b|'ll\b/gi;
+const GOVERNANCE_GAP =
+  /^(?:\s+(?:\w+ly|also|just|soon|now|then|first|again))*(?:\s+have)?(?:\s+(?:\w+ly|also|just|soon|now|then|first|again))*\s*$/i;
+
+// Conditionals suppress from two positions: inside the claim verb's own
+// clause, or clause-initial ("Once tests pass, I will have updated `x`" —
+// ec-e1) where they govern the rest of the sentence. "once" is excluded
+// when it heads the adverbial idiom "once again"/"once more", which marks a
+// completed repeat action, not a condition ("Once again I updated `x.py`").
+const CONDITIONAL_MARKER = /\b(once|if|when|until|unless)\b/gi;
+const ONCE_IDIOM = /^\s+(?:again|more)\b/i;
+// Clause-initial = at the start of the sentence window, or right after a
+// clause boundary (comma/colon/dash) within it.
+const CLAUSE_INITIAL_PREFIX = /(?:^\s*|[,:–—]\s*|[ \t]-+[ \t]+)$/;
 
 /** Index of the first character after the nearest `boundary` character
  * before `index` (or 0 if none) — the start of the sentence/clause that
@@ -173,21 +215,54 @@ function windowStartBefore(text: string, index: number, boundary: RegExp): numbe
   return 0;
 }
 
+/** The clause containing `index` (text from the nearest clause boundary up
+ * to `index`), with a spaced-hyphen dash (" - ", " -- ") also treated as a
+ * boundary — those are multi-char, so they can't live in CLAUSE_BOUNDARY's
+ * single-char class and are trimmed here instead. */
+function clauseWindowBefore(text: string, index: number): string {
+  let window = text.slice(windowStartBefore(text, index, CLAUSE_BOUNDARY), index);
+  let lastDashEnd = -1;
+  for (const m of window.matchAll(SPACED_DASH)) {
+    lastDashEnd = (m.index ?? 0) + m[0].length;
+  }
+  if (lastDashEnd >= 0) window = window.slice(lastDashEnd);
+  return window;
+}
+
 /**
- * True when the claim verb at `verbIndex` is hedged (future/conditional,
- * incl. future-perfect "will have updated") or negated ("haven't updated",
- * "didn't change") and therefore must not count as a completed-edit claim.
- * Suppression favors precision per the design principles: a suppressed
- * claim can never become a false flag.
+ * True when the claim verb at `verbIndex` must not count as a completed-edit
+ * claim because it is:
+ *  - negated within its own clause ("haven't updated"), or
+ *  - directly governed by a future/modal marker ("will have updated",
+ *    "I'll probably have refactored"), or
+ *  - governed by a conditional in its clause or a clause-initial conditional
+ *    earlier in the sentence ("Once tests pass, …").
  */
 function isSuppressedClaimVerb(text: string, verbIndex: number): boolean {
   const sentenceWindow = text.slice(
     windowStartBefore(text, verbIndex, SENTENCE_BOUNDARY),
     verbIndex,
   );
-  if (HEDGE_MARKER.test(sentenceWindow)) return true;
-  const clauseWindow = text.slice(windowStartBefore(text, verbIndex, CLAUSE_BOUNDARY), verbIndex);
-  return NEGATION_MARKER.test(clauseWindow);
+  const clauseWindow = clauseWindowBefore(text, verbIndex);
+
+  if (NEGATION_MARKER.test(clauseWindow)) return true;
+
+  for (const m of sentenceWindow.matchAll(FUTURE_MARKER)) {
+    const gap = sentenceWindow.slice((m.index ?? 0) + m[0].length);
+    if (GOVERNANCE_GAP.test(gap)) return true;
+  }
+
+  const clauseStartInSentence = sentenceWindow.length - clauseWindow.length;
+  for (const m of sentenceWindow.matchAll(CONDITIONAL_MARKER)) {
+    const at = m.index ?? 0;
+    if (m[1].toLowerCase() === "once" && ONCE_IDIOM.test(sentenceWindow.slice(at + m[0].length))) {
+      continue;
+    }
+    const inVerbClause = at >= clauseStartInSentence;
+    if (inVerbClause || CLAUSE_INITIAL_PREFIX.test(sentenceWindow.slice(0, at))) return true;
+  }
+
+  return false;
 }
 
 /**

@@ -8,7 +8,7 @@
 // Requires `npm run build:node` to have been run first (imports the
 // compiled core package, not TypeScript source).
 //
-// Exit code: 0 when precision === 1.0 AND recall >= 0.8; 1 otherwise.
+// Exit code: 0 when precision === 1.0 AND recall >= 0.95; 1 otherwise.
 
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -20,7 +20,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CORPUS_PATH = path.join(__dirname, "editclaim-corpus.jsonl");
 
 const PRECISION_THRESHOLD = 1.0;
-const RECALL_THRESHOLD = 0.8;
+// current corpus recall: 1.0 — do not lower this floor without a controller decision
+const RECALL_THRESHOLD = 0.95;
 
 function loadCorpus(corpusPath) {
   const raw = readFileSync(corpusPath, "utf8");
@@ -133,7 +134,12 @@ async function main() {
   }
 
   const passed = precision >= PRECISION_THRESHOLD && recall >= RECALL_THRESHOLD;
-  console.log(passed ? "RESULT: PASS" : "RESULT: FAIL");
+  console.log(
+    passed
+      ? "RESULT: PASS"
+      : `RESULT: FAIL (achieved precision=${precision.toFixed(4)}, recall=${recall.toFixed(4)}; ` +
+        `required precision === ${PRECISION_THRESHOLD}, recall >= ${RECALL_THRESHOLD})`,
+  );
 
   process.exit(passed ? 0 : 1);
 }

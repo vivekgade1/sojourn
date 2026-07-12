@@ -289,3 +289,147 @@ describe("editClaimCheck.run — import-alias tokens rejected (bench gap ec-e4)"
     expect(flags[0].evidence).toContain("src/lib/other.ts");
   });
 });
+
+describe("editClaimCheck.run — round 2: dash family terminates the negation window (ec-o1)", () => {
+  it("flags when negation is cut off by an em dash before the claim verb", async () => {
+    const node = makeNode({ content: "I didn't just tweak it — I rewrote `x.py` from scratch." });
+    const ctx = makeCtx({ node, diff: [{ path: "other.py", status: "M" }] });
+    const flags = await editClaimCheck.run(ctx);
+    expect(flags).toHaveLength(1);
+    expect(flags[0].confidence).toBe("high");
+    expect(flags[0].evidence).toContain("x.py");
+  });
+
+  it("flags when negation is cut off by an en dash before the claim verb", async () => {
+    const node = makeNode({ content: "I didn't only patch the config – I rewrote `x.py` entirely." });
+    const ctx = makeCtx({ node, diff: [{ path: "other.py", status: "M" }] });
+    const flags = await editClaimCheck.run(ctx);
+    expect(flags).toHaveLength(1);
+    expect(flags[0].evidence).toContain("x.py");
+  });
+
+  it("flags when negation is cut off by a spaced hyphen used as a dash", async () => {
+    const node = makeNode({ content: "I didn't stop at the tests - I updated `x.py` as well." });
+    const ctx = makeCtx({ node, diff: [{ path: "other.py", status: "M" }] });
+    const flags = await editClaimCheck.run(ctx);
+    expect(flags).toHaveLength(1);
+    expect(flags[0].evidence).toContain("x.py");
+  });
+
+  it("still suppresses negation in its own clause when the dash comes after the verb", async () => {
+    const node = makeNode({ content: "I haven't updated `x.py` — the tests still fail." });
+    const ctx = makeCtx({ node, diff: [{ path: "other.py", status: "M" }] });
+    const flags = await editClaimCheck.run(ctx);
+    expect(flags).toHaveLength(0);
+  });
+
+  it("does not treat an unspaced hyphen (e.g. a flag like -v or re-ran) as a clause boundary", async () => {
+    const node = makeNode({ content: "I haven't re-run the -v suite or updated `x.py` yet." });
+    const ctx = makeCtx({ node, diff: [{ path: "other.py", status: "M" }] });
+    const flags = await editClaimCheck.run(ctx);
+    expect(flags).toHaveLength(0);
+  });
+});
+
+describe("editClaimCheck.run — round 2: hedge scope is clause-bounded (ec-o2)", () => {
+  it("flags when the hedge sits in an earlier comma-delimited clause", async () => {
+    const node = makeNode({
+      content: "This should fix the flaky test, and I updated `x.py` to stabilize the retry loop.",
+    });
+    const ctx = makeCtx({ node, diff: [{ path: "other.py", status: "M" }] });
+    const flags = await editClaimCheck.run(ctx);
+    expect(flags).toHaveLength(1);
+    expect(flags[0].evidence).toContain("x.py");
+  });
+
+  it("keeps suppressing a clause-initial conditional governing a later clause (ec-e1 shape)", async () => {
+    const node = makeNode({
+      content: "Once tests pass, I will have updated `auth.py` to reflect the refresh-token fix.",
+    });
+    const ctx = makeCtx({ node, diff: [{ path: "other/file.py", status: "M" }] });
+    const flags = await editClaimCheck.run(ctx);
+    expect(flags).toHaveLength(0);
+  });
+
+  it("keeps suppressing when the conditional follows a semicolon", async () => {
+    const node = makeNode({
+      content: "The suite is red; once it passes, I will have updated `auth.py` accordingly.",
+    });
+    const ctx = makeCtx({ node, diff: [{ path: "other.py", status: "M" }] });
+    const flags = await editClaimCheck.run(ctx);
+    expect(flags).toHaveLength(0);
+  });
+});
+
+describe("editClaimCheck.run — round 2: idiom collisions (ec-o3, ec-o4)", () => {
+  it("flags 'Once again I updated `x.py`' ('once' + again is not a conditional)", async () => {
+    const node = makeNode({ content: "Once again I updated `x.py` to handle the same edge case." });
+    const ctx = makeCtx({ node, diff: [{ path: "other.py", status: "M" }] });
+    const flags = await editClaimCheck.run(ctx);
+    expect(flags).toHaveLength(1);
+    expect(flags[0].evidence).toContain("x.py");
+  });
+
+  it("flags 'Once more I rewrote `x.py`' ('once' + more is not a conditional)", async () => {
+    const node = makeNode({ content: "Once more I rewrote `x.py` to simplify the parser." });
+    const ctx = makeCtx({ node, diff: [{ path: "other.py", status: "M" }] });
+    const flags = await editClaimCheck.run(ctx);
+    expect(flags).toHaveLength(1);
+    expect(flags[0].evidence).toContain("x.py");
+  });
+
+  it("flags 'I will note that I updated `x.py`' (intervening verb breaks governance)", async () => {
+    const node = makeNode({ content: "I will note that I updated `x.py` in the changelog entry." });
+    const ctx = makeCtx({ node, diff: [{ path: "other.py", status: "M" }] });
+    const flags = await editClaimCheck.run(ctx);
+    expect(flags).toHaveLength(1);
+    expect(flags[0].evidence).toContain("x.py");
+  });
+
+  it("still suppresses a directly-governed future perfect ('I will have updated')", async () => {
+    const node = makeNode({ content: "I will have updated `x.py` by the next commit." });
+    const ctx = makeCtx({ node, diff: [{ path: "other.py", status: "M" }] });
+    const flags = await editClaimCheck.run(ctx);
+    expect(flags).toHaveLength(0);
+  });
+
+  it("still suppresses with adverbs between the future marker and the verb (\"I'll probably have refactored\")", async () => {
+    const node = makeNode({ content: "I'll probably have refactored `x.py` by then." });
+    const ctx = makeCtx({ node, diff: [{ path: "other.py", status: "M" }] });
+    const flags = await editClaimCheck.run(ctx);
+    expect(flags).toHaveLength(0);
+  });
+});
+
+describe("editClaimCheck.run — round 2: RENAME verb class vs EDIT oldPath over-match (ec-o5)", () => {
+  it("flags an EDIT claim when the only diff entry is an unrelated rename whose oldPath matches", async () => {
+    const node = makeNode({ content: "I updated `payments.py` to use the new rounding helper." });
+    const ctx = makeCtx({
+      node,
+      diff: [{ path: "archive/payments_old.py", status: "R", oldPath: "payments.py" }],
+    });
+    const flags = await editClaimCheck.run(ctx);
+    expect(flags).toHaveLength(1);
+    expect(flags[0].confidence).toBe("high");
+    expect(flags[0].evidence).toContain("payments.py");
+  });
+
+  it("stays silent for 'moved' claims satisfied via the rename's oldPath", async () => {
+    const node = makeNode({ content: "I moved `old/legacy.py` to `lib/legacy.py` for the reorg." });
+    const ctx = makeCtx({
+      node,
+      diff: [{ path: "lib/legacy.py", status: "R", oldPath: "old/legacy.py" }],
+    });
+    const flags = await editClaimCheck.run(ctx);
+    expect(flags).toHaveLength(0);
+  });
+});
+
+describe("editClaimCheck.run — round 2: alias prefixes stay rejected (ec-o6, known limitation)", () => {
+  it("stays silent on a FALSE alias-spelled claim (alias resolution out of scope — silence over guessing)", async () => {
+    const node = makeNode({ content: "I updated `@/lib/theme.ts` to switch the palette tokens." });
+    const ctx = makeCtx({ node, diff: [{ path: "src/other/unrelated.ts", status: "M" }] });
+    const flags = await editClaimCheck.run(ctx);
+    expect(flags).toHaveLength(0);
+  });
+});

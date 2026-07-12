@@ -15,7 +15,8 @@ const CORPUS_PATH = fileURLToPath(
 );
 
 const PRECISION_THRESHOLD = 1.0;
-const RECALL_THRESHOLD = 0.8;
+// current corpus recall: 1.0 — do not lower this floor without a controller decision
+const RECALL_THRESHOLD = 0.95;
 
 interface BenchCase {
   id: string;
@@ -88,7 +89,7 @@ describe("edit-claim precision/recall benchmark (scripts/bench/editclaim-corpus.
     expect(cases.length).toBeGreaterThanOrEqual(40);
   });
 
-  it("meets precision === 1.0 and recall >= 0.8 over the corpus", async () => {
+  it("meets precision === 1.0 and recall >= 0.95 over the corpus", async () => {
     const cases = loadCorpus();
 
     let tp = 0;
@@ -121,7 +122,9 @@ describe("edit-claim precision/recall benchmark (scripts/bench/editclaim-corpus.
       `false positives (expected silent, got flag): ${falsePositiveIds.join(", ") || "none"}\n` +
       `false negatives (expected flag, got silent): ${falseNegativeIds.join(", ") || "none"}`;
 
-    expect(precision, summary).toBe(PRECISION_THRESHOLD);
-    expect(recall, summary).toBeGreaterThanOrEqual(RECALL_THRESHOLD);
+    expect(precision, `achieved precision=${precision.toFixed(4)}\n${summary}`).toBe(PRECISION_THRESHOLD);
+    expect(recall, `achieved recall=${recall.toFixed(4)}\n${summary}`).toBeGreaterThanOrEqual(
+      RECALL_THRESHOLD,
+    );
   });
 });

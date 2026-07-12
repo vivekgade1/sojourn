@@ -9,13 +9,17 @@ function basename(p: string): string {
 
 /** Find diff entries matching a claimed path, allowing a basename fallback
  * only when the claim itself is a bare filename (no `/`) and exactly one
- * diff path shares that basename. For EDIT/DELETE claims a rename's
- * `oldPath` also counts — the file at that path genuinely changed/went
- * away ("the old path should still show up as changed in some way in the
- * diff"). CREATE claims still require the new path itself. */
+ * diff path shares that basename. A rename's `oldPath` satisfies only
+ * claims about the file LEAVING that path: RENAME ("renamed"/"moved") and
+ * DELETE (the file is genuinely gone from there). A plain EDIT claim is
+ * NOT accounted for by an unrelated rename that happens to move the
+ * claimed path away — EDIT matches the diff's `path` only (round-2 fix for
+ * the oldPath over-match), and CREATE still requires the new path itself. */
 function resolveDiffMatches(claimPath: string, diff: FileChange[], kind: ClaimKind): FileChange[] {
   const exact = diff.filter(
-    (d) => d.path === claimPath || (kind !== "CREATE" && d.oldPath === claimPath),
+    (d) =>
+      d.path === claimPath ||
+      ((kind === "RENAME" || kind === "DELETE") && d.oldPath === claimPath),
   );
   if (exact.length > 0) return exact;
 
@@ -54,10 +58,17 @@ export const editClaimCheck: FlagCheck = {
         continue;
       }
 
-      if (claim.kind === "EDIT") {
+      if (claim.kind === "EDIT" || claim.kind === "RENAME") {
         if (matches.length === 0) {
           flags.push(
-            mismatchFlag(claim.kind, claim.path, "high", "snapshot diff shows no change to that file"),
+            mismatchFlag(
+              claim.kind,
+              claim.path,
+              "high",
+              claim.kind === "RENAME"
+                ? "snapshot diff shows no rename or change of that file"
+                : "snapshot diff shows no change to that file",
+            ),
           );
         }
         continue;
@@ -108,7 +119,13 @@ function mismatchFlag(
   groundTruth: string,
 ): Flag {
   const verbPhrase =
-    kind === "CREATE" ? "claimed creation of" : kind === "DELETE" ? "claimed deletion of" : "claimed edit to";
+    kind === "CREATE"
+      ? "claimed creation of"
+      : kind === "DELETE"
+        ? "claimed deletion of"
+        : kind === "RENAME"
+          ? "claimed rename of"
+          : "claimed edit to";
   return {
     kind: "edit_claim_mismatch",
     tier: "verified",
