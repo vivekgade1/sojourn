@@ -7,6 +7,13 @@
   "bin": {
     "sojourn-daemon": "./dist/main.js"
   },
+  "files": ["dist"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vivekgade1/sojourn.git",
+    "directory": "packages/daemon"
+  },
+  "license": "MIT",
   "dependencies": {
     "@sojourn/adapter-claude": "*",
     "@sojourn/adapter-opencode": "*",

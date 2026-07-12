@@ -3,8 +3,18 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "bin": { "soj": "./dist/main.js" },
+  "bin": {
+    "soj": "./dist/main.js"
+  },
+  "files": ["dist"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vivekgade1/sojourn.git",
+    "directory": "packages/cli"
+  },
+  "license": "MIT",
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "@sojourn/core": "*",
     "commander": "^13.0.0"
   }

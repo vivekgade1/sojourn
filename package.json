@@ -3,16 +3,23 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "engines": { "node": ">=20" },
-  "workspaces": ["packages/*"],
+  "engines": {
+    "node": ">=20"
+  },
+  "workspaces": [
+    "packages/*"
+  ],
   "scripts": {
-    "build": "tsc -b packages/core packages/adapter-claude packages/adapter-opencode packages/daemon packages/cli && npm run build -w @sojourn/web",
+    "build": "tsc -b packages/core packages/adapter-claude packages/adapter-opencode packages/daemon packages/cli && npm run build -w @sojourn/web && npm run build:plugin",
     "build:node": "tsc -b packages/core packages/adapter-claude packages/adapter-opencode packages/daemon packages/cli",
+    "build:plugin": "node scripts/build-plugin.mjs",
+    "validate:plugin": "node plugins/claude/validate.mjs",
     "test": "vitest run",
     "dev:daemon": "node packages/daemon/dist/main.js"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
+    "esbuild": "^0.28.1",
     "typescript": "^5.6.0",
     "vitest": "^3.2.0"
   }
