@@ -9,12 +9,15 @@
  */
 import fs from "node:fs/promises";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import WebSocket from "ws";
 
 const PORT = process.env.E2E_PORT ?? "4199";
 const BASE = `http://localhost:${PORT}`;
 const manifest = JSON.parse(await fs.readFile(process.env.E2E_OUT, "utf8"));
 const REPORT = process.env.E2E_REPORT ?? "/tmp/sojourn-e2e-report.json";
+const CLAUDE_DIR = process.env.E2E_CLAUDE_DIR ?? manifest.claudeDir;
 
 const results = [];
 async function check(name, fn) {
@@ -58,6 +61,14 @@ let graph = null;
 const nodeById = (id) => graph.nodes.find((n) => n.id === id);
 const activeFlags = (node, kind) =>
   (node?.flags ?? []).filter((f) => f.kind === kind && !f.dismissed && !f.autoResolved);
+const isActiveFlag = (f) => !f.dismissed && !f.autoResolved;
+const isDigestFlag = (f) => (f.suppressedCount ?? 0) > 0;
+/** Fresh per-node flag fetch (the early `graph` object is a snapshot). */
+const nodeFlags = async (id) => {
+  const r = await json(`/api/nodes/${enc(id)}`);
+  if (r.status !== 200) throw new Error(`GET /api/nodes/${id} -> ${r.status}`);
+  return r.body.flags ?? [];
+};
 
 // ---------- basics ----------
 await check("GET /api/health", async () => {
@@ -172,6 +183,151 @@ if (!graph) {
     ok(graph.sessions.some((sess) => sess.id === manifest.sessionB), "session B listed");
   });
 
+  // ---------- V2: session health (pure counts) ----------
+  await check("GET /api/sessions/:id/health 404s JSON on an unknown session", async () => {
+    const r = await json(`/api/sessions/${enc("no-such-session")}/health`);
+    eq(r.status, 404, "status");
+    ok(typeof r.body?.error === "string", "error JSON");
+  });
+
+  await check("session A health counts match the staged scenario", async () => {
+    const r = await json(`/api/sessions/${enc(manifest.sessionA)}/health`);
+    eq(r.status, 200, "status");
+    eq(r.body.sessionId, manifest.sessionA, "sessionId echoed");
+    eq(r.body.turns, s.healthA.turns, "turns (prompt nodes)");
+    // Deterministically active in A: missing file ref, missing symbol, and
+    // the two test-claim flags (package hallucination is network-dependent).
+    ok(r.body.verifiedActive >= 4, `verifiedActive >= 4 (got ${r.body.verifiedActive})`);
+    ok(r.body.verifiedResolved >= 1, "verifiedResolved >= 1 (turn10 auto-resolve)");
+  });
+
+  await check("storm session health reflects budgets (turns, active, suppressed)", async () => {
+    const st = s.flagStorm;
+    const r = await json(`/api/sessions/${enc(st.sessionId)}/health`);
+    eq(r.status, 200, "status");
+    eq(r.body.turns, st.expect.turns, "turns");
+    eq(r.body.verifiedActive, st.expect.activeVerified, "verifiedActive (kept + digest)");
+    ok(
+      r.body.suppressed >= st.expect.digestSuppressed,
+      `suppressed >= ${st.expect.digestSuppressed} (got ${r.body.suppressed})`,
+    );
+    eq(r.body.advisoryActive, 0, "advisoryActive");
+    eq(r.body.dismissed, 0, "dismissed");
+  });
+
+  // ---------- V2: turn-flags (terminal delivery budget) ----------
+  await check("turn-flags for the storm turn: max 3 lines + '+n more', verified only", async () => {
+    const st = s.flagStorm;
+    const r = await json(`/api/sessions/${enc(st.sessionId)}/turn-flags`);
+    eq(r.status, 200, "status");
+    const lines = r.body.lines;
+    ok(Array.isArray(lines), "lines array");
+    // 5 active verified flags in the storm turn -> 3 lines + "+2 more".
+    eq(lines.length, 4, "3 flag lines + overflow marker");
+    for (const line of lines.slice(0, 3)) {
+      ok(/^[a-z_]+: /.test(line), `compact 'kind: evidence' shape: ${line}`);
+      ok(!line.toLowerCase().includes("advisory"), "verified only");
+    }
+    eq(lines[3], `+${st.expect.activeVerified - 3} more`, "overflow marker");
+  });
+
+  // ---------- V2: flag storm — budgets + digests ----------
+  await check("storm: 8 identical edit claims dedup to ONE kept flag, no digest", async () => {
+    const st = s.flagStorm;
+    let kept = 0;
+    let digests = 0;
+    for (const id of st.editNodeIds) {
+      for (const f of await nodeFlags(id)) {
+        if (f.kind !== "edit_claim_mismatch" || !isActiveFlag(f)) continue;
+        if (isDigestFlag(f)) digests += 1;
+        else kept += 1;
+      }
+    }
+    eq(kept, st.expect.editKept, "kept edit_claim_mismatch count");
+    eq(digests, 0, "identical claims never digest");
+  });
+
+  await check("storm: distinct claims kept up to budget + exactly ONE count-free digest", async () => {
+    const st = s.flagStorm;
+    const kept = [];
+    const digests = [];
+    for (const id of st.distinctNodeIds) {
+      for (const f of await nodeFlags(id)) {
+        if (f.kind !== st.expect.distinctKind || !isActiveFlag(f)) continue;
+        (isDigestFlag(f) ? digests : kept).push(f);
+      }
+    }
+    eq(kept.length, st.expect.distinctBudget, "kept == per-turn budget");
+    eq(new Set(kept.map((f) => f.evidence)).size, kept.length, "kept claims are individually distinct");
+    eq(digests.length, st.expect.digestCount, "exactly one digest");
+    const digest = digests[0];
+    eq(digest.suppressedCount, st.expect.digestSuppressed, "suppressedCount");
+    eq(digest.tier, "verified", "digest keeps its tier");
+    ok(digest.evidence.includes("similar claims suppressed"), "digest evidence marker");
+    ok(!/\d+\s+similar/.test(digest.evidence), "evidence is count-free (count lives in suppressedCount)");
+  });
+
+  await check("storm: flags/run rerun does NOT inflate (digest upserts in place)", async () => {
+    const st = s.flagStorm;
+    const rerun = async () => {
+      const r = await post(`/api/nodes/${enc(st.digestOwnerNodeId)}/flags/run`, {});
+      eq(r.status, 200, "status");
+      return r.body.flags.filter((f) => f.kind === st.expect.distinctKind && isActiveFlag(f));
+    };
+    const first = await rerun();
+    const second = await rerun();
+    eq(second.length, first.length, "active flag count stable across reruns");
+    const digests = second.filter(isDigestFlag);
+    eq(digests.length, 1, "still exactly one digest row");
+    eq(digests[0].suppressedCount, s.flagStorm.expect.digestSuppressed, "suppressedCount not inflated");
+  });
+
+  // ---------- V2: decision-memory search ----------
+  const w = s.walrusSearch;
+
+  await check("search q= finds the turn by its gist text", async () => {
+    const r = await json(`/api/search?projectId=${enc(pid)}&q=${enc(w.q)}`);
+    eq(r.status, 200, "status");
+    ok(Array.isArray(r.body.hits) && r.body.hits.length >= 1, "hits present");
+    ok(
+      r.body.hits.some((h) => h.node.id === w.nodeId || h.node.id === w.promptNodeId),
+      "walrus turn among hits",
+    );
+    const hit = r.body.hits[0];
+    ok(typeof hit.score === "number" && typeof hit.snippet === "string", "SearchHit shape");
+  });
+
+  await check("search file= (with q) hits the turn that touched the indexed path", async () => {
+    const r = await json(`/api/search?projectId=${enc(pid)}&q=${enc(w.q)}&file=${enc(w.file)}`);
+    eq(r.status, 200, "status");
+    ok(r.body.hits.some((h) => h.node.id === w.promptNodeId), "turn prompt indexed for the file");
+  });
+
+  await check("search kinds= filters hits to the requested node kinds", async () => {
+    const r = await json(`/api/search?projectId=${enc(pid)}&q=${enc(w.q)}&kinds=prompt`);
+    eq(r.status, 200, "status");
+    ok(r.body.hits.length >= 1, "hits present");
+    ok(r.body.hits.every((h) => h.node.kind === "prompt"), "every hit is a prompt node");
+  });
+
+  await check("search with file= and NO q works (files-touched index alone)", async () => {
+    const r = await json(`/api/search?projectId=${enc(pid)}&file=${enc(w.file)}`);
+    eq(r.status, 200, "status");
+    ok(r.body.hits.some((h) => h.node.id === w.promptNodeId), "turn prompt in q-less hits");
+  });
+
+  await check("search is project-isolated: bogus projectId -> empty hits", async () => {
+    const r = await json(`/api/search?projectId=${enc("no-such-project")}&q=${enc(w.q)}`);
+    eq(r.status, 200, "status");
+    eq((r.body.hits ?? []).length, 0, "no cross-project hits");
+  });
+
+  await check("search without projectId -> 400 JSON", async () => {
+    const r = await json(`/api/search?q=${enc(w.q)}`);
+    eq(r.status, 400, "status");
+    ok(typeof r.body?.error === "string", "error JSON");
+  });
+
   // ---------- per-node routes ----------
   const flaggedId = s.testClaimFailingRun.nodeId;
   const snapshottedNode = [...graph.nodes].reverse().find((n) => n.snapshotRef);
@@ -255,6 +411,7 @@ if (!graph) {
   });
 
   // ---------- restore (the data-loss-critical path) ----------
+  let restoredWorktree = null; // captured for the V2 harvest/aliasing checks
   await check("preflight -> restore lands a worktree with node-time files, project untouched", async () => {
     const pf = await post(`/api/nodes/${enc(snapshottedNode.id)}/preflight`);
     eq(pf.status, 200, "preflight status");
@@ -265,6 +422,7 @@ if (!graph) {
     const r = await post(`/api/nodes/${enc(snapshottedNode.id)}/restore`);
     eq(r.status, 200, "restore status");
     const wt = r.body.worktreePath;
+    restoredWorktree = wt;
     ok((await fs.readFile(path.join(wt, "src", "app.py"), "utf8")).length > 0, "restored file");
     const manifestFile = JSON.parse(
       await fs.readFile(path.join(wt, ".sojourn-restore.json"), "utf8"),
@@ -281,6 +439,169 @@ if (!graph) {
     const r = await post(`/api/nodes/${enc(bare.id)}/restore`);
     eq(r.status, 400, "status");
     ok(typeof r.body?.error === "string", "error JSON");
+  });
+
+  // ---------- V2: harvest round-trip (the return path) ----------
+  const readProjectFile = (rel) => fs.readFile(path.join(manifest.project, rel), "utf8");
+  const HARVESTED_APP = "def main():\n    return 99  # harvested\n";
+  const MAINLINE_AUTH = "def refresh_token():\n    return 'mainline-edit'\n";
+
+  await check("harvest preflight classifies a worktree-only edit as clean", async () => {
+    ok(restoredWorktree, "restored worktree available (restore check must pass first)");
+    await fs.writeFile(path.join(restoredWorktree, "src", "app.py"), HARVESTED_APP, "utf8");
+    const r = await post("/api/worktrees/harvest/preflight", { worktreePath: restoredWorktree });
+    eq(r.status, 200, "status");
+    eq(r.body.originNodeId, snapshottedNode.id, "originNodeId resolves the restore manifest");
+    ok(typeof r.body.baseTree === "string" && r.body.baseTree.length > 0, "baseTree");
+    ok(typeof r.body.branchTree === "string" && r.body.branchTree.length > 0, "branchTree");
+    const entry = (r.body.files ?? []).find((f) => f.path === "src/app.py");
+    ok(entry, "src/app.py classified");
+    eq(entry.status, "clean", "worktree-only edit is clean");
+    eq(r.body.mainlineDirty, false, "mainline untouched on harvest paths");
+  });
+
+  let mergeNodeId = null;
+  await check("harvest apply lands the edit on the mainline with a safety snapshot", async () => {
+    ok(restoredWorktree, "restored worktree available");
+    const r = await post("/api/worktrees/harvest", {
+      worktreePath: restoredWorktree,
+      mode: "apply",
+    });
+    eq(r.status, 200, "status");
+    ok((r.body.applied ?? []).includes("src/app.py"), "src/app.py applied");
+    eq((r.body.conflicted ?? []).length, 0, "no conflicts");
+    ok(
+      typeof r.body.safetySnapshotRef === "string" && r.body.safetySnapshotRef.length > 0,
+      "mainline safety snapshot ref returned",
+    );
+    ok(r.body.mergeNodeId, "merge node id returned");
+    mergeNodeId = r.body.mergeNodeId;
+    eq(await readProjectFile("src/app.py"), HARVESTED_APP, "mainline file updated");
+  });
+
+  await check("harvest merge node is in the graph, parented to the origin node", async () => {
+    ok(mergeNodeId, "merge node id from apply");
+    const r = await json(`/api/nodes/${enc(mergeNodeId)}`);
+    eq(r.status, 200, "status");
+    eq(r.body.kind, "checkpoint", "kind");
+    eq(r.body.parentId, snapshottedNode.id, "parented to the restored-from node");
+    ok((r.body.label ?? "").startsWith("harvest:"), "harvest label");
+    const g = await json(`/api/projects/${enc(pid)}/graph`);
+    ok(g.body.nodes.some((n) => n.id === mergeNodeId), "visible in the project graph");
+  });
+
+  await check("harvest conflict aborts CLEAN with typed code; mainline untouched", async () => {
+    ok(restoredWorktree, "restored worktree available");
+    // Diverge the SAME file on both sides (different edits to one line).
+    await fs.writeFile(path.join(manifest.project, "src", "auth.py"), MAINLINE_AUTH, "utf8");
+    await fs.writeFile(
+      path.join(restoredWorktree, "src", "auth.py"),
+      "def refresh_token():\n    return 'branch-edit'\n",
+      "utf8",
+    );
+    const pf = await post("/api/worktrees/harvest/preflight", { worktreePath: restoredWorktree });
+    eq(pf.status, 200, "preflight status");
+    const entry = (pf.body.files ?? []).find((f) => f.path === "src/auth.py");
+    ok(entry, "src/auth.py classified");
+    eq(entry.status, "conflict", "conflict classification");
+    eq(pf.body.mainlineDirty, true, "mainlineDirty");
+
+    const r = await post("/api/worktrees/harvest", {
+      worktreePath: restoredWorktree,
+      mode: "apply",
+    });
+    eq(r.status, 400, "abort status");
+    eq(r.body.code, "conflicts", "typed error code");
+    ok((r.body.files ?? []).includes("src/auth.py"), "names the conflicted file");
+    eq(await readProjectFile("src/auth.py"), MAINLINE_AUTH, "mainline unchanged after abort");
+  });
+
+  await check("harvest patch mode writes .sojourn-harvest.patch, mainline untouched", async () => {
+    ok(restoredWorktree, "restored worktree available");
+    const r = await post("/api/worktrees/harvest", {
+      worktreePath: restoredWorktree,
+      mode: "patch",
+    });
+    eq(r.status, 200, "status");
+    eq(r.body.patchPath, path.join(restoredWorktree, ".sojourn-harvest.patch"), "patch path");
+    eq(r.body.mergeNodeId, null, "no merge node in patch mode");
+    eq((r.body.applied ?? []).length, 0, "nothing applied");
+    const patch = await fs.readFile(r.body.patchPath, "utf8");
+    ok(patch.includes("src/auth.py"), "patch covers the diverged file");
+    eq(await readProjectFile("src/auth.py"), MAINLINE_AUTH, "mainline still untouched");
+  });
+
+  await check("harvest preflight 400s typed no_manifest on a non-worktree path", async () => {
+    const r = await post("/api/worktrees/harvest/preflight", { worktreePath: manifest.project });
+    eq(r.status, 400, "status");
+    eq(r.body.code, "no_manifest", "typed code");
+  });
+
+  // ---------- V2: worktree project aliasing ----------
+  const wtSessionId = "e2e-worktree-0005";
+
+  await check("session run INSIDE the restored worktree aliases into the origin project", async () => {
+    ok(restoredWorktree, "restored worktree available");
+    const dir = path.join(CLAUDE_DIR, "projects", "-e2e-worktree");
+    await fs.mkdir(dir, { recursive: true });
+    const file = path.join(dir, `${wtSessionId}.jsonl`);
+    const line = (rec) => JSON.stringify(rec) + "\n";
+    await fs.writeFile(
+      file,
+      line({
+        type: "user",
+        uuid: "e2e-wt-u1",
+        parentUuid: null,
+        sessionId: wtSessionId,
+        cwd: restoredWorktree,
+        timestamp: new Date().toISOString(),
+        message: { role: "user", content: "hello from the worktree" },
+      }) +
+        line({
+          type: "assistant",
+          uuid: "e2e-wt-a1",
+          parentUuid: "e2e-wt-u1",
+          sessionId: wtSessionId,
+          cwd: restoredWorktree,
+          timestamp: new Date(Date.now() + 1000).toISOString(),
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "Working from the branch now." }],
+          },
+        }),
+      "utf8",
+    );
+    await post("/api/hooks/claude", {
+      session_id: wtSessionId,
+      transcript_path: file,
+      cwd: restoredWorktree,
+      hook_event_name: "PostToolUse",
+    });
+
+    // The hook rescan is fire-and-forget; poll until the aliased session
+    // shows up under the ORIGIN project.
+    const deadline = Date.now() + 15000;
+    let g = null;
+    for (;;) {
+      g = (await json(`/api/projects/${enc(pid)}/graph`)).body;
+      const sess = g?.sessions?.find((x) => x.id === wtSessionId);
+      const first = g?.nodes?.find((n) => n.id === "claude:e2e-wt-u1");
+      if (sess && first) break;
+      if (Date.now() > deadline) {
+        throw new Error("aliased session did not appear under the origin project");
+      }
+      await new Promise((res) => setTimeout(res, 300));
+    }
+    const sess = g.sessions.find((x) => x.id === wtSessionId);
+    const native8 = snapshottedNode.id.slice(snapshottedNode.id.indexOf(":") + 1).slice(0, 8);
+    eq(sess.title, `worktree:${native8}`, "session titled worktree:<node8>");
+  });
+
+  await check("first aliased node carries the fork edge to the restore-origin node", async () => {
+    const r = await json(`/api/nodes/${enc("claude:e2e-wt-u1")}`);
+    eq(r.status, 200, "status");
+    eq(r.body.parentId, snapshottedNode.id, "parented to the origin node");
+    eq(r.body.projectId, pid, "stored under the ORIGIN project");
   });
 
   // ---------- error handling + hooks ----------
@@ -318,6 +639,100 @@ if (!graph) {
   await check("hooks/opencode is fail-soft 200 without a live OpenCode server", async () => {
     const r = await post("/api/hooks/opencode", { sessionId: "nope" });
     eq(r.status, 200, "status");
+  });
+
+  // ---------- V2: exact-node rewind (transcript synthesis) ----------
+  const sessionATranscript = path.join(
+    CLAUDE_DIR,
+    "projects",
+    "-e2e-proj",
+    `${manifest.sessionA}.jsonl`,
+  );
+  const insideClaudeDir = (p) =>
+    typeof p === "string" && p.startsWith(path.join(CLAUDE_DIR, "projects") + path.sep);
+
+  await check("rewind-plan on a clean chain is EXACT and pure (no file written)", async () => {
+    const r = await post(`/api/nodes/${enc(s.rewindExact.nodeId)}/rewind-plan`);
+    eq(r.status, 200, "status");
+    eq(r.body.mode, "exact", "mode");
+    ok(r.body.newSessionId, "newSessionId");
+    eq(r.body.refusedReason, null, "no refusal");
+    eq(r.body.resumeCommand, `claude --resume ${r.body.newSessionId}`, "resume command");
+    ok(insideClaudeDir(r.body.transcriptPath), "transcript planned inside the e2e CLAUDE dir");
+    const exists = await fs.access(r.body.transcriptPath).then(
+      () => true,
+      () => false,
+    );
+    eq(exists, false, "plan is pure — nothing written");
+  });
+
+  await check("rewind-plan REFUSES exact mode across a compaction boundary", async () => {
+    const r = await post(`/api/nodes/${enc(s.compaction.targetNodeId)}/rewind-plan`);
+    eq(r.status, 200, "status");
+    eq(r.body.mode, "tip", "honest tip fallback");
+    ok(
+      typeof r.body.refusedReason === "string" && /compact/i.test(r.body.refusedReason),
+      `refusal names compaction (got: ${r.body.refusedReason})`,
+    );
+    eq(r.body.resumeCommand, s.compaction.expect.resumeCommand, "fork-session fallback command");
+    eq(r.body.newSessionId, null, "no synthesized session");
+    eq(r.body.transcriptPath, null, "no transcript path");
+  });
+
+  await check("rewind execute writes a NEW parseable transcript; original untouched", async () => {
+    const before = await fs.readFile(sessionATranscript);
+    const r = await post(`/api/nodes/${enc(s.rewindExact.nodeId)}/rewind`);
+    eq(r.status, 200, "status");
+    eq(r.body.mode, "exact", "mode");
+    ok(insideClaudeDir(r.body.transcriptPath), "written inside the e2e CLAUDE dir");
+    const written = await fs.readFile(r.body.transcriptPath, "utf8");
+    const lines = written.split("\n").filter((l) => l.trim().length > 0);
+    ok(lines.length > 0, "non-empty transcript");
+    for (const l of lines) {
+      const rec = JSON.parse(l); // throws -> not valid JSONL
+      eq(rec.sessionId, r.body.newSessionId, "every line carries the new session id");
+    }
+    const after = await fs.readFile(sessionATranscript);
+    ok(before.equals(after), "original transcript byte-identical");
+  });
+
+  await check("rewind on an unknown (opencode-style) node id -> typed 4xx JSON", async () => {
+    const r = await post(`/api/nodes/${enc("opencode:no-such-node")}/rewind`);
+    ok(r.status === 404 || r.status === 400, `4xx (got ${r.status})`);
+    ok(typeof r.body?.error === "string", "error JSON");
+  });
+
+  // ---------- V2: soj gate exit codes (live daemon) ----------
+  const cliMain = fileURLToPath(new URL("../../packages/cli/dist/main.js", import.meta.url));
+  const runGate = (args, env = {}) =>
+    spawnSync(process.execPath, [cliMain, "gate", ...args], {
+      encoding: "utf8",
+      timeout: 30000,
+      env: { ...process.env, ...env },
+    });
+
+  await check("soj gate exits 2 on a session with active verified flags", async () => {
+    const r = runGate(["--session", s.flagStorm.sessionId, "--project", pid]);
+    eq(r.status, 2, `exit code (stdout: ${r.stdout?.trim()} stderr: ${r.stderr?.trim()})`);
+    ok((r.stdout ?? "").includes("gate failed"), "failure headline");
+    ok((r.stdout ?? "").includes("checked:"), "honest header states what was checked");
+  });
+
+  await check("soj gate exits 0 on a clean session", async () => {
+    // NOT session B: any first-turn TEXT assistant in a fresh session gets
+    // a whole-tree diff (no grounded turn base), so when online it carries
+    // a package_hallucination flag from src/deps.py. The dedicated clean
+    // session is tool-only and can never carry flags.
+    const r = runGate(["--session", s.cleanSession.sessionId, "--project", pid]);
+    eq(r.status, 0, `exit code (stdout: ${r.stdout?.trim()} stderr: ${r.stderr?.trim()})`);
+    ok((r.stdout ?? "").includes("gate passed"), "pass headline");
+  });
+
+  await check("soj gate exits 3 when the daemon is unreachable", async () => {
+    const r = runGate(["--session", s.flagStorm.sessionId, "--project", pid], {
+      SOJOURN_PORT: "9",
+    });
+    eq(r.status, 3, `exit code (stderr: ${r.stderr?.trim()})`);
   });
 
   // ---------- websocket ----------
