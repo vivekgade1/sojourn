@@ -47,17 +47,30 @@ export class SojournRewindError extends Error {
  * single value and execute never re-derives chain membership on its own:
  *
  * - `lineIndexes`: indexes into the SAME `rawLines` array the plan was built
- *   from, ascending — the chain's source lines, ending at the target's line.
+ *   from, ascending — the chain's source lines (plus any sibling tool_result
+ *   host lines pulled in to avoid mid-file dangling tool_use blocks), ending
+ *   at the target's line.
+ * - `lineUuids`: parallel to `lineIndexes` — each included ORIGINAL line's
+ *   uuid. `executeRewind` asserts these against `rawLines` before writing
+ *   anything, so a transcript that drifted between plan and execute fails
+ *   fast as `plan_invalid` instead of synthesizing from the wrong lines.
  * - `expectedKinds`: the chain projection — the node kinds (in parse order)
  *   that parsing exactly those source lines yields. Used by execute's
  *   round-trip validation.
+ * - `expectedParentIndexes`: the chain projection's parent SHAPE — for each
+ *   projected node, the index (into the projection) of its parent; `null`
+ *   for a root, `-1` for a parent outside the projection. Node ids cancel
+ *   out, so the shape is directly comparable between the original-lines
+ *   projection and the freshly-uuid'd synthesized one.
  * - `sessionId`: the ORIGINAL session id (rewritten to `newSessionId` in the
  *   synthesized file).
  */
 export interface ClaudeRewindPlan extends RewindPlan {
   sessionId: string;
   lineIndexes: number[];
+  lineUuids: string[];
   expectedKinds: NodeKind[];
+  expectedParentIndexes: (number | null)[];
 }
 
 export interface PlanRewindInput {
@@ -78,6 +91,7 @@ const REASON_BOUNDARY =
   "chain crosses a compaction/summary boundary; exact context cannot be reconstructed";
 const REASON_MISSING_LINES = "transcript lines missing for chain";
 const REASON_NO_TARGET = "target node not found in node set";
+const REASON_ROOT_UNRESOLVED = "transcript root has unresolved parent (truncated file?)";
 
 function refuse(sessionId: string, reason: string): ClaudeRewindPlan {
   return {
@@ -88,7 +102,9 @@ function refuse(sessionId: string, reason: string): ClaudeRewindPlan {
     resumeCommand: `claude --resume ${sessionId} --fork-session`,
     sessionId,
     lineIndexes: [],
+    lineUuids: [],
     expectedKinds: [],
+    expectedParentIndexes: [],
   };
 }
 
@@ -126,6 +142,17 @@ function isBoundaryLine(rec: Record<string, unknown>): boolean {
   return false;
 }
 
+/** The record's `message.content` blocks, when it has array content. */
+function contentBlocksOf(rec: Record<string, unknown>): Record<string, unknown>[] {
+  const message = rec.message;
+  if (typeof message !== "object" || message === null) return [];
+  const content = (message as Record<string, unknown>).content;
+  if (!Array.isArray(content)) return [];
+  return content.filter(
+    (b): b is Record<string, unknown> => typeof b === "object" && b !== null,
+  );
+}
+
 /**
  * Builds a lookup from every native id the parser can address to the raw
  * line hosting it, mirroring `parseSessionJsonl`'s addressing scheme:
@@ -138,24 +165,25 @@ function buildNativeIdIndex(parsed: ParsedRawLine[]): Map<string, number> {
     if (typeof rec.uuid === "string" && rec.uuid.length > 0) {
       index.set(rec.uuid, lineIndex);
     }
-    const message = rec.message;
-    if (typeof message === "object" && message !== null) {
-      const content = (message as Record<string, unknown>).content;
-      if (Array.isArray(content)) {
-        for (const block of content) {
-          if (
-            typeof block === "object" &&
-            block !== null &&
-            (block as Record<string, unknown>).type === "tool_use" &&
-            typeof (block as Record<string, unknown>).id === "string"
-          ) {
-            index.set((block as Record<string, unknown>).id as string, lineIndex);
-          }
-        }
+    for (const block of contentBlocksOf(rec)) {
+      if (block.type === "tool_use" && typeof block.id === "string") {
+        index.set(block.id, lineIndex);
       }
     }
   }
   return index;
+}
+
+/**
+ * Parent shape of a projection: each node's parent as an index into the
+ * projection (`null` = root, `-1` = parent not in the projection). Computed
+ * identically at plan time (over the original lines) and at validation time
+ * (over the synthesized file), where the fresh node ids cancel out.
+ */
+function parentIndexShape(nodes: readonly ChronoNode[]): (number | null)[] {
+  const indexById = new Map<string, number>();
+  nodes.forEach((n, i) => indexById.set(n.id, i));
+  return nodes.map((n) => (n.parentId === null ? null : (indexById.get(n.parentId) ?? -1)));
 }
 
 /** Resolves a node's `meta.nativeUuid` to its host line. Synthetic block ids
@@ -177,7 +205,14 @@ function locateLine(nativeUuid: string, index: Map<string, number>): number | un
  *    line range in the original transcript (compaction honesty: a chain
  *    that crosses a compaction boundary references context the transcript
  *    no longer contains verbatim, so we refuse rather than guess);
- * 3. every chain node's transcript line locatable in `rawLines`.
+ * 3. every chain node's transcript line locatable in `rawLines`;
+ * 4. the chain root's line is a TRUE transcript root — a non-null raw
+ *    parentUuid resolving nowhere in the transcript (truncated file) refuses.
+ *
+ * Included lines are the chain's host lines PLUS, for every tool_use block
+ * hosted on an included line, its tool_result's host line when that line
+ * falls at or before the target's line (no mid-file dangling tool_use; a
+ * dangler at the tip is native interrupted shape and stays allowed).
  */
 export function planRewind(input: PlanRewindInput): ClaudeRewindPlan {
   const { nodes, targetNodeId, rawLines, projectsSubdir, sessionId } = input;
@@ -203,13 +238,68 @@ export function planRewind(input: PlanRewindInput): ClaudeRewindPlan {
   // (3) Locate every chain node's host line in the original transcript.
   const parsed = parseRawLines(rawLines);
   const nativeIdIndex = buildNativeIdIndex(parsed);
+  const recByLineIndex = new Map<number, Record<string, unknown>>();
+  for (const { index, rec } of parsed) recByLineIndex.set(index, rec);
+
   const lineIndexSet = new Set<number>();
-  for (const node of chain) {
+  let targetLineIndex = -1;
+  let rootLineIndex = -1;
+  for (let c = 0; c < chain.length; c++) {
+    const node = chain[c];
     const nativeUuid = node.meta?.nativeUuid ?? node.id.replace(/^claude:/, "");
     const lineIndex = locateLine(nativeUuid, nativeIdIndex);
     if (lineIndex === undefined) return refuse(sessionId, REASON_MISSING_LINES);
+    if (c === 0) targetLineIndex = lineIndex; // chain[0] is the target
+    rootLineIndex = lineIndex; // last iteration is the chain root
     lineIndexSet.add(lineIndex);
   }
+
+  // Root honesty: the chain root's line must be a TRUE transcript root. The
+  // parser tolerates orphaned parentage by nulling parentId, but a root line
+  // whose raw parentUuid is non-null and resolves nowhere in the transcript
+  // means the file was truncated (or corrupted) upstream of the chain —
+  // synthesizing a "root" from a mid-conversation line would fabricate
+  // history the model never saw as a conversation start.
+  const rootParentUuid = recByLineIndex.get(rootLineIndex)?.parentUuid;
+  if (
+    typeof rootParentUuid === "string" &&
+    rootParentUuid.length > 0 &&
+    !nativeIdIndex.has(rootParentUuid)
+  ) {
+    return refuse(sessionId, REASON_ROOT_UNRESOLVED);
+  }
+
+  // Dangling-tool_use honesty: for every tool_use block hosted on an
+  // INCLUDED line, also include its tool_result's host line — a chain
+  // through one of several parallel tool_use blocks would otherwise leave a
+  // MID-FILE assistant tool_use with no tool_result, a shape native
+  // transcripts never contain. A required result line falling AFTER the
+  // target's line is the native interrupted-turn shape (tip dangler) and
+  // stays excluded. (Result host lines are user lines and host no tool_use
+  // blocks themselves, so a single pass suffices.)
+  const resultHostLineByToolUseId = new Map<string, number>();
+  for (const { index, rec } of parsed) {
+    for (const block of contentBlocksOf(rec)) {
+      if (
+        block.type === "tool_result" &&
+        typeof block.tool_use_id === "string" &&
+        !resultHostLineByToolUseId.has(block.tool_use_id)
+      ) {
+        resultHostLineByToolUseId.set(block.tool_use_id, index);
+      }
+    }
+  }
+  for (const { index, rec } of parsed) {
+    if (!lineIndexSet.has(index)) continue;
+    for (const block of contentBlocksOf(rec)) {
+      if (block.type !== "tool_use" || typeof block.id !== "string") continue;
+      const resultLine = resultHostLineByToolUseId.get(block.id);
+      if (resultLine !== undefined && resultLine <= targetLineIndex) {
+        lineIndexSet.add(resultLine);
+      }
+    }
+  }
+
   const lineIndexes = [...lineIndexSet].sort((a, b) => a - b);
   const minLine = lineIndexes[0];
   const maxLine = lineIndexes[lineIndexes.length - 1];
@@ -239,6 +329,17 @@ export function planRewind(input: PlanRewindInput): ClaudeRewindPlan {
   );
   if (!projection) return refuse(sessionId, REASON_MISSING_LINES);
 
+  // Pin each included line's uuid so executeRewind can verify it is reading
+  // the SAME lines the plan was built from before writing anything.
+  const lineUuids: string[] = [];
+  for (const lineIndex of lineIndexes) {
+    const uuid = recByLineIndex.get(lineIndex)?.uuid;
+    if (typeof uuid !== "string" || uuid.length === 0) {
+      return refuse(sessionId, REASON_MISSING_LINES);
+    }
+    lineUuids.push(uuid);
+  }
+
   const newSessionId = crypto.randomUUID();
   return {
     mode: "exact",
@@ -248,17 +349,22 @@ export function planRewind(input: PlanRewindInput): ClaudeRewindPlan {
     resumeCommand: `claude --resume ${newSessionId}`,
     sessionId,
     lineIndexes,
+    lineUuids,
     expectedKinds: projection.nodes.map((n) => n.kind),
+    expectedParentIndexes: parentIndexShape(projection.nodes),
   };
 }
 
 /**
  * Executes an exact rewind plan: writes the synthesized transcript as a NEW
  * file at `plan.transcriptPath` and validates it round-trips through
- * `parseSessionJsonl` to the plan's chain projection.
+ * `parseSessionJsonl` to the plan's chain projection — node kinds, count,
+ * sessionId, AND parent-index shape.
  *
  * - Tip plans are a no-op (nothing to write; the resumeCommand already
  *   points at the original session with `--fork-session`).
+ * - Before anything is written, every plan line's uuid is asserted against
+ *   `rawLines` (`plan.lineUuids`); drift → `plan_invalid`, no file created.
  * - The original transcript is NEVER touched: this function only receives
  *   its lines and only ever writes `plan.transcriptPath` (+ a tmp sibling).
  * - Write is atomic: content goes to a tmp file (non-.jsonl suffix, so
@@ -272,18 +378,27 @@ export async function executeRewind(
 ): Promise<ClaudeRewindPlan> {
   if (plan.mode !== "exact") return plan;
 
-  if (plan.newSessionId === null || plan.transcriptPath === null || plan.lineIndexes.length === 0) {
+  if (
+    plan.newSessionId === null ||
+    plan.transcriptPath === null ||
+    plan.lineIndexes.length === 0 ||
+    plan.lineUuids.length !== plan.lineIndexes.length
+  ) {
     throw new SojournRewindError(
-      "exact plan is missing newSessionId/transcriptPath/lineIndexes",
+      "exact plan is missing newSessionId/transcriptPath/lineIndexes or has mismatched lineUuids",
       "plan_invalid",
     );
   }
   const { newSessionId, transcriptPath } = plan;
 
   // Re-parse the plan's source lines from rawLines (the same array the plan
-  // was built from — indexes are the handoff contract).
+  // was built from — indexes are the handoff contract) and assert every
+  // line's uuid against the plan's pins BEFORE writing anything: a mismatch
+  // means rawLines drifted since planning and the plan no longer describes
+  // these lines.
   const included: Record<string, unknown>[] = [];
-  for (const lineIndex of plan.lineIndexes) {
+  for (let k = 0; k < plan.lineIndexes.length; k++) {
+    const lineIndex = plan.lineIndexes[k];
     const raw = rawLines[lineIndex];
     let rec: unknown;
     try {
@@ -294,6 +409,14 @@ export async function executeRewind(
     if (typeof rec !== "object" || rec === null) {
       throw new SojournRewindError(
         `plan line index ${lineIndex} does not resolve to a JSON line in rawLines`,
+        "plan_invalid",
+      );
+    }
+    const expectedUuid = plan.lineUuids[k];
+    const actualUuid = (rec as Record<string, unknown>).uuid;
+    if (typeof expectedUuid !== "string" || expectedUuid.length === 0 || actualUuid !== expectedUuid) {
+      throw new SojournRewindError(
+        `rawLines drifted since planning: line index ${lineIndex} has uuid ${String(actualUuid)}, plan pinned ${String(expectedUuid)}`,
         "plan_invalid",
       );
     }
@@ -308,18 +431,13 @@ export async function executeRewind(
     if (typeof rec.parentUuid === "string") originalUuids.add(rec.parentUuid);
   }
 
-  // Stable old-uuid → fresh-uuid map over the included lines.
+  // Stable old-uuid → fresh-uuid map over the included lines (every line's
+  // uuid was already verified against the plan's pins above).
   const uuidMap = new Map<string, string>();
   for (const rec of included) {
-    if (typeof rec.uuid !== "string" || rec.uuid.length === 0) {
-      throw new SojournRewindError(
-        "an included transcript line has no uuid; cannot remap",
-        "plan_invalid",
-      );
-    }
     let fresh = crypto.randomUUID();
     while (originalUuids.has(fresh) || uuidMap.has(fresh)) fresh = crypto.randomUUID();
-    uuidMap.set(rec.uuid, fresh);
+    uuidMap.set(rec.uuid as string, fresh);
   }
 
   // Rewrite: sessionId → newSessionId; uuid → fresh; parentUuid → the fresh
@@ -391,9 +509,17 @@ export async function executeRewind(
     } else if (batch.nodes.length !== plan.expectedKinds.length) {
       failure = `synthesized transcript projects ${batch.nodes.length} nodes, expected ${plan.expectedKinds.length}`;
     } else {
+      // Kinds AND parent shape: parentUuid is exactly what the rewrite
+      // touches, so validation must prove the projected TREE survived, not
+      // just the node kinds/count.
+      const shape = parentIndexShape(batch.nodes);
       for (let i = 0; i < batch.nodes.length; i++) {
         if (batch.nodes[i].kind !== plan.expectedKinds[i]) {
           failure = `node ${i} kind ${batch.nodes[i].kind} != expected ${plan.expectedKinds[i]}`;
+          break;
+        }
+        if (shape[i] !== plan.expectedParentIndexes[i]) {
+          failure = `node ${i} parent index ${String(shape[i])} != expected ${String(plan.expectedParentIndexes[i])}`;
           break;
         }
       }

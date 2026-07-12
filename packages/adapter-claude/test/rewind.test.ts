@@ -108,17 +108,70 @@ describe("planRewind", () => {
     );
     expect(plan.resumeCommand).toBe(`claude --resume ${plan.newSessionId}`);
     // chain lines: prompt(0), assistant multi-block(1), tool_result 4444(3),
-    // assistant text(4). Line 2 (tool_result for the OTHER tool_use) is not
-    // on the ancestor chain.
-    expect(plan.lineIndexes).toEqual([0, 1, 3, 4]);
+    // assistant text(4) — PLUS line 2, the tool_result for the OFF-chain
+    // toolu_read_001: every tool_use block hosted on an included line must
+    // have its tool_result line included too (at or before the target's
+    // line), or the synthesized transcript would carry a mid-file dangling
+    // tool_use — a shape native transcripts never contain.
+    expect(plan.lineIndexes).toEqual([0, 1, 2, 3, 4]);
     expect(plan.expectedKinds).toEqual([
       "prompt",
       "assistant",
       "tool_use",
       "tool_use",
       "tool_result",
+      "tool_result",
       "assistant",
     ]);
+    // Per-line uuid pins (parallel to lineIndexes): execute asserts these
+    // against rawLines before writing anything.
+    expect(plan.lineUuids).toEqual([
+      "11111111-1111-1111-1111-111111111111",
+      "22222222-2222-2222-2222-222222222222",
+      "33333333-3333-3333-3333-333333333333",
+      "44444444-4444-4444-4444-444444444444",
+      "55555555-5555-5555-5555-555555555555",
+    ]);
+    // Parent shape of the chain projection, as indexes into the projection:
+    // prompt(root), assistant->prompt, two parallel tool_uses->assistant,
+    // each tool_result->its own tool_use, final assistant->second result.
+    expect(plan.expectedParentIndexes).toEqual([null, 0, 1, 1, 2, 3, 5]);
+  });
+
+  it("allows a tip dangler: a tool_use target whose results fall after the target's line", () => {
+    // MID_LINE_TARGET is a tool_use block on line 1; both tool_results live
+    // on lines 2-3, AFTER the target's line. A dangling tool_use at the TIP
+    // is the native interrupted-turn shape, so no result lines are pulled in.
+    const plan = planFixture({ targetNodeId: MID_LINE_TARGET });
+    expect(plan.mode).toBe("exact");
+    expect(plan.refusedReason).toBeNull();
+    expect(plan.lineIndexes).toEqual([0, 1]);
+  });
+
+  it("includes the sibling tool_result line of a parallel tool_use turn (no mid-file dangling tool_use)", async () => {
+    const plan = planFixture();
+    // Line 2 hosts toolu_read_001's result. toolu_read_001 is NOT on the
+    // ancestor chain, but its tool_use block sits on included line 1.
+    expect(plan.mode).toBe("exact");
+    expect(plan.lineIndexes).toContain(2);
+
+    await executeRewind(plan, fixtureRaw.split("\n"));
+    const synthesized = jsonLinesOf(await readFile(plan.transcriptPath!, "utf8"));
+
+    // Invariant: every tool_use block in the synthesized transcript has a
+    // matching tool_result somewhere after it.
+    const useIds: string[] = [];
+    const resultIds: string[] = [];
+    for (const rec of synthesized) {
+      const content = (rec.message as Record<string, unknown> | undefined)?.content;
+      if (!Array.isArray(content)) continue;
+      for (const block of content as Record<string, unknown>[]) {
+        if (block.type === "tool_use") useIds.push(block.id as string);
+        if (block.type === "tool_result") resultIds.push(block.tool_use_id as string);
+      }
+    }
+    expect(useIds).toHaveLength(2);
+    for (const id of useIds) expect(resultIds).toContain(id);
   });
 
   it("accepts a summary/sidechain line OUTSIDE the chain's line range (after target)", () => {
@@ -140,6 +193,53 @@ describe("planRewind", () => {
     expect(plan.newSessionId).toBeNull();
     expect(plan.transcriptPath).toBeNull();
     expect(plan.resumeCommand).toBe("claude --resume session-abc --fork-session");
+    expect(plan.lineIndexes).toEqual([]);
+    expect(plan.lineUuids).toEqual([]);
+  });
+
+  it("refuses when the chain root's line has a non-null unresolvable parentUuid (truncated file)", () => {
+    // The parser tolerates orphaned parentage by rooting the node (parentId
+    // null), but synthesizing a transcript whose FIRST line was really a
+    // mid-conversation line would fabricate history. Refuse instead.
+    const mk = (o: Record<string, unknown>) => JSON.stringify(o);
+    const raw =
+      [
+        mk({
+          type: "user",
+          uuid: "u1",
+          parentUuid: "gone-parent-uuid",
+          sessionId: "sess-t",
+          cwd: "/repo",
+          timestamp: "2026-01-01T00:00:00.000Z",
+          message: { role: "user", content: "continue where we left off" },
+        }),
+        mk({
+          type: "assistant",
+          uuid: "a1",
+          parentUuid: "u1",
+          sessionId: "sess-t",
+          cwd: "/repo",
+          timestamp: "2026-01-01T00:00:01.000Z",
+          message: { role: "assistant", content: [{ type: "text", text: "ok" }] },
+        }),
+      ].join("\n") + "\n";
+    const plan = planRewind({
+      nodes: nodesOf(raw),
+      targetNodeId: "claude:a1",
+      rawLines: raw.split("\n"),
+      projectsSubdir,
+      sessionId: "sess-t",
+    });
+    expect(plan.mode).toBe("tip");
+    expect(plan.refusedReason).toBe("transcript root has unresolved parent (truncated file?)");
+    expect(plan.newSessionId).toBeNull();
+    expect(plan.transcriptPath).toBeNull();
+    expect(plan.resumeCommand).toBe("claude --resume sess-t --fork-session");
+
+    // Other direction: a true root (parentUuid null) stays exact-eligible.
+    const clean = planFixture();
+    expect(clean.mode).toBe("exact");
+    expect(clean.refusedReason).toBeNull();
   });
 
   it("refuses when a summary line falls WITHIN the chain's line range", () => {
@@ -252,7 +352,8 @@ describe("executeRewind", () => {
     expect(batch!.nodes.map((n) => n.kind)).toEqual(plan.expectedKinds);
 
     const synthesized = jsonLinesOf(content);
-    expect(synthesized).toHaveLength(4);
+    // 4 chain lines + the included sibling tool_result line (index 2).
+    expect(synthesized).toHaveLength(5);
 
     // Every line's sessionId rewritten.
     for (const rec of synthesized) {
@@ -308,11 +409,12 @@ describe("executeRewind", () => {
     expect(content).toContain("toolu_read_002");
   });
 
-  it("splices parentUuid to the previous included line when the original parent line is excluded", async () => {
-    // Real transcripts chain parentUuid linearly line-by-line, so a chain
-    // that skips a sibling tool_result line leaves the next line's
-    // parentUuid dangling; it must be re-pointed at the nearest preceding
-    // included line.
+  it("splices parentUuid across a skipped system line to the previous included line", async () => {
+    // Real transcripts interleave `type:"system"` lines that carry uuid +
+    // parentUuid and thread the line chain, but produce no graph node (the
+    // parser skips them). The chain therefore never includes them, so the
+    // NEXT line's parentUuid dangles in the synthesized file and must be
+    // re-pointed at the nearest preceding included line.
     const mk = (o: Record<string, unknown>) => JSON.stringify(o);
     const raw =
       [
@@ -335,37 +437,36 @@ describe("executeRewind", () => {
           message: {
             role: "assistant",
             content: [
-              { type: "text", text: "running two tools" },
+              { type: "text", text: "running a tool" },
               { type: "tool_use", id: "t1", name: "Read", input: { file_path: "/a" } },
-              { type: "tool_use", id: "t2", name: "Read", input: { file_path: "/b" } },
             ],
           },
         }),
         mk({
+          type: "system",
+          uuid: "s1",
+          parentUuid: "a1",
+          sessionId: "sess-x",
+          cwd: "/repo",
+          timestamp: "2026-01-01T00:00:01.500Z",
+          content: "hook ran",
+        }),
+        mk({
           type: "user",
           uuid: "r1",
-          parentUuid: "a1",
+          parentUuid: "s1",
           sessionId: "sess-x",
           cwd: "/repo",
           timestamp: "2026-01-01T00:00:02.000Z",
           message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "aaa" }] },
         }),
         mk({
-          type: "user",
-          uuid: "r2",
+          type: "assistant",
+          uuid: "a2",
           parentUuid: "r1",
           sessionId: "sess-x",
           cwd: "/repo",
           timestamp: "2026-01-01T00:00:03.000Z",
-          message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t2", content: "bbb" }] },
-        }),
-        mk({
-          type: "assistant",
-          uuid: "a2",
-          parentUuid: "r2",
-          sessionId: "sess-x",
-          cwd: "/repo",
-          timestamp: "2026-01-01T00:00:04.000Z",
           message: { role: "assistant", content: [{ type: "text", text: "done" }] },
         }),
       ].join("\n") + "\n";
@@ -378,16 +479,106 @@ describe("executeRewind", () => {
       sessionId: "sess-x",
     });
     expect(plan.mode).toBe("exact");
-    // r1's line (index 2) is not on the chain.
+    // s1's line (index 2) hosts no node and no tool_result: excluded.
     expect(plan.lineIndexes).toEqual([0, 1, 3, 4]);
 
     await executeRewind(plan, raw.split("\n"));
     const synthesized = jsonLinesOf(await readFile(plan.transcriptPath!, "utf8"));
     expect(synthesized).toHaveLength(4);
-    // r2's original parentUuid ("r1") was excluded: spliced to a1's new uuid.
+    // r1's original parentUuid ("s1") was excluded: spliced to a1's new uuid.
     expect(synthesized[2].parentUuid).toBe(synthesized[1].uuid);
-    // a2 still points at r2 (both included, normal remap).
+    // a2 still points at r1 (both included, normal remap).
     expect(synthesized[3].parentUuid).toBe(synthesized[2].uuid);
+  });
+
+  it("throws plan_invalid and writes nothing when rawLines drift between plan and execute", async () => {
+    const plan = planFixture();
+    // Simulate the transcript changing on disk after planning: line 0 now
+    // carries a different uuid than the one the plan pinned.
+    const lines = fixtureRaw.split("\n");
+    expect(lines[0]).toContain("11111111-1111-1111-1111-111111111111");
+    lines[0] = lines[0].replace(
+      "11111111-1111-1111-1111-111111111111",
+      "99999999-9999-9999-9999-999999999999",
+    );
+    await expect(executeRewind(plan, lines)).rejects.toMatchObject({
+      name: "SojournRewindError",
+      code: "plan_invalid",
+    });
+    // Nothing written — not even a tmp file.
+    expect(readdirSync(projectsSubdir)).toEqual([]);
+  });
+
+  it("catches parentage-corrupting drift via parent-shape validation and deletes the file", async () => {
+    const plan = planFixture();
+    // Sabotage the remap input: uuids untouched (so per-line uuid pins still
+    // match) but line 4's parentUuid re-pointed at the root — same kinds,
+    // same count, same sessionId, DIFFERENT tree shape.
+    const lines = fixtureRaw.split("\n");
+    expect(lines[4]).toContain('"parentUuid":"44444444-4444-4444-4444-444444444444"');
+    lines[4] = lines[4].replace(
+      '"parentUuid":"44444444-4444-4444-4444-444444444444"',
+      '"parentUuid":"11111111-1111-1111-1111-111111111111"',
+    );
+    await expect(executeRewind(plan, lines)).rejects.toMatchObject({
+      name: "SojournRewindError",
+      code: "validation_mismatch",
+    });
+    expect(existsSync(plan.transcriptPath!)).toBe(false);
+    expect(readdirSync(projectsSubdir)).toEqual([]);
+  });
+
+  it("preserves uuids/sessionIds quoted inside message content verbatim (rewrite is field-level)", async () => {
+    const mk = (o: Record<string, unknown>) => JSON.stringify(o);
+    const raw =
+      [
+        mk({
+          type: "user",
+          uuid: "qu-1",
+          parentUuid: null,
+          sessionId: "sess-q",
+          cwd: "/repo",
+          timestamp: "2026-01-01T00:00:00.000Z",
+          message: { role: "user", content: "replay node qu-1 from session sess-q please" },
+        }),
+        mk({
+          type: "assistant",
+          uuid: "qa-1",
+          parentUuid: "qu-1",
+          sessionId: "sess-q",
+          cwd: "/repo",
+          timestamp: "2026-01-01T00:00:01.000Z",
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "as recorded in qu-1 (session sess-q): done" }],
+          },
+        }),
+      ].join("\n") + "\n";
+    const plan = planRewind({
+      nodes: nodesOf(raw),
+      targetNodeId: "claude:qa-1",
+      rawLines: raw.split("\n"),
+      projectsSubdir,
+      sessionId: "sess-q",
+    });
+    expect(plan.mode).toBe("exact");
+    await executeRewind(plan, raw.split("\n"));
+    const synthesized = jsonLinesOf(await readFile(plan.transcriptPath!, "utf8"));
+
+    // Top-level identity FIELDS are rewritten...
+    expect(synthesized[0].uuid).not.toBe("qu-1");
+    expect(synthesized[1].uuid).not.toBe("qa-1");
+    for (const rec of synthesized) expect(rec.sessionId).toBe(plan.newSessionId);
+    expect(synthesized[1].parentUuid).toBe(synthesized[0].uuid);
+
+    // ...but the same ids quoted INSIDE message content survive verbatim:
+    // the rewrite is field-level, never a whole-line string replace.
+    expect((synthesized[0].message as { content: string }).content).toBe(
+      "replay node qu-1 from session sess-q please",
+    );
+    const assistantPayload = JSON.stringify(synthesized[1].message);
+    expect(assistantPayload).toContain("qu-1");
+    expect(assistantPayload).toContain("sess-q");
   });
 
   it("is a no-op for a tip (refused) plan", async () => {
