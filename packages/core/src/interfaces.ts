@@ -16,6 +16,13 @@ export interface SnapshotterLike {
   diffFile(treeA: string | null, treeB: string, path: string): Promise<string>;
   listFiles(tree: string): Promise<string[]>;
   readFile(tree: string, path: string): Promise<string | null>;
+  /**
+   * Byte-exact read of a file from a tree — no utf8 round-trip, so binary
+   * content survives verbatim. Optional: binary-safe consumers (harvest)
+   * use it when present and fall back to readFile() (utf8, NOT binary-safe)
+   * when absent.
+   */
+  readFileRaw?(tree: string, path: string): Promise<Buffer | null>;
   restoreToWorktree(tree: string, destDir: string): Promise<void>;
 }
 

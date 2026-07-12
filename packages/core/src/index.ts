@@ -7,3 +7,4 @@ export * from "./store/index.js";
 export * from "./snapshot/index.js";
 export * from "./flags/index.js";
 export * from "./restore/index.js";
+export * from "./harvest/index.js";

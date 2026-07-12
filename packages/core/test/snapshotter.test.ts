@@ -240,6 +240,56 @@ describe("ShadowSnapshotter", () => {
     expect(await snapshotter.readFile(tree, "missing.txt")).toBeNull();
   });
 
+  it("readFileRaw() round-trips binary content byte-identical and returns null when missing", async () => {
+    // PNG-ish header: NUL bytes + sequences that are invalid UTF-8 (0xff 0xfe).
+    const bin = Buffer.from([
+      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
+      0x49, 0x48, 0x44, 0x52, 0xff, 0xfe, 0x00, 0x01, 0x02, 0x03,
+    ]);
+    await fsp.writeFile(path.join(projectRoot, "logo.png"), bin);
+    const tree = await snapshotter.snapshot();
+
+    const raw = await snapshotter.readFileRaw(tree, "logo.png");
+    expect(raw).not.toBeNull();
+    expect(Buffer.isBuffer(raw)).toBe(true);
+    expect(Buffer.compare(raw!, bin)).toBe(0);
+
+    expect(await snapshotter.readFileRaw(tree, "missing.png")).toBeNull();
+  });
+
+  it("readFile() and readFileRaw() propagate a real git failure — do NOT swallow it into null like a genuine absence", async () => {
+    // Probe-proven bug (see harvest.test.ts "read-failure honesty"): the old
+    // catch-all here returned null on ANY failure, including ones that have
+    // nothing to do with the path being absent (a 64MB maxBuffer overrun on
+    // a large blob, a bad tree, a spawn error). harvestEngine's classifier
+    // then read that null as "the file doesn't exist on this side" and, for
+    // a branch read, as "the branch deleted the file" — silently deleting a
+    // mainline file that in fact still existed on the branch.
+    //
+    // "not-a-real-tree" is not a resolvable git object at all — its stderr
+    // is "fatal: invalid object name 'not-a-real-tree'.", which does NOT
+    // match the "path ... does not exist in <tree>" absence pattern git uses
+    // when a TREE is valid but a PATH within it is missing. This must
+    // reject, not resolve to null.
+    await fsp.writeFile(path.join(projectRoot, "a.txt"), "hello");
+    await snapshotter.snapshot();
+
+    await expect(snapshotter.readFile("not-a-real-tree", "a.txt")).rejects.toThrow();
+    await expect(snapshotter.readFileRaw("not-a-real-tree", "a.txt")).rejects.toThrow();
+  });
+
+  it("diff() and listFiles() return non-ASCII paths verbatim (no core.quotepath octal quoting)", async () => {
+    await fsp.writeFile(path.join(projectRoot, "ümlaut.txt"), "v1\n");
+    const t1 = await snapshotter.snapshot();
+    await fsp.writeFile(path.join(projectRoot, "ümlaut.txt"), "v2\n");
+    const t2 = await snapshotter.snapshot();
+
+    const changes = await snapshotter.diff(t1, t2);
+    expect(changes).toEqual([{ path: "ümlaut.txt", status: "M" }]);
+
+    expect(await snapshotter.listFiles(t2)).toContain("ümlaut.txt");
+  });
+
   it("restoreToWorktree() reproduces byte-identical content in a fresh dest without touching projectRoot", async () => {
     await fsp.writeFile(path.join(projectRoot, "a.txt"), "snapshot-1-content");
     const tree1 = await snapshotter.snapshot();
