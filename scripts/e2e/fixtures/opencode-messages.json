@@ -1,0 +1,183 @@
+[
+  {
+    "info": {
+      "id": "oc-msg-1",
+      "role": "user",
+      "sessionID": "ses_build",
+      "time": { "created": 1738368000000 }
+    },
+    "parts": [
+      {
+        "id": "oc-p1",
+        "messageID": "oc-msg-1",
+        "sessionID": "ses_build",
+        "type": "text",
+        "text": "Investigate the failing build and fix it."
+      }
+    ]
+  },
+  {
+    "info": {
+      "id": "oc-msg-2",
+      "role": "assistant",
+      "sessionID": "ses_build",
+      "time": { "created": 1738368001000 }
+    },
+    "parts": [
+      {
+        "id": "oc-p2",
+        "messageID": "oc-msg-2",
+        "sessionID": "ses_build",
+        "type": "text",
+        "text": "I'll check the build log and the config in parallel."
+      },
+      {
+        "id": "oc-p3",
+        "messageID": "oc-msg-2",
+        "sessionID": "ses_build",
+        "type": "tool",
+        "callID": "oc-call-1",
+        "tool": "bash",
+        "state": {
+          "status": "completed",
+          "input": { "command": "npm run build" },
+          "output": "Error: Module not found: webpack.config.js -> loader missing"
+        }
+      },
+      {
+        "id": "oc-p4",
+        "messageID": "oc-msg-2",
+        "sessionID": "ses_build",
+        "type": "tool",
+        "callID": "oc-call-2",
+        "tool": "read",
+        "state": {
+          "status": "completed",
+          "input": { "filePath": "/repo/project/webpack.config.js" },
+          "output": "module.exports = { module: { rules: [] } };\n"
+        }
+      }
+    ]
+  },
+  {
+    "info": {
+      "id": "oc-msg-3",
+      "role": "assistant",
+      "sessionID": "ses_build",
+      "time": { "created": 1738368002000 }
+    },
+    "parts": [
+      {
+        "id": "oc-p5",
+        "messageID": "oc-msg-3",
+        "sessionID": "ses_build",
+        "type": "text",
+        "text": "Found the issue in the webpack config. Fixing it now, then rerunning the build."
+      }
+    ]
+  },
+  {
+    "info": {
+      "id": "oc-msg-4",
+      "role": "assistant",
+      "sessionID": "ses_build",
+      "time": { "created": 1738368003000 }
+    },
+    "parts": [
+      {
+        "id": "oc-p6",
+        "messageID": "oc-msg-4",
+        "sessionID": "ses_build",
+        "type": "tool",
+        "callID": "oc-call-3",
+        "tool": "edit",
+        "state": {
+          "status": "error",
+          "input": { "filePath": "/repo/project/webpack.config.js" },
+          "error": "permission denied writing file"
+        }
+      },
+      {
+        "id": "oc-p7",
+        "messageID": "oc-msg-4",
+        "sessionID": "ses_build",
+        "type": "tool",
+        "callID": "oc-call-4",
+        "tool": "bash",
+        "state": {
+          "status": "running",
+          "input": { "command": "npm run build" }
+        }
+      },
+      {
+        "id": "oc-p8",
+        "messageID": "oc-msg-4",
+        "sessionID": "ses_build",
+        "type": "tool"
+      }
+    ]
+  },
+  {
+    "info": {
+      "id": "oc-msg-5",
+      "role": "assistant",
+      "sessionID": "ses_build",
+      "time": { "created": 1738368004000 }
+    },
+    "parts": [
+      {
+        "id": "oc-p9",
+        "messageID": "oc-msg-5",
+        "sessionID": "ses_build",
+        "type": "step-start"
+      }
+    ]
+  },
+  {
+    "info": {
+      "id": "oc-msg-6",
+      "role": "user",
+      "sessionID": "ses_build",
+      "time": { "created": 1738368005000 }
+    },
+    "parts": [
+      {
+        "id": "oc-p10",
+        "messageID": "oc-msg-6",
+        "sessionID": "ses_build",
+        "type": "text",
+        "text": "Also run the linter while you're at it."
+      }
+    ]
+  },
+  {
+    "info": {
+      "id": "oc-msg-7",
+      "role": "assistant",
+      "sessionID": "ses_build",
+      "time": { "created": 1738368006000 }
+    },
+    "parts": [
+      {
+        "id": "oc-p11",
+        "messageID": "oc-msg-7",
+        "sessionID": "ses_build",
+        "type": "text",
+        "text": "Sure, running lint now alongside the build fix."
+      },
+      {
+        "id": "oc-p12",
+        "messageID": "oc-msg-7",
+        "sessionID": "ses_build",
+        "type": "tool",
+        "callID": "oc-call-5",
+        "tool": "bash",
+        "state": {
+          "status": "completed",
+          "input": { "command": "npm run lint" },
+          "output": "0 problems"
+        }
+      }
+    ]
+  }
+]
