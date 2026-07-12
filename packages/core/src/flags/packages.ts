@@ -265,6 +265,14 @@ export const packagesCheck: FlagCheck = {
 
   async run(ctx: CheckContext): Promise<Flag[]> {
     if (ctx.nodeTree === null || ctx.snapshotter === null) return [];
+    // No turn-scoped base: ctx.diff was built as diff(null, nodeTree), a
+    // whole-tree pseudo-diff where EVERY file in the repo appears as status
+    // "A". That is not evidence the assistant touched anything this turn —
+    // candidates below are selected purely from ctx.diff, so without a real
+    // base a verified flag could fire on files from unrelated earlier turns
+    // the assistant never mentioned. Stay silent instead (precision over
+    // recall — same doctrine as editClaimCheck's null-tree guard).
+    if (ctx.parentTree === null) return [];
     const text = getNodeText(ctx.node);
     if (text === null) return [];
 

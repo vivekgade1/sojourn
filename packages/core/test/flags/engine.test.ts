@@ -676,4 +676,85 @@ describe("autoResolveFlags with turnBaseOf (span re-evaluation)", () => {
     expect(store.resolved).toEqual([601]);
     expect(diffSpy).not.toHaveBeenCalled();
   });
+
+  // packagesCheck (and editClaimCheck) go SILENT — return [] — when their
+  // ctx.parentTree is null (no turn-scoped base: see their null-tree guard
+  // comments). If autoResolveFlags fed a null re-eval base straight into
+  // check.run() and read an empty result as "condition no longer holds", it
+  // would misinterpret "cannot re-evaluate" as "fixed" and wrongly resolve
+  // the flag. A null re-eval base must instead skip resolution outright and
+  // leave the flag active — mirroring the "fails soft" contract for a
+  // throwing span diff just above.
+  it("does NOT resolve a package_hallucination flag when turnBaseOf yields a null re-eval base (cannot re-evaluate, not fixed)", async () => {
+    const nodeA = makeNode({ content: "Added `src/deps.py` with the imports we need." });
+    const storedFlag = makeStoredFlag(nodeA.id, 801, {
+      kind: "package_hallucination",
+      evidence:
+        "claimed/used import of package `totallybogus`; PyPI returned 404 (not found) for that package name",
+    });
+    const nodeCurrent = makeNode({ content: "Refactored `src/auth.py` for clarity." });
+
+    const flagsByNode = new Map<string, StoredFlag[]>([[nodeA.id, [storedFlag]]]);
+    const store = makeFakeStore(flagsByNode, [nodeA, nodeCurrent]);
+
+    const diffSpy = vi.fn(async () => [{ path: "src/deps.py", status: "A" as const }]);
+    const snapshotter = {
+      diff: diffSpy,
+      readFile: async (_tree: string, path: string) =>
+        path === "src/deps.py" ? "import totallybogus\n" : null,
+      listFiles: async () => ["src/deps.py"],
+    };
+    const fetchJson: FetchJson = async () => ({ status: 404, body: {} });
+
+    const ctx = makeCtx(nodeCurrent, {
+      priorNodes: [nodeA, nodeCurrent],
+      diff: [{ path: "src/auth.py", status: "M" }],
+      parentTree: BASE_CURRENT,
+      nodeTree: TREE_CURRENT,
+      snapshotter: snapshotter as unknown as CheckContext["snapshotter"],
+      fetchJson,
+    });
+
+    // nodeA has no ancestor prompt snapshot (e.g. it's the first captured
+    // node of the session): turnBaseOf reports null for it.
+    const count = await autoResolveFlags(store, nodeCurrent, ctx, undefined, (n) =>
+      n.id === nodeA.id ? null : BASE_CURRENT,
+    );
+
+    expect(count).toBe(0);
+    expect(store.resolved).toEqual([]);
+    // The span diff must never even be computed for an unresolvable null base.
+    expect(diffSpy).not.toHaveBeenCalled();
+  });
+
+  it("does NOT resolve an edit_claim_mismatch flag when turnBaseOf yields a null re-eval base (same null-base guard applies to editClaimCheck)", async () => {
+    const nodeA = makeNode({ content: "I updated `src/x.py` to fix the parser." });
+    const storedFlag = makeStoredFlag(nodeA.id, 802, {
+      kind: "edit_claim_mismatch",
+      evidence: "claimed edit to `src/x.py`; snapshot diff shows no change to that file",
+    });
+    const nodeCurrent = makeNode({ content: "Unrelated follow-up." });
+
+    const flagsByNode = new Map<string, StoredFlag[]>([[nodeA.id, [storedFlag]]]);
+    const store = makeFakeStore(flagsByNode, [nodeA, nodeCurrent]);
+
+    const diffSpy = vi.fn(async () => [{ path: "src/x.py", status: "M" as const }]);
+    const snapshotter = { diff: diffSpy };
+
+    const ctx = makeCtx(nodeCurrent, {
+      priorNodes: [nodeA, nodeCurrent],
+      diff: [{ path: "src/other.py", status: "M" }],
+      parentTree: BASE_CURRENT,
+      nodeTree: TREE_CURRENT,
+      snapshotter: snapshotter as unknown as CheckContext["snapshotter"],
+    });
+
+    const count = await autoResolveFlags(store, nodeCurrent, ctx, undefined, (n) =>
+      n.id === nodeA.id ? null : BASE_CURRENT,
+    );
+
+    expect(count).toBe(0);
+    expect(store.resolved).toEqual([]);
+    expect(diffSpy).not.toHaveBeenCalled();
+  });
 });

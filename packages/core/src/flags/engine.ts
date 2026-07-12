@@ -69,6 +69,19 @@ function flagsMatchSameClaim(a: Flag, b: Flag): boolean {
 }
 
 /**
+ * Kinds whose check selects candidates from `ctx.diff`/`ctx.parentTree` and
+ * therefore goes SILENT (returns []) when `parentTree` is null — see
+ * editClaimCheck's and packagesCheck's null-tree guards. That silence is
+ * correct for FORWARD flagging (no ground truth => no new flag), but it is
+ * NOT evidence a previously-flagged claim was fixed: a null re-eval base
+ * means "cannot re-evaluate", not "condition no longer holds". Feeding it
+ * into `check.run()` and reading the empty result as "resolved" would
+ * silently clear real flags the moment a prior node has no ancestor prompt
+ * snapshot. See the null-re-eval-base guard in the loop below.
+ */
+const DIFF_SCOPED_KINDS: ReadonlySet<FlagKind> = new Set(["edit_claim_mismatch", "package_hallucination"]);
+
+/**
  * Re-runs the T1 check that produced each earlier ACTIVE (non-dismissed,
  * not-yet-auto-resolved) flag in this session, evaluating the *originally
  * flagged node's claim* against the ground truth available at `node`
@@ -143,6 +156,16 @@ export async function autoResolveFlags(
       // truth at the current node, spanning from the PRIOR node's own turn
       // base so intermediate turns' changes are visible.
       const base = turnBaseOf ? turnBaseOf(priorNode) : ctx.parentTree;
+
+      // A null base for a diff-scoped check's kind means "cannot
+      // re-evaluate" (no ancestor prompt snapshot to span from), not "the
+      // claim is fixed" — the check's own null-tree guard would return []
+      // regardless of ground truth, and reading that as "no longer holds"
+      // would wrongly auto-resolve a still-active flag. Fail soft: skip
+      // resolution, keep the flag active, same contract as a throwing span
+      // diff below.
+      if (base === null && DIFF_SCOPED_KINDS.has(flag.kind)) continue;
+
       const spanDiff = await spanDiffFor(base);
       if (spanDiff === null) continue; // diff failed: never resolve blind
 

@@ -124,6 +124,56 @@ describe("packagesCheck.run — true positive", () => {
   });
 });
 
+describe("packagesCheck.run — null parentTree (no turn-scoped base): silence over crying wolf", () => {
+  // ctx.parentTree === null means there is no ancestor prompt / no snapshot
+  // before it, so ctx.diff was built as diff(null, nodeTree) — a whole-tree
+  // pseudo-diff where EVERY file in the repo appears as status "A". That is
+  // not evidence the assistant touched anything this turn; treating it as
+  // candidate evidence risks flagging files from unrelated earlier turns the
+  // assistant never mentioned. Design principle 3 (precision over recall)
+  // says the check must go silent here, exactly like editClaimCheck already
+  // does for a null tree.
+  const bogusImportFiles: Record<string, string> = {
+    "src/deps.ts": `import { thing } from "totally-bogus-hallucinated-pkg";\n`,
+  };
+  const wholeTreePseudoDiff = [{ path: "src/deps.ts", status: "A" as const }];
+
+  it("does NOT flag a bogus import when parentTree is null, even though the registry 404s", async () => {
+    const fetchJson: FetchJson = vi.fn(async (url: string) => {
+      if (url.includes("totally-bogus-hallucinated-pkg")) return { status: 404, body: null };
+      return { status: 200, body: {} };
+    });
+    const ctx = makeCtx({
+      diff: wholeTreePseudoDiff,
+      files: bogusImportFiles,
+      fetchJson,
+      parentTree: null,
+    });
+    const flags = await packagesCheck.run(ctx);
+    expect(flags).toHaveLength(0);
+    // Silence means never even reaching the registry lookup, not merely
+    // discarding a flag it decided to produce.
+    expect(fetchJson).not.toHaveBeenCalled();
+  });
+
+  it("regression guard: the SAME diff/files still flags when parentTree IS grounded (non-null)", async () => {
+    const fetchJson: FetchJson = vi.fn(async (url: string) => {
+      if (url.includes("totally-bogus-hallucinated-pkg")) return { status: 404, body: null };
+      return { status: 200, body: {} };
+    });
+    const ctx = makeCtx({
+      diff: wholeTreePseudoDiff,
+      files: bogusImportFiles,
+      fetchJson,
+      parentTree: "some-grounded-parent-tree",
+    });
+    const flags = await packagesCheck.run(ctx);
+    expect(flags).toHaveLength(1);
+    expect(flags[0].kind).toBe("package_hallucination");
+    expect(flags[0].evidence).toContain("totally-bogus-hallucinated-pkg");
+  });
+});
+
 describe("packagesCheck.run — monorepo root package.json merging", () => {
   it("does not flag an import declared only in the ROOT package.json of a monorepo (nested pkg, no node_modules on disk)", async () => {
     const files: Record<string, string> = {
