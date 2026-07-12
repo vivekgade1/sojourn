@@ -6,7 +6,7 @@ Two things ship in this plugin:
    events (`SessionStart` / `PostToolUse` / `Stop`) to the local Sojourn
    daemon (`POST /api/hooks/claude`) so ingestion is immediate instead of
    waiting on the filesystem watcher's debounce. The hook script always
-   exits 0 within ~3s, daemon up or not — capture never blocks or breaks a
+   exits 0 within ~3.5s, daemon up or not — capture never blocks or breaks a
    session.
 2. **The `sojourn` skill** (`skills/sojourn/SKILL.md`) — teaches Claude Code
    how to drive the `soj` CLI: list flags with evidence, mark

@@ -74,6 +74,35 @@ soj restore <nodeId>             PREFLIGHT ONLY: prints the target snapshot, val
                                  without touching anything.
 soj restore <nodeId> --yes       Actually restore: safety snapshot → new worktree → prints the
                                  worktree path and resume command.
+
+soj gc [--project <id>] [--days N] [--archive-dir <path>] [--run]
+                                 Prune old snapshot history in a project's shadow repo. Dry-run by
+                                 default (prints what WOULD be pruned/reclaimed); pass --run to
+                                 actually prune. Operates directly on $SOJOURN_HOME — the daemon
+                                 does not need to be running. Never prunes a snapshot pinned by a
+                                 decision/assumption/checkpoint node, a flagged node, or a live
+                                 restored worktree (its .sojourn-restore.json is scanned
+                                 automatically). If a live daemon lands a new snapshot mid-run, gc
+                                 detects it and aborts safely without pruning anything — re-run
+                                 soj gc later to complete it. See §8.
+
+soj why "<query>" [--project <id>] [--file <path>]
+                                 Full-text search over prompts, gists, marks, and annotations —
+                                 "why/when did the agent do X?" Hits print best-first with kind,
+                                 node id, gist, active-flag markers, and a snippet. See §9.
+
+soj decisions [--project <id>] [--file <path>]
+                                 The durable record: marked decisions/assumptions/checkpoints, plus
+                                 any turn still carrying an active flag (evidence attached). See §9.
+
+soj gate [--session <id> | --project <id>] [--include-advisory]
+                                 CI-style check. Exit 0 = clean; 2 = active verified flags exist
+                                 (prints an evidence table); 3 = daemon unreachable. Advisory flags
+                                 never gate unless --include-advisory. See §10.
+
+soj mcp                          Run a read-only MCP stdio server over the graph for agentic CLIs
+                                 (sojourn_search, sojourn_decisions, sojourn_flags, sojourn_node).
+                                 See §11.
 ```
 
 Node ids come from `soj flags` output or the web UI inspector. They contain a `:`— quote them if your shell cares.
@@ -130,30 +159,153 @@ Every restore, in order:
 
 **What restore cannot undo** (the preflight warns you every time): Bash side effects (`rm`, `mv` outside the tree), database migrations, network calls, `git push`.
 
-**Conversation caveat:** native CLIs can only fork a resumed conversation from the session's current tip, so the resumed *conversation* continues from where the session left off, while the *filesystem* in the worktree is exactly the node you chose.
+**Conversation restore — two modes.** For Claude Code sessions, every restore also attempts an **exact-node rewind**: the daemon synthesizes a brand-new transcript file containing only the chain of lines from the root to the node you chose (the original transcript is never touched), and the resume command becomes `claude --resume <newSessionId>` — the resumed *conversation* genuinely starts at that node, not just the session's tip. Sojourn refuses exact rewind, honestly and by design, whenever it can't guarantee the reconstruction is correct — an incomplete ancestor chain (orphaned parentage), a parentage cycle, or a chain that crosses a compaction/summary boundary (Claude Code compacted the conversation, so the exact prior turns no longer exist to replay) all refuse, with a `refusedReason` explaining why. A refusal — or an OpenCode session, which restores in tip mode only — falls back to the **tip-mode** resume command you'd get in V1: `claude --resume <sessionId> --fork-session`, which continues the conversation from wherever the session currently stands, while the *filesystem* in the worktree is still restored exactly to the node you chose. A rewind failure never fails the restore itself — the `rewind` field is simply omitted from the response and you still get a working tip-mode resume command.
 
-## 7. Claude Code integration
+## 7. Harvest — bringing worktree work back
 
-The pull-based transcript watcher is the **source of truth** — Sojourn works with zero Claude Code configuration. The plugin in `plugins/claude/` adds two optional things:
+A restore drops you into a **new, disposable worktree**, deliberately isolated from your mainline project so nothing you do there touches real state by accident. When work in that worktree turns out to be worth keeping, **harvest** merges it back into your mainline project root — the first (and only) Sojourn feature that ever writes into your actual project directory.
 
-1. **Push-timing hooks** (`SessionStart` / `PostToolUse` / `Stop`) that ping the daemon so ingestion is immediate instead of debounce-delayed. The hook script always exits 0 within ~3 seconds, daemon up or not — it can never break your session.
-2. **The `sojourn` skill** (`plugins/claude/skills/sojourn/`) that teaches Claude Code itself how to drive `soj` — so you can ask Claude "any flags on this session?" or "rewind to before that bad refactor" and it knows what to do.
+There is no dedicated `soj harvest` subcommand yet in this release — harvest is driven entirely through the HTTP API (`docs/API.md`); script it or drive it from a client of your choosing.
 
-Install (in-repo checkout; marketplace packaging is post-V1 — see `plugins/claude/README.md`):
+A typical harvest, in order:
+
+1. **Preflight** (`POST /api/worktrees/harvest/preflight {worktreePath}`) — a pure, zero-write dry run. Reads the worktree's `.sojourn-restore.json` manifest to resolve the origin project (mainline root + the shared shadow git repo the worktree branched from) and classifies every changed file as `clean` (safe to apply), `conflict` (both sides touched it since the branch point), or `identical`. No manifest, or it doesn't resolve → `code: "no_manifest"`.
+2. **Harvest** (`POST /api/worktrees/harvest {worktreePath, mode}`) — internally: **mainline safety snapshot first, unconditionally, before anything else, in EVERY mode** (same non-negotiable guarantee as restore — even `patch` mode takes one, despite never writing to the mainline itself), then classification is re-run, then:
+   - `mode: "apply"` — writes the worktree's clean changes onto the mainline. Any conflict aborts the **whole** apply cleanly (nothing written) unless you pass `allowConflicts: true`, in which case clean files land and conflicting ones are named in the response. A successful apply that lands at least one file gets a **checkpoint node** in the graph, parented to the restore's origin node — the worktree session joins the origin project's graph instead of living in a disconnected branch.
+   - `mode: "patch"` — composes a `base..branch` patch file (`.sojourn-harvest.patch`) inside the worktree and never touches the mainline, for when you'd rather review and apply by hand.
+
+**Conflict and failure handling is honest, not silent.** A mid-apply failure (e.g. a read-only destination) never leaves a half-applied mainline pretending to be a success — it aborts with a typed error naming exactly what applied, what conflicted, and what's left (a `.partial` payload), with the mainline safety snapshot always there as the fallback. Typed error codes: `no_manifest`, `stale_base`, `conflicts`, `patch_incomplete` (400s); `partial_apply`, `mainline_drift` (500s, `.partial` in the body). `mainline_drift` fires when the mainline itself changed underneath the harvest between classification and write — nothing further is written once that's detected.
+
+**Known limits (documented, not hidden):** harvest transfers file *contents* only — file-mode changes (e.g. the executable bit) aren't preserved; a branch entry that is itself a symlink is materialized as a regular file containing the target path; patch mode emits git's ordinary "Binary files differ" stub for binary paths rather than a binary-aware patch.
+
+## 8. Retention & garbage collection (`soj gc`)
+
+Every node boundary writes a new whole-tree snapshot into the project's shadow repo — over a long-lived project that adds up. `soj gc` prunes old snapshot history without ever touching your project's real `.git`, and without ever pruning something you might still need:
 
 ```bash
-claude plugin install /Users/you/path/to/sojourn/plugins/claude   # or add via /plugin in Claude Code
+soj gc                                    # dry-run preview for cwd's project, 30-day keep window
+soj gc --days 14                          # preview with a shorter keep window
+soj gc --archive-dir ~/sojourn-archive    # preview + (on --run) write a backup bundle first
+soj gc --run                              # actually prune
 ```
 
-The hooks assume the repo stays where the plugin path points (`${CLAUDE_PLUGIN_ROOT}/../../packages/adapter-claude/dist/...`), so build the repo first.
+**What's always kept**, regardless of age: anything younger than `--days` (default 30); every snapshot for a `decision` / `assumption` / `checkpoint` node; every snapshot for a node carrying **any** flag, dismissed or not, verified or advisory (evidence worth being able to re-examine later); and the tree hash of every live restored worktree, read automatically out of its `.sojourn-restore.json` manifest so `soj gc` never prunes a snapshot a worktree you're actively using still depends on. The safety-snapshot history gc itself relies on (`refs/sojourn/safety`) is never pruned either — restoring is never made less safe by running gc.
 
-## 8. OpenCode integration
+**Dry-run is the default on purpose.** Without `--run`, `soj gc` computes and prints exactly what it would do — kept/pruned commit counts and a reclaim-size estimate — without deleting anything. Nothing is mutated until you pass `--run`.
+
+**Concurrency: abort and retry, not a race.** `soj gc` does not need the daemon stopped — it's safe to run while capture is active. If a live daemon lands a new snapshot in the exact window gc is finalizing, gc detects the conflicting write (a compare-and-swap on the shadow repo's head ref) and **aborts the entire run before pruning anything**: the concurrent snapshot is untouched, nothing is lost, and gc prints that it aborted and to re-run it later to complete the job. This is intentionally an abort-and-retry design rather than a lock — gc never blocks capture, and capture never has to wait on gc.
+
+`--archive-dir <path>` writes a full `git bundle` of everything about to be touched (not just the pruned range) before any ref is rewritten or object pruned, so a classification bug can never make the backup itself incomplete.
+
+## 9. Decision memory (`soj why` / `soj decisions` / `/api/search`)
+
+Sojourn indexes prompts, gists, marks, and annotations into a full-text search index as they're captured, plus a files-touched index per node, so you can ask "why did we do X" months later instead of scrolling the graph.
+
+```bash
+soj why "why sqlite over postgres"        # full-text search, best match first
+soj why "auth flow" --file src/auth.ts    # only turns that touched this file
+soj decisions                             # marked decisions/assumptions/checkpoints + flagged turns
+soj decisions --file src/auth.ts          # same, filtered to a file
+```
+
+`soj why` hits print `[kind] node-id  gist` with active-flag markers and a snippet, in the same best-first order the daemon returns (bm25-ranked). A query with no hits gets a two-line nudge toward `soj decisions` rather than a bare "nothing found."
+
+`soj decisions` is the durable record — marks plus any node still carrying an active (non-dismissed, non-auto-resolved) flag — with each flag line printed as `⚑ kind (tier/confidence): evidence` so an advisory flag can never be mistaken for a verified one, even in this listing.
+
+Both are thin CLI wrappers over `GET /api/search?projectId=&q=&file=&kinds=` (docs/API.md) — script against that route directly for anything more custom. Query text is always treated as literal phrases (never parsed as FTS operators), so search terms containing `OR`, `NOT`, quotes, or other special characters can't throw or over-match.
+
+## 10. `soj gate` — CI-style verification
+
+`soj gate` turns Sojourn's verified flags into a pass/fail check you can wire into CI or a pre-merge hook:
+
+```bash
+soj gate                                  # gate cwd's project's whole graph
+soj gate --session <id>                   # gate one session (turns/flags from its health route)
+soj gate --include-advisory               # also gate on hedged LLM-critic flags
+```
+
+Every run prints the same honest header first, on every outcome: `checked: claims vs snapshots recorded by the local Sojourn daemon` — the gate proves recorded claims against snapshots, nothing more; it is not a general correctness proof.
+
+Exit codes:
+
+| Exit | Meaning |
+|---|---|
+| `0` | Clean — `gate passed: N turns, 0 active verified flags` |
+| `2` | Active verified flags exist — prints a table (node, kind, tier, confidence, evidence excerpt) |
+| `3` | Daemon unreachable — distinct from both pass and fail on purpose: "could not check" is never reported as "passed" |
+
+Advisory flags never gate by default — a note names any active advisory count and points at `--include-advisory`. With that flag set, advisory flags gate too and appear in the table with tier `advisory`, still clearly labeled as such.
+
+## 11. `soj mcp` — MCP server for agentic CLIs
+
+`soj mcp` runs a local, **read-only** [MCP](https://modelcontextprotocol.io) stdio server so any agentic CLI (not just Claude Code) can query the decision graph itself mid-session, instead of you copy-pasting flag evidence into the conversation.
+
+```bash
+claude mcp add sojourn -- soj mcp
+```
+
+Four tools, every one backed by the daemon HTTP API (never the database directly), all read-only:
+
+| Tool | Arguments | Returns |
+|---|---|---|
+| `sojourn_search` | `query`, `file?`, `project?` | relevance-ordered hits (gist + snippet + active flag kinds) |
+| `sojourn_decisions` | `project?` | marks (decision/assumption/checkpoint) + actively flagged turns |
+| `sojourn_flags` | `sessionId?` | active flags with tier/confidence/evidence |
+| `sojourn_node` | `nodeId` | one full node including flags and annotations |
+
+If the daemon is down, tools answer with friendly guidance text ("not reachable … `soj start`") rather than a protocol error, and the server keeps answering other requests normally. The default project is derived from the working directory `soj mcp` was launched in.
+
+## 12. Claude Code integration
+
+The pull-based transcript watcher is the **source of truth** — Sojourn works with zero Claude Code configuration. The plugin in `plugins/claude/` adds two optional things on top:
+
+1. **Push-timing hooks** (`SessionStart` / `PostToolUse` / `Stop`) that ping the daemon so ingestion is immediate instead of debounce-delayed. The hook script always exits 0 within ~3.5 seconds, daemon up or not — it can never break your session.
+2. **The `sojourn` skill** (`plugins/claude/skills/sojourn/`) that teaches Claude Code itself how to drive `soj` — so you can ask Claude "any flags on this session?" or "rewind to before that bad refactor" and it knows what to do.
+
+### Installing the plugin
+
+The plugin is a **self-contained bundle** — it does not assume you're working inside a Sojourn repo checkout. There are two install modes:
+
+**In-repo dev checkout** — you have (or are working in) a full clone of the `sojourn` repo:
+
+```bash
+git clone <this-repo> sojourn
+cd sojourn
+npm install
+npm run build            # tsc for all packages + web + build:plugin (regenerates the hook bundle)
+claude plugin install /path/to/sojourn/plugins/claude   # or add via /plugin in Claude Code
+```
+
+`npm run build` (or the narrower `npm run build:plugin`) keeps `plugins/claude/hooks/sojourn-hook.mjs` — a generated, dependency-free ESM bundle of `packages/adapter-claude/src/hooks/postToolUse.ts` — in sync with the TypeScript source.
+
+**Copied plugin directory** — you only have `plugins/claude/` itself, e.g. copied out of a release archive or a marketplace entry, with no `packages/` or `node_modules/` alongside it:
+
+```bash
+cp -r plugins/claude ~/wherever/sojourn-claude-plugin
+claude plugin install ~/wherever/sojourn-claude-plugin
+```
+
+This works out of the box with **no `npm install` and no build step** — `hooks/sojourn-hook.mjs` is already a finished artifact with zero runtime imports outside Node builtins. What you can't do from a copied directory is regenerate that bundle; to pick up hook changes, re-copy an updated `plugins/claude/` from a repo checkout that has rebuilt it (`npm run validate:plugin` verifies the bundle stays self-contained and `hooks.json` never resolves outside the plugin directory).
+
+Either way, a running Sojourn daemon (`soj start`) is what actually records anything — the plugin only forwards events to it.
+
+### Terminal flag delivery (`SOJOURN_HOOK_FLAGS=1`)
+
+By default the hooks are silent — they POST the event and exit, printing nothing. Set `SOJOURN_HOOK_FLAGS=1` in the environment Claude Code itself runs in (e.g. `export SOJOURN_HOOK_FLAGS=1` before launching `claude`) to additionally have the `Stop` hook print that turn's active flags straight to your terminal:
+
+```
+Sojourn: edit_claim_mismatch — claimed src/x.ts:42 edited, snapshot shows no change
+```
+
+This surface is **verified-only, by contract and by a second guard**: the underlying route only ever returns active verified flags, and the hook itself drops any line that mentions "advisory" as defense in depth — an unverified guess can never read as confirmed here. Output is budgeted (max 3 lines plus a `"+n more"` marker on overflow, digest-collapsed) so a flag storm can't flood your terminal. It only fires on `Stop`, and only when the daemon responds within its own short timeout — a slow or unreachable daemon means no lines print, the same silent-and-exit-0 behavior as when the variable is unset. This is purely additive: it never changes the hook's exit code (always 0) or blocks the session either way.
+
+## 13. OpenCode integration
 
 `POST /api/hooks/opencode {sessionId}` makes the daemon pull that session's messages from the local OpenCode server (`OPENCODE_URL`, default `http://localhost:4096`) and ingest them into the same per-project graph — Claude and OpenCode nodes unify by repository. `plugins/opencode/sojourn.ts` forwards session events to that route. Set `SOJOURN_OPENCODE=1` to have the daemon also subscribe to OpenCode's `/event` SSE stream directly (off by default).
 
 **Honesty note:** the OpenCode adapter was written against OpenCode's documented API and is **not yet live-integration-tested**; every module carries that header, and everything fails soft (an unreachable OpenCode server is logged and ignored).
 
-## 9. Environment variables
+## 14. Environment variables
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -165,12 +317,13 @@ The hooks assume the repo stays where the plugin path points (`${CLAUDE_PLUGIN_R
 | `OPENCODE_URL` | `http://localhost:4096` | Local OpenCode server base URL. |
 | `SOJOURN_OPENCODE` | off | `1` = daemon subscribes to OpenCode's SSE event stream. |
 | `SOJOURN_DAEMON_ENTRY` | auto-resolved | Override the daemon entry script `soj start` spawns. |
+| `SOJOURN_HOOK_FLAGS` | off | `1` = the Claude Code `Stop` hook prints that turn's active verified flags to the terminal (§12). Set in the environment Claude Code itself runs in, not the daemon's. |
 
-## 10. HTTP & WebSocket API
+## 15. HTTP & WebSocket API
 
-The daemon exposes a full local API (projects, graph, node diffs, flags/run, preflight/restore, annotations, mark, dismiss, hooks) plus `node_added` / `flags_updated` / `project_updated` WebSocket events — see [docs/API.md](API.md) for the route table and payload shapes. Everything the CLI and web UI do goes through this API, so you can script against it.
+The daemon exposes a full local API (projects, graph, node diffs, flags/run, preflight/restore, annotations, mark, dismiss, hooks, search, session health, turn-flags, rewind, harvest) plus `node_added` / `flags_updated` / `project_updated` WebSocket events — see [docs/API.md](API.md) for the route table and payload shapes. Everything the CLI and web UI do goes through this API, so you can script against it.
 
-## 11. Troubleshooting
+## 16. Troubleshooting
 
 - **`soj` not found** — run `npm link -w @sojourn/cli`, or call `node packages/cli/dist/main.js …` directly.
 - **"daemon is not reachable … Try `soj start`"** — the daemon isn't running (or is on a different `SOJOURN_PORT`).
@@ -178,5 +331,8 @@ The daemon exposes a full local API (projects, graph, node diffs, flags/run, pre
 - **A node shows no diff / flags stay silent** — expected when that step has no snapshot ground truth (e.g. the very first turn); precision over recall means silence, not guessing.
 - **`soj critic` returns an error** — `ANTHROPIC_API_KEY` must be set in the environment of the *daemon* process, not your shell; restart it after setting.
 - **Stale pidfile after a crash** — `soj start`/`soj stop` detect a recycled PID (process identity check) and clean up automatically; they will never signal a non-Sojourn process.
-- **Restore refused** — the preflight found no valid snapshot for that node (or its ancestors). Nothing was changed; pick a node that carries a snapshot (the UI shows diffs only on such nodes).
-- **Everything broke, where's my data?** — the DB and snapshots live under `~/.sojourn`; your project tree and `.git` are never written to by capture or restore. Safety snapshots taken before every restore are in the shadow repo (`refs/sojourn/head` history).
+- **Restore refused, "snapshot missing or thinned by retention policy"** — the preflight found no valid snapshot for that node (or its ancestors), including the case where `soj gc` pruned it. Nothing was changed; pick a node that carries a snapshot (the UI shows diffs only on such nodes), or re-run without pruning it next time (pin it with a mark, or widen `--days`).
+- **`soj gc` says it aborted** — a live daemon landed a new snapshot in the exact window gc was finalizing; by design gc pruned nothing and left everything as-is. Just re-run `soj gc` (with `--run` if you meant to prune).
+- **`soj gate` exits 3** — the daemon is unreachable, deliberately distinct from exit 0 (pass) and exit 2 (fail): "could not check" is never reported as "clean."
+- **Harvest refuses with `no_manifest`** — the path you gave isn't a Sojourn restore worktree (no readable `.sojourn-restore.json`), or its origin project can't be resolved. Harvest only ever operates on worktrees Sojourn itself created.
+- **Everything broke, where's my data?** — the DB and snapshots live under `~/.sojourn`; your project tree and `.git` are never written to by capture, restore, or gc. Harvest is the one exception, and only after its own safety snapshot. Safety snapshots taken before every restore/harvest/gc are in the shadow repo (`refs/sojourn/head` and `refs/sojourn/safety` history).

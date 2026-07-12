@@ -8,6 +8,16 @@ Everything runs on localhost. No account, no upload.
 
 **📖 Complete user guide: [docs/USAGE.md](docs/USAGE.md)** — CLI reference, web UI tour, flag semantics, restore guarantees, Claude Code/OpenCode setup, troubleshooting.
 
+## Also in V2
+
+- **`soj gc`** — retention/GC for snapshot history: dry-run by default, pin-aware (decisions, flags, live worktrees never pruned), abort-and-retry safe against a live daemon.
+- **`soj why` / `soj decisions`** — full-text decision memory over prompts, gists, marks, and annotations; `/api/search` for scripting.
+- **`soj mcp`** — a read-only MCP server so any agentic CLI can query flags/decisions/search itself.
+- **`soj gate`** — CI-style check: exit 0 clean, 2 active verified flags, 3 daemon unreachable.
+- **Exact-node rewind** — Claude Code restores can resume the conversation exactly at the chosen node (synthesized transcript), with an honest tip-mode fallback on compaction or orphaned parentage.
+- **Harvest** — merge work done in a restore worktree back into your mainline project, safety-snapshotted first (HTTP API only for now).
+- **Terminal flag delivery** — `SOJOURN_HOOK_FLAGS=1` prints a turn's active verified flags straight to your terminal.
+
 ## Install & run (from this repo)
 
 ```bash
@@ -21,7 +31,7 @@ The daemon watches `~/.claude/projects/**/*.jsonl` (honors `CLAUDE_CONFIG_DIR`) 
 
 ### Claude Code plugin (push-timing hooks, optional)
 
-The pull-based watcher is the source of truth; the plugin in `plugins/claude/` just makes ingestion immediate by pinging the daemon on `SessionStart` / `PostToolUse` / `Stop`. The hook script always exits 0 within ~3s, daemon up or not.
+The pull-based watcher is the source of truth; the plugin in `plugins/claude/` just makes ingestion immediate by pinging the daemon on `SessionStart` / `PostToolUse` / `Stop`. The hook script always exits 0 within ~3.5s, daemon up or not. It's a self-contained bundle (works from an in-repo checkout or a copied `plugins/claude/` directory alone — see `plugins/claude/README.md`) and can optionally print a turn's verified flags to your terminal (`SOJOURN_HOOK_FLAGS=1`).
 
 ### OpenCode
 
@@ -38,6 +48,10 @@ soj critic <nodeId>            # run the Tier-2 advisory critic on a node (needs
 soj mark <label> [--kind decision|assumption|checkpoint]
 soj checkpoint <name>
 soj restore <nodeId> [--yes]   # without --yes: preflight + warnings only
+soj gc [--days N] [--archive-dir <p>] [--run]   # prune old snapshots; dry-run by default
+soj why "<query>" / soj decisions   # full-text decision memory
+soj gate [--session <id>] [--include-advisory]  # CI-style check; exit 0/2/3
+soj mcp                         # read-only MCP stdio server for agents
 ```
 
 ## Confidence flags — what they mean
@@ -60,7 +74,7 @@ Verified flags auto-resolve when a later node fixes the issue. They are tuned fo
 
 Every node checkout: **safety-snapshot your current state → validate the target snapshot exists → restore into a NEW git worktree under `~/.sojourn/worktrees/` → hand you the native resume command** (`claude --resume <session> --fork-session`). Your working tree and your `.git` are never touched; snapshots live in a shadow git repo per project under `~/.sojourn/snapshots/`.
 
-Sojourn restores *conversation* + *whole-tree file state*. It **cannot** undo Bash side effects (`rm`, `mv`), DB migrations, network calls, or `git push` — the preflight panel warns you every time. One caveat on the conversation side: the native CLIs can only fork a resumed conversation from the session's current tip (e.g. `claude --resume … --fork-session`), so the resumed *conversation* continues from where the session left off, while the *filesystem* in the new worktree is restored exactly to the node you chose.
+Sojourn restores *conversation* + *whole-tree file state*. It **cannot** undo Bash side effects (`rm`, `mv`), DB migrations, network calls, or `git push` — the preflight panel warns you every time. For Claude Code sessions, restore also attempts **exact-node rewind**: a synthesized transcript so the resumed conversation truly starts at the chosen node (`claude --resume <newSessionId>`), not just the session's tip. It refuses honestly — falling back to the tip-mode `claude --resume <session> --fork-session` — when the ancestor chain is incomplete/cyclic or crosses a compaction boundary; OpenCode sessions always restore in tip mode. Either way the *filesystem* in the new worktree is restored exactly to the node you chose. See [docs/USAGE.md](docs/USAGE.md) for the full semantics.
 
 ## Architecture
 
