@@ -64,13 +64,39 @@ export class SojournRewindError extends Error {
  *   projection and the freshly-uuid'd synthesized one.
  * - `sessionId`: the ORIGINAL session id (rewritten to `newSessionId` in the
  *   synthesized file).
+ * - `targetNodeId`: the GRAPH node id the rewind targets — recorded in the
+ *   provenance sidecar so the daemon can parent the synthesized session to
+ *   its origin instead of ingesting a disconnected phantom (must-fix I3).
  */
 export interface ClaudeRewindPlan extends RewindPlan {
   sessionId: string;
+  targetNodeId: string;
   lineIndexes: number[];
   lineUuids: string[];
   expectedKinds: NodeKind[];
   expectedParentIndexes: (number | null)[];
+}
+
+/**
+ * Provenance sidecar written by `executeRewind` NEXT TO the synthesized
+ * transcript (`<newSessionId>.sojourn-rewind.json`). Transcript line content
+ * itself is never mutated to carry provenance — `claude --resume` must load
+ * exactly native shape — so this separate file is the only channel telling
+ * the daemon's ingest that (a) the session forked off `originNodeId` and
+ * (b) lines with these uuids are synthesized HISTORY, not new agent claims
+ * (T1 flag runs must skip them). Watchers ignore it by extension (.json,
+ * not .jsonl).
+ */
+export interface RewindSidecar {
+  originSessionId: string;
+  originNodeId: string;
+  /** The SYNTHESIZED transcript's line uuids, in file order. */
+  lineUuids: string[];
+}
+
+/** The sidecar path for a synthesized transcript path. */
+export function rewindSidecarPathFor(transcriptPath: string): string {
+  return transcriptPath.replace(/\.jsonl$/, "") + ".sojourn-rewind.json";
 }
 
 export interface PlanRewindInput {
@@ -93,7 +119,7 @@ const REASON_MISSING_LINES = "transcript lines missing for chain";
 const REASON_NO_TARGET = "target node not found in node set";
 const REASON_ROOT_UNRESOLVED = "transcript root has unresolved parent (truncated file?)";
 
-function refuse(sessionId: string, reason: string): ClaudeRewindPlan {
+function refuse(sessionId: string, targetNodeId: string, reason: string): ClaudeRewindPlan {
   return {
     mode: "tip",
     newSessionId: null,
@@ -101,6 +127,7 @@ function refuse(sessionId: string, reason: string): ClaudeRewindPlan {
     refusedReason: reason,
     resumeCommand: `claude --resume ${sessionId} --fork-session`,
     sessionId,
+    targetNodeId,
     lineIndexes: [],
     lineUuids: [],
     expectedKinds: [],
@@ -219,19 +246,19 @@ export function planRewind(input: PlanRewindInput): ClaudeRewindPlan {
 
   const byId = new Map<string, ChronoNode>(nodes.map((n) => [n.id, n]));
   const target = byId.get(targetNodeId);
-  if (!target) return refuse(sessionId, REASON_NO_TARGET);
+  if (!target) return refuse(sessionId, targetNodeId, REASON_NO_TARGET);
 
   // (1) Walk target → root via parentId, cycle-guarded.
   const chain: ChronoNode[] = [];
   const visited = new Set<string>();
   let current: ChronoNode = target;
   for (;;) {
-    if (visited.has(current.id)) return refuse(sessionId, REASON_CYCLE);
+    if (visited.has(current.id)) return refuse(sessionId, targetNodeId, REASON_CYCLE);
     visited.add(current.id);
     chain.push(current);
     if (current.parentId === null) break;
     const parent = byId.get(current.parentId);
-    if (!parent) return refuse(sessionId, REASON_ORPHAN);
+    if (!parent) return refuse(sessionId, targetNodeId, REASON_ORPHAN);
     current = parent;
   }
 
@@ -248,7 +275,7 @@ export function planRewind(input: PlanRewindInput): ClaudeRewindPlan {
     const node = chain[c];
     const nativeUuid = node.meta?.nativeUuid ?? node.id.replace(/^claude:/, "");
     const lineIndex = locateLine(nativeUuid, nativeIdIndex);
-    if (lineIndex === undefined) return refuse(sessionId, REASON_MISSING_LINES);
+    if (lineIndex === undefined) return refuse(sessionId, targetNodeId, REASON_MISSING_LINES);
     if (c === 0) targetLineIndex = lineIndex; // chain[0] is the target
     rootLineIndex = lineIndex; // last iteration is the chain root
     lineIndexSet.add(lineIndex);
@@ -266,7 +293,7 @@ export function planRewind(input: PlanRewindInput): ClaudeRewindPlan {
     rootParentUuid.length > 0 &&
     !nativeIdIndex.has(rootParentUuid)
   ) {
-    return refuse(sessionId, REASON_ROOT_UNRESOLVED);
+    return refuse(sessionId, targetNodeId, REASON_ROOT_UNRESOLVED);
   }
 
   // Dangling-tool_use honesty: for every tool_use block hosted on an
@@ -309,7 +336,7 @@ export function planRewind(input: PlanRewindInput): ClaudeRewindPlan {
   // after the target's line) don't affect the reconstructed prefix.
   for (const { index, rec } of parsed) {
     if (index >= minLine && index <= maxLine && isBoundaryLine(rec)) {
-      return refuse(sessionId, REASON_BOUNDARY);
+      return refuse(sessionId, targetNodeId, REASON_BOUNDARY);
     }
   }
 
@@ -327,7 +354,7 @@ export function planRewind(input: PlanRewindInput): ClaudeRewindPlan {
     "chain-projection.jsonl",
     lineIndexes.map((i) => rawLines[i]).join("\n"),
   );
-  if (!projection) return refuse(sessionId, REASON_MISSING_LINES);
+  if (!projection) return refuse(sessionId, targetNodeId, REASON_MISSING_LINES);
 
   // Pin each included line's uuid so executeRewind can verify it is reading
   // the SAME lines the plan was built from before writing anything.
@@ -335,7 +362,7 @@ export function planRewind(input: PlanRewindInput): ClaudeRewindPlan {
   for (const lineIndex of lineIndexes) {
     const uuid = recByLineIndex.get(lineIndex)?.uuid;
     if (typeof uuid !== "string" || uuid.length === 0) {
-      return refuse(sessionId, REASON_MISSING_LINES);
+      return refuse(sessionId, targetNodeId, REASON_MISSING_LINES);
     }
     lineUuids.push(uuid);
   }
@@ -348,6 +375,7 @@ export function planRewind(input: PlanRewindInput): ClaudeRewindPlan {
     refusedReason: null,
     resumeCommand: `claude --resume ${newSessionId}`,
     sessionId,
+    targetNodeId,
     lineIndexes,
     lineUuids,
     expectedKinds: projection.nodes.map((n) => n.kind),
@@ -532,6 +560,31 @@ export async function executeRewind(
     throw new SojournRewindError(
       `synthesized transcript failed round-trip validation (${failure}); file deleted`,
       "validation_mismatch",
+    );
+  }
+
+  // Provenance sidecar (V2 must-fix I3): written LAST, same atomic tmp +
+  // rename pattern, non-.jsonl so transcript watchers never ingest it. The
+  // pair is all-or-nothing — a synthesized transcript WITHOUT its sidecar
+  // would be exactly the disconnected, false-flag-prone phantom session the
+  // sidecar exists to prevent, so a failed sidecar write deletes the
+  // transcript and fails the rewind typed rather than leaving the phantom.
+  const sidecar: RewindSidecar = {
+    originSessionId: plan.sessionId,
+    originNodeId: plan.targetNodeId,
+    lineUuids: newUuidsInOrder,
+  };
+  const sidecarPath = rewindSidecarPathFor(transcriptPath);
+  const sidecarTmp = `${sidecarPath}.tmp-${crypto.randomUUID().slice(0, 8)}`;
+  try {
+    await fs.writeFile(sidecarTmp, JSON.stringify(sidecar, null, 2) + "\n", "utf8");
+    await fs.rename(sidecarTmp, sidecarPath);
+  } catch (err) {
+    await fs.rm(sidecarTmp, { force: true }).catch(() => {});
+    await fs.rm(transcriptPath, { force: true }).catch(() => {});
+    throw new SojournRewindError(
+      `failed to write rewind provenance sidecar: ${err instanceof Error ? err.message : String(err)}; transcript deleted`,
+      "write_failed",
     );
   }
 

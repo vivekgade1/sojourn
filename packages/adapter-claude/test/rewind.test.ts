@@ -383,6 +383,52 @@ describe("executeRewind", () => {
     expect(originalBytesAfter.equals(originalBytesBefore)).toBe(true);
   });
 
+  // V2 must-fix I3: the daemon's own watcher ingests every new .jsonl in
+  // the projects dir — including the transcript executeRewind just wrote.
+  // The sidecar is the provenance channel that lets ingest parent the
+  // synthesized session to its origin node and skip T1 flag runs on the
+  // synthesized (historical) lines. Transcript line CONTENT is never
+  // mutated to carry this — a resume must load exactly native shape.
+  it("writes a provenance sidecar next to the synthesized transcript: origin session + node, and the synthesized line uuids", async () => {
+    const plan = planFixture();
+    await executeRewind(plan, fixtureRaw.split("\n"));
+
+    const sidecarPath = path.join(projectsSubdir, `${plan.newSessionId}.sojourn-rewind.json`);
+    expect(existsSync(sidecarPath)).toBe(true);
+
+    const sidecar = JSON.parse(await readFile(sidecarPath, "utf8")) as {
+      originSessionId: string;
+      originNodeId: string;
+      lineUuids: string[];
+    };
+    expect(sidecar.originSessionId).toBe("session-abc");
+    expect(sidecar.originNodeId).toBe(TIP_TARGET);
+
+    // The sidecar pins the SYNTHESIZED transcript's line uuids, in order.
+    const synthesized = jsonLinesOf(await readFile(plan.transcriptPath!, "utf8"));
+    expect(sidecar.lineUuids).toEqual(synthesized.map((r) => r.uuid));
+
+    // The synthesized transcript itself carries no sojourn markers: line
+    // content must stay native-shaped for `claude --resume`.
+    for (const rec of synthesized) {
+      expect("sojournRewindOf" in rec).toBe(false);
+    }
+  });
+
+  it("writes NO sidecar for a tip-mode plan (execute is a no-op)", async () => {
+    const nodes = nodesOf(fixtureRaw).filter(
+      (n) => n.id !== "claude:44444444-4444-4444-4444-444444444444",
+    );
+    const plan = planFixture({ nodes });
+    expect(plan.mode).toBe("tip");
+
+    await executeRewind(plan, fixtureRaw.split("\n"));
+    const sidecars = readdirSync(projectsSubdir).filter((f) =>
+      f.endsWith(".sojourn-rewind.json"),
+    );
+    expect(sidecars).toEqual([]);
+  });
+
   it("truncates exactly at the target's line, dropping all post-target turns", async () => {
     const plan = planFixture({ targetNodeId: MID_LINE_TARGET });
     expect(plan.mode).toBe("exact");

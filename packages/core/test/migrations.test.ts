@@ -64,10 +64,10 @@ function userVersion(db: BetterSqlite3.Database): number {
 
 describe("runMigrations via GraphStore", () => {
   describe("fresh database", () => {
-    it("lands at user_version 2", () => {
+    it("lands at user_version 3", () => {
       const store = new GraphStore(":memory:");
       try {
-        expect(userVersion(rawDb(store))).toBe(2);
+        expect(userVersion(rawDb(store))).toBe(3);
       } finally {
         store.close();
       }
@@ -85,6 +85,54 @@ describe("runMigrations via GraphStore", () => {
         expect(col).toBeDefined();
         expect(col?.notnull).toBe(1);
         expect(col?.dflt_value).toBe("0");
+      } finally {
+        store.close();
+      }
+    });
+
+    it("v3: adds nodes.rewind_of, and meta.rewindOf round-trips through upsertNode/getNode", () => {
+      const store = new GraphStore(":memory:");
+      try {
+        const cols = (rawDb(store).prepare("PRAGMA table_info(nodes)").all() as Array<{
+          name: string;
+        }>).map((c) => c.name);
+        expect(cols).toContain("rewind_of");
+
+        store.upsertProject("/repo/rw", "RW");
+        const projectId = store.getProjects()[0].id;
+        store.upsertNode({
+          id: "claude:origin",
+          parentId: null,
+          kind: "assistant",
+          cli: "claude",
+          sessionId: "s-a",
+          projectId,
+          timestamp: "2026-01-01T00:00:00.000Z",
+          snapshotRef: null,
+          label: null,
+          summary: "",
+          content: {},
+          meta: { nativeUuid: "origin" },
+        });
+        store.upsertNode({
+          id: "claude:rewound-root",
+          parentId: "claude:origin",
+          kind: "prompt",
+          cli: "claude",
+          sessionId: "s-b",
+          projectId,
+          timestamp: "2026-01-02T00:00:00.000Z",
+          snapshotRef: null,
+          label: null,
+          summary: "",
+          content: {},
+          meta: { nativeUuid: "rewound-root", rewindOf: "claude:origin" },
+        });
+
+        const stored = store.getNode("claude:rewound-root")!;
+        expect(stored.meta.rewindOf).toBe("claude:origin");
+        // absent stays absent — no null leaking into meta
+        expect(store.getNode("claude:origin")!.meta.rewindOf).toBeUndefined();
       } finally {
         store.close();
       }
@@ -187,7 +235,7 @@ describe("runMigrations via GraphStore", () => {
       try {
         const db = rawDb(store);
 
-        expect(userVersion(db)).toBe(2);
+        expect(userVersion(db)).toBe(3);
         expect((db.prepare("SELECT COUNT(*) c FROM projects").get() as { c: number }).c).toBe(2);
         expect((db.prepare("SELECT COUNT(*) c FROM sessions").get() as { c: number }).c).toBe(1);
         expect((db.prepare("SELECT COUNT(*) c FROM nodes").get() as { c: number }).c).toBe(3);
@@ -217,16 +265,16 @@ describe("runMigrations via GraphStore", () => {
   });
 
   describe("reopen idempotence", () => {
-    it("reopening an already-migrated database is a no-op and stays at version 2", () => {
+    it("reopening an already-migrated database is a no-op and stays at version 3", () => {
       const dbPath = tmpDbPath();
 
       const first = new GraphStore(dbPath);
-      expect(userVersion(rawDb(first))).toBe(2);
+      expect(userVersion(rawDb(first))).toBe(3);
       first.close();
 
       const second = new GraphStore(dbPath);
       try {
-        expect(userVersion(rawDb(second))).toBe(2);
+        expect(userVersion(rawDb(second))).toBe(3);
         expect(() => second.getProjects()).not.toThrow();
       } finally {
         second.close();
@@ -240,7 +288,7 @@ describe("runMigrations via GraphStore", () => {
       seed.close();
 
       const first = new GraphStore(dbPath);
-      expect(userVersion(rawDb(first))).toBe(2);
+      expect(userVersion(rawDb(first))).toBe(3);
       first.close();
 
       // A second open must not attempt to re-add suppressed_count (which
@@ -378,16 +426,16 @@ describe("runMigrations failure handling", () => {
 });
 
 describe("MIGRATIONS", () => {
-  it("is the ordered list runMigrations uses by default, currently reaching version 2", () => {
-    expect(MIGRATIONS.map((m) => m.version)).toEqual([2]);
+  it("is the ordered list runMigrations uses by default, currently reaching version 3", () => {
+    expect(MIGRATIONS.map((m) => m.version)).toEqual([2, 3]);
   });
 
   it("running the real list twice in a row is idempotent", () => {
     const db = new Database(":memory:");
     db.exec(V1_DDL);
     runMigrations(db);
-    expect(userVersion(db)).toBe(2);
+    expect(userVersion(db)).toBe(3);
     expect(() => runMigrations(db)).not.toThrow();
-    expect(userVersion(db)).toBe(2);
+    expect(userVersion(db)).toBe(3);
   });
 });

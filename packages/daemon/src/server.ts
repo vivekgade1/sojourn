@@ -18,6 +18,7 @@ import type {
   StoredFlag,
 } from "@sojourn/core";
 import {
+  applyBudgets,
   getSessionHealth,
   harvest as coreHarvest,
   harvestPreflight as coreHarvestPreflight,
@@ -498,7 +499,12 @@ export function createApp(deps: ServerDeps): Express {
         const ctx = await buildCheckContext(deps, fetchJson, node);
         const llm = criticFor(apiKey);
         const flags = await runCritic(llm, ctx);
-        for (const f of flags) deps.store.addFlag(node.id, f);
+        // Budget the critic's output exactly like ingest would (V2 must-fix
+        // I2): the advisory per-turn budget applies here too, so a manual
+        // T2 run can never flood a node past what capture would keep.
+        const { kept, digests } = applyBudgets(flags);
+        for (const f of kept) deps.store.addFlag(node.id, f);
+        for (const d of digests) deps.store.addFlag(node.id, d);
 
         // Broadcast the node's FULL current flag list so clients replace,
         // never merge (same contract as the ingest pipeline's broadcasts).
@@ -525,7 +531,16 @@ export function createApp(deps: ServerDeps): Express {
     try {
       const ctx = await buildCheckContext(deps, fetchJson, node);
       const flags = await deps.flagEngine.runOnNode(ctx);
-      for (const f of flags) deps.store.addFlag(node.id, f);
+      // Same budget pass ingest applies (V2 must-fix I2). Without it, a
+      // manual re-run on a storm node re-persists every claim the ingest
+      // digest suppressed (distinct evidence -> fresh rows), while the
+      // digest still says "+N similar suppressed" — double-counted health,
+      // and the storm the budgets exist to contain lands anyway. Budgeting
+      // here keeps the kept set identical (store-level (node_id, kind,
+      // evidence) dedup) and reconciles the digest row in place.
+      const { kept, digests } = applyBudgets(flags);
+      for (const f of kept) deps.store.addFlag(node.id, f);
+      for (const d of digests) deps.store.addFlag(node.id, d);
 
       // Broadcast (and return) the node's FULL current flag list so clients
       // replace, never merge.

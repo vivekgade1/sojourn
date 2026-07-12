@@ -98,10 +98,24 @@ export class ShadowSnapshotter implements SnapshotterLike {
   }
 
   private get env(): ShadowGitEnv {
+    // The ingest index file is PER-ROOT (V2 must-fix C1): worktree-project
+    // aliasing gives two ShadowSnapshotters for the SAME project id — same
+    // shadowDir, different projectRoot. A single shared `sojourn-index`
+    // would let a concurrent snapshot from the other root interleave
+    // between this root's `add -A` and `write-tree`, silently producing the
+    // OTHER root's tree (cross-root snapshot corruption). Deriving the
+    // index name from the projectRoot (the snapshotSafety() pattern, but
+    // stable so successive snapshots of one root stay incremental) makes
+    // the two roots' index state physically disjoint.
+    const rootHash = crypto
+      .createHash("sha256")
+      .update(this.projectRoot)
+      .digest("hex")
+      .slice(0, 8);
     return {
       GIT_DIR: this.shadowDir,
       GIT_WORK_TREE: this.projectRoot,
-      GIT_INDEX_FILE: path.join(this.shadowDir, "sojourn-index"),
+      GIT_INDEX_FILE: path.join(this.shadowDir, `sojourn-index-${rootHash}`),
     };
   }
 
@@ -124,25 +138,54 @@ export class ShadowSnapshotter implements SnapshotterLike {
     );
   }
 
+  /** Bounded attempts for snapshot()'s CAS head append. Each retry re-reads
+   * the head and re-parents, so persistent failure requires the ref to move
+   * between read and update this many times in a row — effectively never. */
+  private static readonly MAX_HEAD_CAS_ATTEMPTS = 5;
+
   async snapshot(): Promise<string> {
     await runGit(["add", "-A"], this.env);
     const tree = (await runGit(["write-tree"], this.env)).trim();
 
-    const prevHead = await this.currentHeadCommit();
-    const commitArgs = ["commit-tree", tree, "-m", "snap"];
-    if (prevHead) {
-      commitArgs.push("-p", prevHead);
+    // Compare-and-swap head append (V2 must-fix C1): two snapshotters
+    // sharing one shadowDir (worktree aliasing) can race the prevHead ->
+    // commit-tree -> update-ref sequence; an unconditional update-ref
+    // makes the loser's commit unreachable from refs/sojourn/head, and
+    // `soj gc` (which walks only the head chain) would then silently prune
+    // a snapshot the graph still advertises as restorable. The 3-arg
+    // update-ref form only succeeds while the ref still equals the value
+    // read above ("" = must not exist yet); on failure, re-read the moved
+    // head, re-parent, and retry — bounded, then fail soft by THROWING
+    // (callers treat a failed snapshot as "skipped", never as a
+    // silently-orphaned success).
+    for (let attempt = 0; attempt < ShadowSnapshotter.MAX_HEAD_CAS_ATTEMPTS; attempt++) {
+      const prevHead = await this.currentHeadCommit();
+      const commitArgs = ["commit-tree", tree, "-m", "snap"];
+      if (prevHead) {
+        commitArgs.push("-p", prevHead);
+      }
+      const commit = (await runGit(commitArgs, this.env)).trim();
+      try {
+        await runGit(
+          ["update-ref", SOJOURN_HEAD_REF, commit, prevHead ?? ""],
+          this.env,
+        );
+        return tree;
+      } catch {
+        // Head moved (or appeared) between read and CAS — retry against
+        // the new tip. The dangling commit object is harmless: it is
+        // unreferenced and gets reaped by git's normal gc grace handling.
+      }
     }
-    const commit = (await runGit(commitArgs, this.env)).trim();
-    await runGit(["update-ref", SOJOURN_HEAD_REF, commit], this.env);
-
-    return tree;
+    throw new Error(
+      `snapshot: refs/sojourn/head kept moving; gave up after ${ShadowSnapshotter.MAX_HEAD_CAS_ATTEMPTS} CAS attempts (tree ${tree} was NOT recorded)`,
+    );
   }
 
   /**
    * Concurrency-safe sibling of snapshot(): captures the working tree using
    * a PRIVATE temp index and records the commit on refs/sojourn/safety —
-   * never the shared ingest index or refs/sojourn/head. Restore's safety
+   * never the (per-root) ingest index or refs/sojourn/head. Restore's safety
    * snapshot uses this so it can run while capture is mid-snapshot.
    * (Git object-database writes are concurrency-safe; the only shared
    * mutable state in snapshot() is the index file and the head ref, and

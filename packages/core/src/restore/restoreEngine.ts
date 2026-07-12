@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
 import type { GraphStore } from "../store/index.js";
+import { findEffectiveTree } from "../store/effectiveTree.js";
 import type { SnapshotterLike } from "../interfaces.js";
 import type { ChronoNode, Project, RestorePreflight, RestoreResult } from "../types.js";
 
@@ -98,30 +99,10 @@ async function claimDest(baseDest: string): Promise<string> {
 }
 
 /** Returns the node's own `snapshotRef` if set, otherwise walks `parentId`
- * ancestors upward until one with a non-null `snapshotRef` is found. */
-function findTreeHash(
-  store: GraphStore,
-  node: ChronoNode,
-): { treeHash: string | null; sourceNodeId: string } {
-  if (node.snapshotRef !== null) {
-    return { treeHash: node.snapshotRef, sourceNodeId: node.id };
-  }
-
-  const seen = new Set<string>([node.id]);
-  let current = node;
-  while (current.parentId !== null) {
-    if (seen.has(current.parentId)) break; // guard against cycles
-    const parent = store.getNode(current.parentId);
-    if (!parent) break;
-    if (parent.snapshotRef !== null) {
-      return { treeHash: parent.snapshotRef, sourceNodeId: parent.id };
-    }
-    seen.add(parent.id);
-    current = parent;
-  }
-
-  return { treeHash: null, sourceNodeId: node.id };
-}
+ * ancestors upward until one with a non-null `snapshotRef` is found.
+ * Extracted to `store/effectiveTree.ts` (shared with gc's `collectPins`) so
+ * restore semantics and pin semantics can never drift apart. */
+const findTreeHash = findEffectiveTree;
 
 export class RestoreEngine {
   private readonly store: GraphStore;

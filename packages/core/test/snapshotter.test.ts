@@ -4,6 +4,7 @@ import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { ShadowSnapshotter } from "../src/snapshot/index.js";
+import { runGit } from "../src/snapshot/git.js";
 
 describe("ShadowSnapshotter", () => {
   let projectRoot: string;
@@ -353,5 +354,81 @@ describe("ShadowSnapshotter", () => {
     } finally {
       fs.rmSync(dest, { recursive: true, force: true });
     }
+  });
+
+  // ——— V2 must-fix C1: two roots sharing one shadow repo ————————————————
+  //
+  // Worktree-project aliasing (V2 Task 7) creates a SECOND snapshotter for
+  // the same project id with a different projectRoot but the SAME shadowDir.
+  // snapshot() must therefore (a) never share a mutable index file between
+  // roots, and (b) append to refs/sojourn/head with a compare-and-swap so a
+  // concurrent snapshot from the other root can never orphan a commit
+  // (an orphaned commit's tree would be silently reaped by `soj gc`).
+  describe("cross-root concurrency (shared shadowDir)", () => {
+    let rootB: string;
+    let snapshotterB: ShadowSnapshotter;
+
+    beforeEach(async () => {
+      rootB = fs.mkdtempSync(path.join(os.tmpdir(), "sojourn-project-b-"));
+      snapshotterB = new ShadowSnapshotter({ projectRoot: rootB, shadowDir });
+      await snapshotterB.init();
+    });
+
+    afterEach(() => {
+      fs.rmSync(rootB, { recursive: true, force: true });
+    });
+
+    it("concurrent snapshot() calls from two roots each capture exactly their own root's files", async () => {
+      // Several rounds: without a per-root index, the interleave
+      // (A add -> B add -> A write-tree) makes A's tree list B's files.
+      for (let round = 0; round < 5; round++) {
+        await fsp.writeFile(path.join(projectRoot, "mainline.txt"), `mainline-${round}`);
+        await fsp.writeFile(path.join(rootB, "branch.txt"), `branch-${round}`);
+
+        const [treeA, treeB] = await Promise.all([
+          snapshotter.snapshot(),
+          snapshotterB.snapshot(),
+        ]);
+
+        expect((await snapshotter.listFiles(treeA)).sort()).toEqual(["mainline.txt"]);
+        expect((await snapshotter.listFiles(treeB)).sort()).toEqual(["branch.txt"]);
+        expect(await snapshotter.readFile(treeA, "mainline.txt")).toBe(`mainline-${round}`);
+        expect(await snapshotter.readFile(treeB, "branch.txt")).toBe(`branch-${round}`);
+      }
+    });
+
+    it("keeps EVERY concurrent snapshot's commit reachable from refs/sojourn/head (CAS append, no orphaned commits)", async () => {
+      const expectedTrees = new Set<string>();
+      for (let round = 0; round < 5; round++) {
+        await fsp.writeFile(path.join(projectRoot, "mainline.txt"), `m-${round}`);
+        await fsp.writeFile(path.join(rootB, "branch.txt"), `b-${round}`);
+        const [treeA, treeB] = await Promise.all([
+          snapshotter.snapshot(),
+          snapshotterB.snapshot(),
+        ]);
+        expectedTrees.add(treeA);
+        expectedTrees.add(treeB);
+      }
+
+      // Walk refs/sojourn/head: every snapshot's tree must be reachable —
+      // a lost head update would leave that snapshot's commit orphaned and
+      // therefore eligible for `soj gc` pruning while the graph still
+      // advertises the node as restorable.
+      const env = {
+        GIT_DIR: shadowDir,
+        GIT_WORK_TREE: projectRoot,
+        GIT_INDEX_FILE: path.join(shadowDir, "unused-index"),
+      };
+      const out = await runGit(["log", "--format=%T", "refs/sojourn/head"], env);
+      const reachableTrees = new Set(
+        out
+          .split("\n")
+          .map((l) => l.trim())
+          .filter((l) => l.length > 0),
+      );
+      for (const tree of expectedTrees) {
+        expect(reachableTrees.has(tree)).toBe(true);
+      }
+    });
   });
 });

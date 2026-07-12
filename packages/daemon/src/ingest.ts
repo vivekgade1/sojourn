@@ -13,8 +13,10 @@ import type {
   SnapshotterLike,
 } from "@sojourn/core";
 import { applyBudgets, autoResolveFlags } from "@sojourn/core";
+import { rewindSidecarPathFor } from "@sojourn/adapter-claude";
 import type { SojournEvent } from "./events.js";
 import type { TranscriptIndex } from "./transcripts.js";
+import { runSerialized } from "./serialize.js";
 
 export interface EventsSink {
   broadcast(event: SojournEvent): void;
@@ -110,6 +112,83 @@ export function readRestoreManifest(root: string): WorktreeRestoreManifest | nul
   }
 }
 
+interface ResolvedRewindSidecar {
+  originNodeId: string;
+  /** Synthesized transcript LINE uuids — nodes hosted on these lines are
+   * copied history, not new agent claims. */
+  lineUuids: Set<string>;
+}
+
+/**
+ * Rewind provenance (V2 must-fix I3): a transcript synthesized by
+ * `executeRewind` carries a `<sessionId>.sojourn-rewind.json` sidecar next
+ * to it. When present, ingest (a) parents the session's root to the rewind
+ * origin node (`meta.rewindOf`) instead of adding a disconnected phantom
+ * session, and (b) skips T1 flag runs for nodes whose line uuid the sidecar
+ * pins — old prose re-evaluated against TODAY's tree would otherwise mint
+ * false VERIFIED flags (and could flip `soj gate` red) as a direct side
+ * effect of running a restore.
+ *
+ * Fails soft: no transcript index entry, no sidecar (the overwhelmingly
+ * common case — logs nothing), or an unreadable/invalid sidecar returns
+ * null after at most one stderr line, and the batch ingests normally.
+ */
+function resolveRewindSidecar(
+  deps: IngestDeps,
+  sessionId: string,
+): ResolvedRewindSidecar | null {
+  const rec = deps.transcripts?.get(sessionId);
+  if (!rec || !rec.transcriptPath) return null;
+  const sidecarPath = rewindSidecarPathFor(rec.transcriptPath);
+
+  let raw: string;
+  try {
+    raw = fs.readFileSync(sidecarPath, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      console.error(
+        `[sojourn] ingest: failed to read rewind sidecar at ${sidecarPath}:`,
+        err,
+      );
+    }
+    return null;
+  }
+
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed === null || typeof parsed !== "object") {
+      console.error(`[sojourn] ingest: invalid rewind sidecar at ${sidecarPath}: not an object`);
+      return null;
+    }
+    const originNodeId = (parsed as { originNodeId?: unknown }).originNodeId;
+    const lineUuids = (parsed as { lineUuids?: unknown }).lineUuids;
+    if (
+      typeof originNodeId !== "string" ||
+      originNodeId.length === 0 ||
+      !Array.isArray(lineUuids) ||
+      !lineUuids.every((u): u is string => typeof u === "string" && u.length > 0)
+    ) {
+      console.error(
+        `[sojourn] ingest: invalid rewind sidecar at ${sidecarPath}: missing "originNodeId"/"lineUuids"`,
+      );
+      return null;
+    }
+    return { originNodeId, lineUuids: new Set(lineUuids) };
+  } catch (err) {
+    console.error(`[sojourn] ingest: failed to parse rewind sidecar at ${sidecarPath}:`, err);
+    return null;
+  }
+}
+
+/** The transcript LINE uuid hosting a node: `meta.nativeUuid` (falling back
+ * to the id sans `claude:` prefix) with any `#<blockIndex>` suffix stripped —
+ * the same base-uuid addressing the rewind planner uses. */
+function baseLineUuidOf(node: ChronoNode): string {
+  const nativeUuid = node.meta?.nativeUuid ?? node.id.replace(/^claude:/, "");
+  const hash = nativeUuid.indexOf("#");
+  return hash > 0 ? nativeUuid.slice(0, hash) : nativeUuid;
+}
+
 /** First 8 characters of a node id AFTER its `${cli}:` prefix, e.g.
  * `"claude:abc123def456"` -> `"abc123de"`. Falls back to the first 8 chars
  * of the whole id when there's no colon. */
@@ -199,6 +278,31 @@ export async function ingestBatch(
     return { added };
   }
 
+  // Rewind provenance (V2 must-fix I3): sidecar-marked sessions are
+  // synthesized by our own restore/rewind path. `rewindLineUuids` gates the
+  // flag phase below (synthesized history is not new agent claims);
+  // `rewindOriginId` supplies the graph edge that keeps the session
+  // connected. Fail-soft throughout — a missing/invalid sidecar (or an
+  // origin node that no longer exists) just means normal ingest.
+  let rewindOriginId: string | null = null;
+  let rewindLineUuids: Set<string> | null = null;
+  try {
+    const sidecar = resolveRewindSidecar(deps, batch.session.id);
+    if (sidecar) {
+      rewindLineUuids = sidecar.lineUuids;
+      if (store.getNode(sidecar.originNodeId)) {
+        rewindOriginId = sidecar.originNodeId;
+      } else {
+        console.error(
+          `[sojourn] ingest: rewind sidecar for session ${batch.session.id} references unknown ` +
+            `node ${sidecar.originNodeId}; ingesting without a rewind parent edge`,
+        );
+      }
+    }
+  } catch (err) {
+    console.error("[sojourn] ingest: rewind sidecar resolution failed:", err);
+  }
+
   try {
     store.upsertSession({
       id: batch.session.id,
@@ -211,11 +315,25 @@ export async function ingestBatch(
   }
 
   const newNodes: ChronoNode[] = [];
-  // Aliased batches get exactly one fork edge per batch: the first node
-  // whose parent doesn't resolve (the transcript's own session root, whose
-  // parser-assigned parentId is always null — or an orphaned reference) is
-  // reparented to the origin node, with meta.forkedFrom recording the
-  // branch-to-origin edge.
+  // Synthetic parent edge for this batch, if any: worktree-aliased batches
+  // get a fork edge to the restore origin (meta.forkedFrom); rewind-
+  // synthesized sessions get a rewind edge to the rewind target
+  // (meta.rewindOf). When a session is somehow both (a rewind of a session
+  // that ran in a worktree), the rewind edge wins — it names the exact node
+  // the conversation was cut back to, which is strictly more precise than
+  // the worktree's restore origin.
+  const syntheticParent =
+    rewindOriginId !== null
+      ? { id: rewindOriginId, metaKey: "rewindOf" as const }
+      : originNodeId !== null
+        ? { id: originNodeId, metaKey: "forkedFrom" as const }
+        : null;
+
+  // Aliased/rewind batches get exactly one such edge per batch: the first
+  // node whose parent doesn't resolve (the transcript's own session root,
+  // whose parser-assigned parentId is always null — or an orphaned
+  // reference) is reparented to the origin node, with the meta key
+  // recording the branch-to-origin edge.
   //
   // This is NOT gated on the node being new to the store: adapters re-parse
   // the whole transcript file on every batch (see the doc comment on this
@@ -237,12 +355,12 @@ export async function ingestBatch(
       const isNew = existing === null;
 
       const takesForkEdge =
-        originNodeId !== null &&
+        syntheticParent !== null &&
         !forkEdgeApplied &&
         (node.parentId === null || store.getNode(node.parentId) === null);
-      if (takesForkEdge && originNodeId !== null) {
-        node.parentId = originNodeId;
-        node.meta = { ...node.meta, forkedFrom: originNodeId };
+      if (takesForkEdge && syntheticParent !== null) {
+        node.parentId = syntheticParent.id;
+        node.meta = { ...node.meta, [syntheticParent.metaKey]: syntheticParent.id };
       }
 
       store.upsertNode(node);
@@ -284,9 +402,25 @@ export async function ingestBatch(
 
   if (snapshotAnchors.length > 0 && projectRootExists(diskRoot)) {
     try {
-      snapshotter = deps.snapshotterFor(snapshotProject);
-      await snapshotter.init();
-      nodeTree = await snapshotter.snapshot();
+      // Serialize the SNAPSHOT phase per PROJECT ID (V2 must-fix C1). The
+      // callers' outer serializer keys on the batch's DISK root, but a
+      // mainline batch and an aliased-worktree batch for the same project
+      // id carry different roots — so they run concurrently into ONE
+      // shadow repo. The snapshotter itself is now safe against that
+      // (per-root index, CAS head append), and this per-project-id lock is
+      // the belt-and-braces layer: the two writers never even overlap.
+      // Aliased batches resolved their origin project ABOVE, so project.id
+      // here is always the shadow repo actually written to. The
+      // `snapshot::` prefix keeps these keys disjoint from the outer
+      // serializer's path-shaped keys.
+      const taken = await runSerialized(`snapshot::${project.id}`, async () => {
+        const snap = deps.snapshotterFor(snapshotProject);
+        await snap.init();
+        const tree = await snap.snapshot();
+        return { snap, tree };
+      });
+      snapshotter = taken.snap;
+      nodeTree = taken.tree;
       const last = newNodes[newNodes.length - 1];
       store.setSnapshotRef(last.id, nodeTree);
       last.snapshotRef = nodeTree;
@@ -298,7 +432,16 @@ export async function ingestBatch(
   }
 
   // Run T1 flags on new assistant nodes, budgeted per turn segment.
-  const newAssistantNodes = newNodes.filter((n) => n.kind === "assistant");
+  // Rewind-synthesized nodes (line uuid pinned in the sidecar) are SKIPPED:
+  // they are copied history from the origin session, not new agent claims —
+  // re-checking their old prose against today's tree would fabricate
+  // verified flags (must-fix I3). Nodes beyond the synthesized set (a real
+  // resumed continuation appended to the same transcript) flag normally.
+  const newAssistantNodes = newNodes.filter(
+    (n) =>
+      n.kind === "assistant" &&
+      !(rewindLineUuids !== null && rewindLineUuids.has(baseLineUuidOf(n))),
+  );
   if (newAssistantNodes.length > 0) {
     interface FlagProduction {
       node: ChronoNode;

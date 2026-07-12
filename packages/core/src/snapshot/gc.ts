@@ -3,6 +3,7 @@ import path from "node:path";
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import type { GraphStore } from "../store/index.js";
+import { findEffectiveTree } from "../store/effectiveTree.js";
 import { runGit, type ShadowGitEnv } from "./git.js";
 
 const execFileAsync = promisify(execFile);
@@ -28,6 +29,13 @@ const PINNED_NODE_KINDS = new Set(["decision", "assumption", "checkpoint"]);
  *    worktrees. This function does no filesystem I/O itself; the manifest
  *    scan is the caller's job (daemon/CLI own the worktrees directory, not
  *    the store).
+ *
+ * Pin-worthy nodes with a NULL `snapshotRef` (every real `/api/mark` node,
+ * harvest merge nodes, flagged prompt nodes, ...) pin their EFFECTIVE tree:
+ * the nearest ancestor `snapshotRef`, resolved with the exact same walk
+ * `RestoreEngine` uses (`findEffectiveTree` — V2 must-fix I1). That is the
+ * tree restoring the node would actually check out, so pin semantics and
+ * restore semantics are identical by construction.
  */
 export function collectPins(
   store: GraphStore,
@@ -36,10 +44,11 @@ export function collectPins(
 ): Set<string> {
   const pins = new Set<string>(extraPins);
   for (const node of store.getGraph(projectId)) {
-    if (node.snapshotRef === null) continue;
     const isPinnedKind = PINNED_NODE_KINDS.has(node.kind);
     const hasFlags = (node.flags?.length ?? 0) > 0;
-    if (isPinnedKind || hasFlags) pins.add(node.snapshotRef);
+    if (!isPinnedKind && !hasFlags) continue;
+    const { treeHash } = findEffectiveTree(store, node);
+    if (treeHash !== null) pins.add(treeHash);
   }
   return pins;
 }

@@ -9,6 +9,7 @@ import { ShadowSnapshotter } from "../src/snapshot/shadowSnapshotter.js";
 import { runGit, type ShadowGitEnv } from "../src/snapshot/git.js";
 import { gcShadowRepo, collectPins } from "../src/snapshot/gc.js";
 import { GraphStore } from "../src/store/index.js";
+import { RestoreEngine } from "../src/restore/restoreEngine.js";
 import type { ChronoNode, Flag } from "../src/types.js";
 
 const execFileAsync = promisify(execFile);
@@ -335,6 +336,65 @@ describe("gcShadowRepo", () => {
     }
   });
 
+  it("end-to-end (V2 must-fix I1): a mark-shaped checkpoint (null snapshotRef) pins its EFFECTIVE ancestor tree through a real gc run, and restore of the mark still works afterwards", async () => {
+    const store = new GraphStore(":memory:");
+    const worktrees = fs.mkdtempSync(path.join(os.tmpdir(), "sojourn-gc-mark-worktrees-"));
+    try {
+      const project = store.upsertProject(projectRoot, "gc-mark");
+      const base = {
+        parentId: null as string | null,
+        kind: "assistant" as ChronoNode["kind"],
+        cli: "claude" as const,
+        sessionId: "s-mark",
+        projectId: project.id,
+        timestamp: "2026-01-01T00:00:00.000Z",
+        snapshotRef: null as string | null,
+        label: null,
+        summary: "",
+        content: {},
+      };
+      // Ordinary assistant node carrying snapshot #1's tree (40 days old —
+      // prune-eligible on age), with a /api/mark-shaped checkpoint child:
+      // snapshotRef NULL, exactly as the daemon's /api/mark route creates it.
+      store.upsertNode({ ...base, id: "claude:mark-parent", snapshotRef: treeHashes[0], meta: { nativeUuid: "mark-parent" } });
+      store.upsertNode({
+        ...base,
+        id: "claude:mark-node",
+        parentId: "claude:mark-parent",
+        kind: "checkpoint",
+        label: "before big refactor",
+        meta: { nativeUuid: "mark-node" },
+      });
+
+      // The mark's effective tree (its parent's) must be pinned...
+      const pins = collectPins(store, project.id);
+      expect(pins.has(treeHashes[0])).toBe(true);
+
+      // ...and a REAL gc run must keep it (only #2/#3/#4 age out).
+      const result = await gcShadowRepo(
+        { shadowDir },
+        { keepDays: 3, pins, dryRun: false, now: fixedNow() },
+      );
+      expect(result.prunedCommits).toBe(3);
+      await pruneUnreachableNowForTest();
+      expect(await snapshotter.hasTree(treeHashes[0])).toBe(true);
+
+      // Restoring the checkpoint node itself still works post-gc: the
+      // ancestor walk lands on the (still reachable) parent tree.
+      const engine = new RestoreEngine({
+        store,
+        snapshotterFor: () => snapshotter,
+        worktreesDir: worktrees,
+      });
+      const restored = await engine.restore("claude:mark-node");
+      const content = await fsp.readFile(path.join(restored.worktreePath, "state.txt"), "utf8");
+      expect(content).toBe("snapshot-1");
+    } finally {
+      store.close();
+      fs.rmSync(worktrees, { recursive: true, force: true });
+    }
+  });
+
   it("returns an all-zero result for a freshly-initialized shadow repo with no snapshots yet", async () => {
     const emptyShadow = fs.mkdtempSync(path.join(os.tmpdir(), "sojourn-gc-empty-"));
     try {
@@ -427,8 +487,72 @@ describe("collectPins", () => {
     expect(pins).toEqual(new Set(["tree-decision", "tree-from-manifest"]));
   });
 
-  it("ignores nodes without a snapshotRef even if otherwise pin-worthy", () => {
+  it("leaves a pin-worthy node unpinned only when NO ancestor holds a tree either (nothing to protect)", () => {
     store.upsertNode(makeNode({ id: "claude:d1", kind: "decision", snapshotRef: null }));
+    expect(collectPins(store, projectId).size).toBe(0);
+  });
+
+  // V2 must-fix I1: every real mark comes from /api/mark, which creates the
+  // node with snapshotRef null — the tree a checkpoint actually restores to
+  // lives on an ANCESTOR (the same walk RestoreEngine.findTreeHash does).
+  // collectPins must resolve that effective tree, or `soj gc` prunes the
+  // snapshot behind every user checkpoint while USAGE.md promises it's kept.
+  it("pins the EFFECTIVE tree (nearest ancestor snapshotRef) for mark-shaped pinned-kind nodes with a null snapshotRef", () => {
+    store.upsertNode(
+      makeNode({ id: "claude:anchor", kind: "assistant", snapshotRef: "tree-anchor" }),
+    );
+    store.upsertNode(
+      makeNode({
+        id: "claude:between",
+        kind: "assistant",
+        parentId: "claude:anchor",
+        snapshotRef: null,
+      }),
+    );
+    store.upsertNode(
+      makeNode({
+        id: "claude:mark1",
+        kind: "checkpoint",
+        parentId: "claude:between",
+        snapshotRef: null,
+      }),
+    );
+
+    const pins = collectPins(store, projectId);
+    expect(pins.has("tree-anchor")).toBe(true);
+  });
+
+  it("pins the effective ancestor tree for FLAGGED nodes with a null snapshotRef too", () => {
+    store.upsertNode(
+      makeNode({ id: "claude:f-anchor", kind: "assistant", snapshotRef: "tree-flag-anchor" }),
+    );
+    store.upsertNode(
+      makeNode({
+        id: "claude:f-null",
+        kind: "assistant",
+        parentId: "claude:f-anchor",
+        snapshotRef: null,
+      }),
+    );
+    store.addFlag("claude:f-null", baseFlag);
+
+    const pins = collectPins(store, projectId);
+    expect(pins.has("tree-flag-anchor")).toBe(true);
+  });
+
+  it("does not walk ancestors for nodes that are neither pinned-kind nor flagged", () => {
+    store.upsertNode(
+      makeNode({ id: "claude:plain-anchor", kind: "assistant", snapshotRef: "tree-plain-anchor" }),
+    );
+    store.upsertNode(
+      makeNode({
+        id: "claude:plain-child",
+        kind: "assistant",
+        parentId: "claude:plain-anchor",
+        snapshotRef: null,
+      }),
+    );
+    // The anchor itself is unflagged/plain, so nothing pins its tree.
     expect(collectPins(store, projectId).size).toBe(0);
   });
 

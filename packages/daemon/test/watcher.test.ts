@@ -1,0 +1,98 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import fs from "node:fs";
+import fsp from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { GraphStore, FlagEngine, ShadowSnapshotter } from "@sojourn/core";
+import type { FetchJson, Project, SnapshotterLike } from "@sojourn/core";
+import { startWatcher, type WatcherHandle } from "../src/watcher.js";
+import { TranscriptIndex } from "../src/transcripts.js";
+import type { IngestDeps } from "../src/ingest.js";
+
+/** Polls until `cond()` is true or `ms` elapsed. */
+async function waitFor(cond: () => boolean, ms = 5000): Promise<boolean> {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (cond()) return true;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  return cond();
+}
+
+describe("startWatcher — rewind sidecar tolerance (V2 must-fix I3)", () => {
+  let watchDir: string;
+  let projectRoot: string;
+  let shadowRoot: string;
+  let store: GraphStore;
+  let transcripts: TranscriptIndex;
+  let handle: WatcherHandle | null = null;
+
+  beforeEach(() => {
+    watchDir = fs.mkdtempSync(path.join(os.tmpdir(), "sojourn-watcher-dir-"));
+    projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "sojourn-watcher-project-"));
+    shadowRoot = fs.mkdtempSync(path.join(os.tmpdir(), "sojourn-watcher-shadow-"));
+    store = new GraphStore(":memory:");
+    transcripts = new TranscriptIndex();
+  });
+
+  afterEach(async () => {
+    if (handle) await handle.close();
+    handle = null;
+    store.close();
+    for (const d of [watchDir, projectRoot, shadowRoot]) {
+      fs.rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  function makeDeps(): IngestDeps {
+    return {
+      store,
+      flagEngine: new FlagEngine(),
+      events: { broadcast() {} },
+      fetchJson: vi.fn(async () => ({ status: 200, body: {} })) as unknown as FetchJson,
+      transcripts,
+      snapshotterFor(project: Project): SnapshotterLike {
+        return new ShadowSnapshotter({
+          projectRoot: project.root,
+          shadowDir: path.join(shadowRoot, project.id),
+        });
+      },
+    };
+  }
+
+  it("ignores .sojourn-rewind.json sidecar files (non-.jsonl) while still ingesting real transcripts", async () => {
+    const errorSpy = vi.spyOn(console, "error");
+    handle = startWatcher(makeDeps(), watchDir);
+
+    // A sidecar landing in the watched dir (exactly what executeRewind
+    // writes next to its synthesized transcript) must be a non-event.
+    await fsp.writeFile(
+      path.join(watchDir, "some-session.sojourn-rewind.json"),
+      JSON.stringify({ originSessionId: "s", originNodeId: "claude:x", lineUuids: ["u"] }),
+      "utf8",
+    );
+
+    // A real transcript next to it ingests normally.
+    const line = JSON.stringify({
+      type: "user",
+      uuid: "watch-u1",
+      parentUuid: null,
+      sessionId: "watch-session",
+      cwd: projectRoot,
+      timestamp: "2026-01-01T00:00:00.000Z",
+      message: { role: "user", content: "hello" },
+    });
+    await fsp.writeFile(path.join(watchDir, "watch-session.jsonl"), line + "\n", "utf8");
+
+    const ingested = await waitFor(() => store.getNode("claude:watch-u1") !== null);
+    expect(ingested).toBe(true);
+
+    // The sidecar itself never entered the pipeline: no scan failure was
+    // logged for it, and nothing sidecar-shaped reached the store.
+    const sidecarErrors = errorSpy.mock.calls.filter((args) =>
+      args.some((a) => typeof a === "string" && a.includes("sojourn-rewind.json")),
+    );
+    expect(sidecarErrors).toEqual([]);
+    errorSpy.mockRestore();
+  });
+});

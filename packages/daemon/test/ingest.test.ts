@@ -8,6 +8,7 @@ import { GraphStore, ShadowSnapshotter, FlagEngine } from "@sojourn/core";
 import type { ChronoNode, FetchJson, IngestBatch, Project, SnapshotterLike } from "@sojourn/core";
 import { parseSessionJsonl } from "@sojourn/adapter-claude";
 import { ingestBatch, type IngestDeps } from "../src/ingest.js";
+import { TranscriptIndex } from "../src/transcripts.js";
 import type { SojournEvent } from "../src/events.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -796,6 +797,280 @@ describe("ingestBatch", () => {
         expect(originOnlyContent).toBeNull();
       } finally {
         fs.rmSync(worktreeRoot, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe("concurrent mainline + worktree ingest (V2 must-fix C1)", () => {
+    it("two concurrent ingestBatch calls (mainline + aliased worktree, same project id) snapshot exactly their own root's files, and both commits stay reachable from refs/sojourn/head", async () => {
+      const { execFile } = await import("node:child_process");
+      const { promisify } = await import("node:util");
+      const execFileAsync = promisify(execFile);
+
+      await fsp.writeFile(path.join(projectRoot, "mainline.txt"), "mainline-0");
+      const deps = makeDeps();
+
+      // Origin session in the mainline project — anchors the origin node
+      // the worktree manifest points back at.
+      const originPrompt = node("c1-origin-p", null, "prompt", "s-c1-origin", "2026-01-01T00:00:00.000Z", "hi");
+      const originReply = node("c1-origin-r", "c1-origin-p", "assistant", "s-c1-origin", "2026-01-01T00:00:01.000Z", {
+        type: "text",
+        text: "hello",
+      });
+      await ingestBatch(deps, {
+        project: { root: projectRoot, name: "mainline" },
+        session: { id: "s-c1-origin", cli: "claude" },
+        nodes: [originPrompt, originReply],
+      });
+      const originNodeId = "claude:c1-origin-r";
+      const projectId = store.getProjects()[0].id;
+
+      const worktreeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "sojourn-ingest-c1-worktree-"));
+      try {
+        await fsp.writeFile(
+          path.join(worktreeRoot, ".sojourn-restore.json"),
+          JSON.stringify({ nodeId: originNodeId }),
+          "utf8",
+        );
+
+        const expectedTrees: string[] = [];
+        // Several rounds of truly concurrent mainline + worktree batches for
+        // ONE project id. Without per-root indexes / CAS head updates /
+        // per-project snapshot serialization, the shared ingest index blends
+        // the roots (a batch-tail snapshotRef listing the OTHER root's
+        // files) and/or one head update is silently lost.
+        for (let round = 0; round < 3; round++) {
+          await fsp.writeFile(path.join(projectRoot, "mainline.txt"), `mainline-${round}`);
+          await fsp.writeFile(path.join(worktreeRoot, "worktree-only.txt"), `worktree-${round}`);
+
+          const mainPrompt = node(`c1-m-p${round}`, round === 0 ? null : `c1-m-a${round - 1}`, "prompt", "s-c1-main", `2026-01-02T00:0${round}:00.000Z`, "go");
+          const mainReply = node(`c1-m-a${round}`, `c1-m-p${round}`, "assistant", "s-c1-main", `2026-01-02T00:0${round}:01.000Z`, {
+            type: "text",
+            text: "mainline work",
+          });
+          const wtPrompt = node(`c1-w-p${round}`, round === 0 ? null : `c1-w-a${round - 1}`, "prompt", "s-c1-wt", `2026-01-02T00:0${round}:00.000Z`, "go");
+          const wtReply = node(`c1-w-a${round}`, `c1-w-p${round}`, "assistant", "s-c1-wt", `2026-01-02T00:0${round}:01.000Z`, {
+            type: "text",
+            text: "worktree work",
+          });
+
+          await Promise.all([
+            ingestBatch(deps, {
+              project: { root: projectRoot, name: "mainline" },
+              session: { id: "s-c1-main", cli: "claude" },
+              nodes: [mainPrompt, mainReply],
+            }),
+            ingestBatch(deps, {
+              project: { root: worktreeRoot, name: "worktree-phantom" },
+              session: { id: "s-c1-wt", cli: "claude" },
+              nodes: [wtPrompt, wtReply],
+            }),
+          ]);
+
+          // Each batch tail's snapshotRef must list exactly its OWN root's
+          // files — never the other root's.
+          const mainTree = store.getNode(`claude:c1-m-a${round}`)!.snapshotRef;
+          const wtTree = store.getNode(`claude:c1-w-a${round}`)!.snapshotRef;
+          expect(mainTree).not.toBeNull();
+          expect(wtTree).not.toBeNull();
+          expectedTrees.push(mainTree!, wtTree!);
+
+          const snapshotter = deps.snapshotterFor({
+            ...store.getProjects()[0],
+            root: projectRoot,
+          });
+          const mainFiles = (await snapshotter.listFiles(mainTree!)).sort();
+          const wtFiles = (await snapshotter.listFiles(wtTree!)).sort();
+          expect(mainFiles).toContain("mainline.txt");
+          expect(mainFiles).not.toContain("worktree-only.txt");
+          expect(wtFiles).toContain("worktree-only.txt");
+          expect(wtFiles).not.toContain("mainline.txt");
+          expect(await snapshotter.readFile(mainTree!, "mainline.txt")).toBe(`mainline-${round}`);
+          expect(await snapshotter.readFile(wtTree!, "worktree-only.txt")).toBe(`worktree-${round}`);
+        }
+
+        // Both sides' commits must ALL be reachable from refs/sojourn/head:
+        // a lost (non-CAS) head update orphans a commit, and `soj gc` would
+        // then silently prune a snapshot the graph still calls restorable.
+        const shadowDir = path.join(shadowRoot, projectId);
+        const { stdout } = await execFileAsync(
+          "git",
+          ["log", "--format=%T", "refs/sojourn/head"],
+          { env: { ...process.env, GIT_DIR: shadowDir } },
+        );
+        const reachable = new Set(
+          stdout
+            .split("\n")
+            .map((l) => l.trim())
+            .filter((l) => l.length > 0),
+        );
+        for (const tree of expectedTrees) {
+          expect(reachable.has(tree)).toBe(true);
+        }
+      } finally {
+        fs.rmSync(worktreeRoot, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe("rewind-synthesized sessions (V2 must-fix I3)", () => {
+    /** Text that deterministically trips the file_ref_missing T1 check when
+     * flags DO run: a backtick repo-relative path, an existence phrase
+     * before it, and the path absent from the (real tmp) project root. */
+    const PHANTOM_REF_TEXT =
+      "The refresh helper is defined in `src/old_helpers.py` next to the token cache.";
+
+    interface RewindFixture {
+      deps: IngestDeps;
+      originNodeId: string;
+      newSessionId: string;
+      projectsSubdir: string;
+    }
+
+    /** Seeds an origin session (prompt + assistant, snapshot anchored) and a
+     * rewind sidecar for a synthesized session whose line uuids are
+     * `synthesizedUuids`, registering the synthesized transcript path in the
+     * transcript index exactly as the watcher would. */
+    async function seedRewind(synthesizedUuids: string[]): Promise<RewindFixture> {
+      await fsp.writeFile(path.join(projectRoot, "a.txt"), "hello");
+      const transcripts = new TranscriptIndex();
+      const deps: IngestDeps = { ...makeDeps(), transcripts };
+
+      const originPrompt = node("rw-origin-p", null, "prompt", "s-rw-origin", "2026-01-01T00:00:00.000Z", "hi");
+      const originReply = node("rw-origin-a", "rw-origin-p", "assistant", "s-rw-origin", "2026-01-01T00:00:01.000Z", {
+        type: "text",
+        text: "hello",
+      });
+      await ingestBatch(deps, {
+        project: { root: projectRoot, name: "mainline" },
+        session: { id: "s-rw-origin", cli: "claude" },
+        nodes: [originPrompt, originReply],
+      });
+      const originNodeId = "claude:rw-origin-a";
+      expect(store.getNode(originNodeId)!.snapshotRef).not.toBeNull();
+
+      const projectsSubdir = fs.mkdtempSync(path.join(os.tmpdir(), "sojourn-ingest-rewind-"));
+      const newSessionId = "rewound-session-1";
+      const transcriptPath = path.join(projectsSubdir, `${newSessionId}.jsonl`);
+      await fsp.writeFile(
+        path.join(projectsSubdir, `${newSessionId}.sojourn-rewind.json`),
+        JSON.stringify({
+          originSessionId: "s-rw-origin",
+          originNodeId,
+          lineUuids: synthesizedUuids,
+        }),
+        "utf8",
+      );
+      transcripts.record(newSessionId, { transcriptPath, diskRoot: projectRoot });
+
+      return { deps, originNodeId, newSessionId, projectsSubdir };
+    }
+
+    it("parents the synthesized session's root to the origin node (meta.rewindOf) and runs ZERO flags on synthesized nodes", async () => {
+      const fx = await seedRewind(["rw-p1", "rw-a1"]);
+      try {
+        // The synthesized transcript's nodes: OLD prose referencing a file
+        // that does not exist in TODAY's tree — without the sidecar skip,
+        // fileRefs would stamp a false VERIFIED flag on it.
+        const rwPrompt = node("rw-p1", null, "prompt", fx.newSessionId, "2026-01-02T00:00:00.000Z", "old prompt");
+        const rwReply = node("rw-a1", "rw-p1", "assistant", fx.newSessionId, "2026-01-02T00:00:01.000Z", {
+          type: "text",
+          text: PHANTOM_REF_TEXT,
+        });
+        await ingestBatch(fx.deps, {
+          project: { root: projectRoot, name: "mainline" },
+          session: { id: fx.newSessionId, cli: "claude" },
+          nodes: [rwPrompt, rwReply],
+        });
+
+        // (a) No disconnected phantom: the session root joins the graph as
+        // a child of the origin node, marked as a rewind edge.
+        const storedRoot = store.getNode("claude:rw-p1")!;
+        expect(storedRoot.parentId).toBe(fx.originNodeId);
+        expect(storedRoot.meta.rewindOf).toBe(fx.originNodeId);
+
+        // (b) Synthesized history is not new agent claims: ZERO flags.
+        const storedReply = store.getNode("claude:rw-a1")!;
+        expect(storedReply.flags ?? []).toEqual([]);
+      } finally {
+        fs.rmSync(fx.projectsSubdir, { recursive: true, force: true });
+      }
+    });
+
+    it("flags a REAL resumed continuation normally: nodes beyond the synthesized uuid set still run checks", async () => {
+      const fx = await seedRewind(["rw-p1", "rw-a1"]);
+      try {
+        const rwPrompt = node("rw-p1", null, "prompt", fx.newSessionId, "2026-01-02T00:00:00.000Z", "old prompt");
+        const rwReply = node("rw-a1", "rw-p1", "assistant", fx.newSessionId, "2026-01-02T00:00:01.000Z", {
+          type: "text",
+          text: PHANTOM_REF_TEXT,
+        });
+        await ingestBatch(fx.deps, {
+          project: { root: projectRoot, name: "mainline" },
+          session: { id: fx.newSessionId, cli: "claude" },
+          nodes: [rwPrompt, rwReply],
+        });
+
+        // The user resumes the rewound session and a NEW turn lands —
+        // uuids NOT in the sidecar. Checks must run on it normally.
+        const newPrompt = node("rw-p2", "rw-a1", "prompt", fx.newSessionId, "2026-01-02T00:01:00.000Z", "continue");
+        const newReply = node("rw-a2", "rw-p2", "assistant", fx.newSessionId, "2026-01-02T00:01:01.000Z", {
+          type: "text",
+          text: PHANTOM_REF_TEXT,
+        });
+        await ingestBatch(fx.deps, {
+          project: { root: projectRoot, name: "mainline" },
+          session: { id: fx.newSessionId, cli: "claude" },
+          nodes: [rwPrompt, rwReply, newPrompt, newReply],
+        });
+
+        // Synthesized node: still clean after the second batch.
+        expect(store.getNode("claude:rw-a1")!.flags ?? []).toEqual([]);
+        // New continuation node: the false reference is flagged as usual.
+        const newFlags = store.getNode("claude:rw-a2")!.flags ?? [];
+        expect(newFlags.some((f) => f.kind === "file_ref_missing")).toBe(true);
+      } finally {
+        fs.rmSync(fx.projectsSubdir, { recursive: true, force: true });
+      }
+    });
+
+    it("fails soft on a malformed sidecar: normal (unparented) ingest, flags run", async () => {
+      await fsp.writeFile(path.join(projectRoot, "a.txt"), "hello");
+      const transcripts = new TranscriptIndex();
+      const deps: IngestDeps = { ...makeDeps(), transcripts };
+
+      const projectsSubdir = fs.mkdtempSync(path.join(os.tmpdir(), "sojourn-ingest-rewind-bad-"));
+      try {
+        const sid = "rewound-bad-1";
+        const transcriptPath = path.join(projectsSubdir, `${sid}.jsonl`);
+        await fsp.writeFile(
+          path.join(projectsSubdir, `${sid}.sojourn-rewind.json`),
+          "{ not valid json",
+          "utf8",
+        );
+        transcripts.record(sid, { transcriptPath, diskRoot: projectRoot });
+
+        const p = node("rwb-p1", null, "prompt", sid, "2026-01-02T00:00:00.000Z", "hi");
+        const a = node("rwb-a1", "rwb-p1", "assistant", sid, "2026-01-02T00:00:01.000Z", {
+          type: "text",
+          text: PHANTOM_REF_TEXT,
+        });
+        await expect(
+          ingestBatch(deps, {
+            project: { root: projectRoot, name: "mainline" },
+            session: { id: sid, cli: "claude" },
+            nodes: [p, a],
+          }),
+        ).resolves.toEqual({ added: ["claude:rwb-p1", "claude:rwb-a1"] });
+
+        const storedRoot = store.getNode("claude:rwb-p1")!;
+        expect(storedRoot.parentId).toBeNull();
+        expect(storedRoot.meta.rewindOf).toBeUndefined();
+        // Flags run normally for a non-rewind session.
+        const flags = store.getNode("claude:rwb-a1")!.flags ?? [];
+        expect(flags.some((f) => f.kind === "file_ref_missing")).toBe(true);
+      } finally {
+        fs.rmSync(projectsSubdir, { recursive: true, force: true });
       }
     });
   });

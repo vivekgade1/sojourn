@@ -539,6 +539,55 @@ describe("daemon HTTP API (V2 wiring)", () => {
       expect(fs.existsSync(res.body.rewind.transcriptPath)).toBe(true);
     });
 
+    it("V2 must-fix I3: the executed rewind's synthesized transcript ingests PARENTED to the restored node (meta.rewindOf) with zero flags — no disconnected phantom session", async () => {
+      await fsp.writeFile(path.join(projectRoot, "a.txt"), "v1");
+      const { nodes } = await ingestFixture();
+      await registerFixtureTranscript();
+
+      const snapshotted = nodes.filter((n) => n.snapshotRef !== null);
+      const target = snapshotted[snapshotted.length - 1];
+
+      const res = await request(app)
+        .post(`/api/nodes/${encodeURIComponent(target.id)}/restore`)
+        .send();
+      expect(res.status).toBe(200);
+      expect(res.body.rewind.mode).toBe("exact");
+      const synthPath: string = res.body.rewind.transcriptPath;
+      const newSessionId: string = res.body.rewind.newSessionId;
+
+      // The provenance sidecar landed next to the synthesized transcript.
+      const sidecarPath = synthPath.replace(/\.jsonl$/, ".sojourn-rewind.json");
+      expect(fs.existsSync(sidecarPath)).toBe(true);
+      const sidecar = JSON.parse(fs.readFileSync(sidecarPath, "utf8"));
+      expect(sidecar.originNodeId).toBe(target.id);
+
+      // Simulate the daemon watcher picking the new .jsonl up (record in the
+      // transcript index, then ingest) — exactly watcher.ts's scan() flow.
+      const written = fs.readFileSync(synthPath, "utf8");
+      const batch = parseSessionJsonl(synthPath, written)!;
+      expect(batch.session.id).toBe(newSessionId);
+      transcripts.record(newSessionId, {
+        transcriptPath: synthPath,
+        diskRoot: batch.project.root,
+      });
+      await ingestBatch(ingestDeps, batch);
+
+      // Connected, not phantom: the synthesized session's root hangs off
+      // the restored node via a rewind edge.
+      const sessionNodes = store.getSessionNodes(newSessionId);
+      expect(sessionNodes.length).toBeGreaterThan(0);
+      const root = sessionNodes.find((n) => n.meta.rewindOf !== undefined);
+      expect(root).toBeDefined();
+      expect(root!.parentId).toBe(target.id);
+      expect(root!.meta.rewindOf).toBe(target.id);
+
+      // Synthesized history carries ZERO flags — a restore can never flip
+      // `soj gate` red with fabricated verified findings.
+      for (const n of sessionNodes) {
+        expect(n.flags ?? []).toEqual([]);
+      }
+    });
+
     it("omits `rewind` when the session's transcript is not known (restore still succeeds)", async () => {
       await fsp.writeFile(path.join(projectRoot, "a.txt"), "v1");
       const node = mkNode("restore-norw", null, "assistant", "s-norw", "2026-01-01T00:00:00.000Z", {
@@ -583,6 +632,128 @@ describe("daemon HTTP API (V2 wiring)", () => {
       expect(restore.body.error).toContain(
         "snapshot missing or thinned by retention policy (soj gc)",
       );
+    });
+  });
+
+  describe("POST /api/nodes/:id/flags/run — budgets (V2 must-fix I2)", () => {
+    /** Ingests a two-turn session where turn 2's single assistant node makes
+     * `count` DISTINCT false edit claims (nothing on disk changed during the
+     * turn), so ingest-time budgeting keeps the flagship budget (10) plus
+     * one digest. Returns the claim node's id. */
+    async function ingestStormTurn(sess: string, count: number): Promise<string> {
+      await fsp.writeFile(path.join(projectRoot, "a.txt"), "hello");
+      const prompt1 = mkNode(`${sess}-p1`, null, "prompt", sess, "2026-01-01T00:00:00.000Z", "hi");
+      const prior = mkNode(`${sess}-prior`, `${sess}-p1`, "assistant", sess, "2026-01-01T00:00:01.000Z", {
+        type: "text",
+        text: "Sure.",
+      });
+      await ingestBatch(ingestDeps, {
+        project: { root: projectRoot, name: "test" },
+        session: { id: sess, cli: "claude" },
+        nodes: [prompt1, prior],
+      });
+
+      const stormText = Array.from({ length: count }, (_, i) => `I updated \`f${i}.py\`.`).join(" ");
+      const prompt2 = mkNode(`${sess}-p2`, `${sess}-prior`, "prompt", sess, "2026-01-01T00:00:02.000Z", "go");
+      const claim = mkNode(`${sess}-claim`, `${sess}-p2`, "assistant", sess, "2026-01-01T00:00:03.000Z", {
+        type: "text",
+        text: stormText,
+      });
+      await ingestBatch(ingestDeps, {
+        project: { root: projectRoot, name: "test" },
+        session: { id: sess, cli: "claude" },
+        nodes: [prompt1, prior, prompt2, claim],
+      });
+      return `claude:${sess}-claim`;
+    }
+
+    function editClaimState(nodeId: string) {
+      const flags = (store.getNode(nodeId)!.flags ?? []).filter(
+        (f) => f.kind === "edit_claim_mismatch",
+      );
+      return {
+        ordinary: flags.filter((f) => (f.suppressedCount ?? 0) === 0),
+        digests: flags.filter((f) => (f.suppressedCount ?? 0) > 0),
+      };
+    }
+
+    it("a manual T1 re-run on a storm node does NOT resurrect the digest's suppressed siblings: active flag set unchanged, suppressed_count reconciled, health stable", async () => {
+      const claimId = await ingestStormTurn("s-i2-storm", 12);
+
+      // Ingest-time budget state: flagship budget keeps 10, one digest
+      // stands in for the 2 suppressed claims.
+      const before = editClaimState(claimId);
+      expect(before.ordinary).toHaveLength(10);
+      expect(before.digests).toHaveLength(1);
+      expect(before.digests[0].suppressedCount).toBe(2);
+
+      const healthBefore = (await request(app).get("/api/sessions/s-i2-storm/health")).body;
+
+      const res = await request(app)
+        .post(`/api/nodes/${encodeURIComponent(claimId)}/flags/run`)
+        .send({ tier: "T1" });
+      expect(res.status).toBe(200);
+
+      // The re-run reproduces the full storm, but the route must budget it
+      // exactly like ingest: the previously-suppressed claims stay
+      // suppressed (inside the digest), never inserted as fresh rows.
+      const after = editClaimState(claimId);
+      expect(after.ordinary).toHaveLength(10);
+      expect(after.digests).toHaveLength(1);
+      expect(after.digests[0].suppressedCount).toBe(2);
+
+      // The route's response reflects the same budgeted state.
+      const responseEditFlags = (res.body.flags as Array<Record<string, unknown>>).filter(
+        (f) => f.kind === "edit_claim_mismatch",
+      );
+      expect(responseEditFlags).toHaveLength(11); // 10 kept + 1 digest
+
+      // Session health counts are stable across the re-run.
+      const healthAfter = (await request(app).get("/api/sessions/s-i2-storm/health")).body;
+      expect(healthAfter).toEqual(healthBefore);
+      expect(healthAfter.suppressed).toBe(2);
+    });
+
+    it("the T2 branch budgets advisory flags too (advisory budget 2 + one digest)", async () => {
+      const claimId = await ingestStormTurn("s-i2-t2", 1);
+
+      const fakeLlm = {
+        complete: async () =>
+          JSON.stringify({
+            assumptions: [
+              { text: "assumption one", confidence: "high" },
+              { text: "assumption two", confidence: "medium" },
+              { text: "assumption three", confidence: "low" },
+              { text: "assumption four", confidence: "low" },
+            ],
+            possible_hallucinations: [],
+          }),
+      };
+      const t2App = createApp({ ...baseDeps, criticFor: () => fakeLlm });
+
+      const prevKey = process.env.ANTHROPIC_API_KEY;
+      process.env.ANTHROPIC_API_KEY = "test-key";
+      try {
+        const res = await request(t2App)
+          .post(`/api/nodes/${encodeURIComponent(claimId)}/flags/run`)
+          .send({ tier: "T2" });
+        expect(res.status).toBe(200);
+      } finally {
+        if (prevKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+        else process.env.ANTHROPIC_API_KEY = prevKey;
+      }
+
+      const advisory = (store.getNode(claimId)!.flags ?? []).filter(
+        (f) => f.kind === "unstated_assumption",
+      );
+      const ordinary = advisory.filter((f) => (f.suppressedCount ?? 0) === 0);
+      const digests = advisory.filter((f) => (f.suppressedCount ?? 0) > 0);
+      expect(ordinary).toHaveLength(2); // advisory per-turn budget
+      expect(digests).toHaveLength(1);
+      expect(digests[0].suppressedCount).toBe(2);
+      for (const f of advisory) {
+        expect(f.tier).toBe("advisory");
+      }
     });
   });
 

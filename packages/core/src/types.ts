@@ -64,7 +64,7 @@ export interface ChronoNode {
   content: unknown;
   flags?: StoredFlag[];
   annotations?: Annotation[];
-  meta: { nativeUuid: string; forkedFrom?: string };
+  meta: { nativeUuid: string; forkedFrom?: string; rewindOf?: string };
 }
 
 export interface Project {

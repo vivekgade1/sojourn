@@ -29,6 +29,7 @@ interface NodeRow {
   content: string;
   native_uuid: string;
   forked_from: string | null;
+  rewind_of: string | null;
   rowid: number;
 }
 
@@ -118,6 +119,9 @@ function rowToNode(row: NodeRow): ChronoNode {
     meta: {
       nativeUuid: row.native_uuid,
       ...(row.forked_from !== null ? { forkedFrom: row.forked_from } : {}),
+      ...(row.rewind_of !== null && row.rewind_of !== undefined
+        ? { rewindOf: row.rewind_of }
+        : {}),
     },
   };
 }
@@ -195,9 +199,9 @@ export class GraphStore {
       .prepare(
         `INSERT INTO nodes
            (id, parent_id, kind, cli, session_id, project_id, timestamp,
-            snapshot_ref, label, summary, content, native_uuid, forked_from)
+            snapshot_ref, label, summary, content, native_uuid, forked_from, rewind_of)
          VALUES (@id, @parent_id, @kind, @cli, @session_id, @project_id, @timestamp,
-            @snapshot_ref, @label, @summary, @content, @native_uuid, @forked_from)
+            @snapshot_ref, @label, @summary, @content, @native_uuid, @forked_from, @rewind_of)
          ON CONFLICT(id) DO UPDATE SET
            parent_id = excluded.parent_id,
            kind = excluded.kind,
@@ -210,7 +214,8 @@ export class GraphStore {
            summary = excluded.summary,
            content = excluded.content,
            native_uuid = excluded.native_uuid,
-           forked_from = excluded.forked_from`,
+           forked_from = excluded.forked_from,
+           rewind_of = excluded.rewind_of`,
       )
       .run({
         id: node.id,
@@ -226,6 +231,7 @@ export class GraphStore {
         content: JSON.stringify(node.content ?? null),
         native_uuid: node.meta.nativeUuid,
         forked_from: node.meta.forkedFrom ?? null,
+        rewind_of: node.meta.rewindOf ?? null,
       });
 
     this.reindexNodeFts(node.id);

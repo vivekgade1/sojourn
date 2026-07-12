@@ -91,11 +91,25 @@ const V2_MIGRATION: Migration = {
 };
 
 /**
+ * v3: adds `nodes.rewind_of` — the rewind-provenance edge (must-fix I3).
+ * A session synthesized by restore/rewind is parented to the node it was
+ * rewound to, and `rewind_of` records that edge on the session's root
+ * (mirroring `forked_from` for worktree-aliased sessions).
+ */
+const V3_MIGRATION: Migration = {
+  version: 3,
+  description: "add nodes.rewind_of (rewind-synthesized session provenance edge)",
+  up(db) {
+    db.exec(`ALTER TABLE nodes ADD COLUMN rewind_of TEXT`);
+  },
+};
+
+/**
  * Ordered migration list. Keep ascending by `version` with no gaps or
  * duplicates — `runMigrations` sorts defensively but does not validate
  * contiguity.
  */
-export const MIGRATIONS: readonly Migration[] = [V2_MIGRATION];
+export const MIGRATIONS: readonly Migration[] = [V2_MIGRATION, V3_MIGRATION];
 
 function currentVersion(db: BetterSqlite3.Database): number {
   return db.pragma("user_version", { simple: true }) as number;
