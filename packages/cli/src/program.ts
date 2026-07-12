@@ -10,8 +10,11 @@ import type {
   StoredFlag,
   RestorePreflight,
   RestoreResult,
+  SearchHit,
+  SessionHealth,
 } from "@sojourn/core";
 import { DaemonClient, encodeNodeId } from "./client.js";
+import { activeFlags, excerpt, filterDecisionHits, gistOf } from "./searchFormat.js";
 import {
   resolveDaemonEntry,
   readPid,
@@ -478,7 +481,214 @@ export function buildProgram(deps: ProgramDeps): Command {
       },
     );
 
+  program
+    .command("why <query>")
+    .description('search the decision graph: "why/when did the agent do X?"')
+    .option("--project <id>", "project id (default: project for cwd)")
+    .option("--file <path>", "only turns that touched this file")
+    .action(
+      withDaemonErrorHandling(deps, async (query: string, opts: { project?: string; file?: string }) => {
+        const projectId = opts.project ?? projectIdFor(deps.cwd);
+        const params = new URLSearchParams({ projectId, q: query });
+        if (opts.file) params.set("file", opts.file);
+        const res = await client.get<{ hits: SearchHit[] }>(`/api/search?${params.toString()}`);
+        if (res.status !== 200) {
+          deps.stderr(`error: ${describeError(res.body)}`);
+          deps.exit(1);
+          return;
+        }
+        const hits = res.body?.hits ?? [];
+        if (hits.length === 0) {
+          deps.stdout(
+            `no matches for "${query}"${opts.file ? ` touching ${opts.file}` : ""} in project ${projectId}.`,
+          );
+          deps.stdout(
+            "sojourn only knows what the daemon captured — try a broader query, or `soj decisions` to list marks and flagged turns.",
+          );
+          return;
+        }
+        // Hits arrive score-ordered from the daemon (best first) — keep that order.
+        for (const hit of hits) {
+          deps.stdout(formatHitLine(hit));
+          const snippet = excerpt(hit.snippet ?? "", 200);
+          if (snippet.length > 0) deps.stdout(`    ${snippet}`);
+        }
+      }),
+    );
+
+  program
+    .command("decisions")
+    .description("list marked decisions/assumptions/checkpoints plus actively flagged turns")
+    .option("--project <id>", "project id (default: project for cwd)")
+    .option("--file <path>", "only turns that touched this file")
+    .action(
+      withDaemonErrorHandling(deps, async (opts: { project?: string; file?: string }) => {
+        const projectId = opts.project ?? projectIdFor(deps.cwd);
+        const params = new URLSearchParams({ projectId });
+        if (opts.file) params.set("file", opts.file);
+        const res = await client.get<{ hits: SearchHit[] }>(`/api/search?${params.toString()}`);
+        if (res.status !== 200) {
+          deps.stderr(`error: ${describeError(res.body)}`);
+          deps.exit(1);
+          return;
+        }
+        const kept = filterDecisionHits(res.body?.hits ?? []);
+        if (kept.length === 0) {
+          deps.stdout(
+            `no decisions, assumptions, checkpoints, or flagged turns${opts.file ? ` touching ${opts.file}` : ""} in project ${projectId}. \`soj mark\` records one.`,
+          );
+          return;
+        }
+        for (const hit of kept) {
+          deps.stdout(formatHitLine(hit));
+          for (const flag of activeFlags(hit.node)) {
+            deps.stdout(`    ⚑ ${flag.kind} (${flag.tier}/${flag.confidence}): ${excerpt(flag.evidence, 160)}`);
+          }
+        }
+      }),
+    );
+
+  program
+    .command("gate")
+    .description(
+      "CI-style check: exit 2 when active verified flags exist, 0 when clean, 3 when the daemon is unreachable",
+    )
+    .option("--session <id>", "gate one session (turn count and flag counts come from its health route)")
+    .option("--project <id>", "project id (default: project for cwd)")
+    .option("--include-advisory", "also gate on advisory (hedged, LLM-critic) flags", false)
+    .action(async (opts: { session?: string; project?: string; includeAdvisory: boolean }) => {
+      // Honest header: gate only checks what the local daemon recorded — it is
+      // NOT a general correctness proof. Printed on every outcome.
+      deps.stdout("checked: claims vs snapshots recorded by the local Sojourn daemon");
+      try {
+        const projectId = opts.project ?? projectIdFor(deps.cwd);
+        let turns: number;
+        let verifiedCount: number;
+        let advisoryCount: number;
+        let detail: Array<StoredFlag & { nodeId: string }> = [];
+
+        if (opts.session) {
+          const hres = await client.get<SessionHealth>(
+            `/api/sessions/${encodeNodeId(opts.session)}/health`,
+          );
+          if (hres.status !== 200) {
+            deps.stderr(`error: ${describeError(hres.body)}`);
+            deps.exit(1);
+            return;
+          }
+          turns = hres.body.turns;
+          verifiedCount = hres.body.verifiedActive;
+          advisoryCount = hres.body.advisoryActive;
+          if (verifiedCount > 0 || (opts.includeAdvisory && advisoryCount > 0)) {
+            // The verdict above comes from the health counts; the evidence
+            // table is best-effort (the session's nodes live in some project
+            // graph — cwd's by default).
+            try {
+              const g = await client.get<{ project: Project; sessions: SessionRow[]; nodes: ChronoNode[] }>(
+                `/api/projects/${encodeNodeId(projectId)}/graph`,
+              );
+              if (g.status === 200) {
+                detail = collectActiveFlags(g.body.nodes ?? [], opts.session, opts.includeAdvisory);
+              }
+            } catch {
+              // evidence table unavailable — the exit code still stands
+            }
+          }
+        } else {
+          const g = await client.get<{ project: Project; sessions: SessionRow[]; nodes: ChronoNode[] }>(
+            `/api/projects/${encodeNodeId(projectId)}/graph`,
+          );
+          if (g.status !== 200) {
+            deps.stderr(`error: ${describeError(g.body)}`);
+            deps.exit(1);
+            return;
+          }
+          const nodes = g.body.nodes ?? [];
+          turns = nodes.filter((n) => n.kind === "prompt").length;
+          const all = collectActiveFlags(nodes, undefined, true);
+          verifiedCount = all.filter((f) => f.tier === "verified").length;
+          advisoryCount = all.filter((f) => f.tier === "advisory").length;
+          detail = collectActiveFlags(nodes, undefined, opts.includeAdvisory);
+        }
+
+        const gatedCount = verifiedCount + (opts.includeAdvisory ? advisoryCount : 0);
+        if (gatedCount > 0) {
+          let headline = `gate failed: ${verifiedCount} active verified flag(s)`;
+          if (opts.includeAdvisory && advisoryCount > 0) {
+            headline += ` + ${advisoryCount} advisory flag(s) (gated by --include-advisory)`;
+          }
+          deps.stdout(headline);
+          if (detail.length > 0) {
+            deps.stdout(
+              renderTable(
+                ["node", "kind", "tier", "confidence", "evidence"],
+                detail.map((f) => [f.nodeId, f.kind, f.tier, f.confidence, excerpt(f.evidence, 80)]),
+              ),
+            );
+          } else {
+            deps.stdout(
+              `(flag details not found in project ${projectId} — if the session belongs to another project, pass --project)`,
+            );
+          }
+          deps.exit(2);
+          return;
+        }
+
+        deps.stdout(`gate passed: ${turns} turns, 0 active verified flags`);
+        if (!opts.includeAdvisory && advisoryCount > 0) {
+          deps.stdout(
+            `note: ${advisoryCount} active advisory flag(s) (hedged, LLM-critic — not gated). Re-run with --include-advisory to gate on them.`,
+          );
+        }
+      } catch (err) {
+        if (isFetchFailure(err)) {
+          deps.stderr(
+            `sojourn daemon is not reachable at ${deps.baseUrl} — is it running? Try \`soj start\`. (exit 3 = could not check)`,
+          );
+          deps.exit(3);
+          return;
+        }
+        throw err;
+      }
+    });
+
+  program
+    .command("mcp")
+    .description(
+      "run a read-only MCP stdio server over the graph (tools: sojourn_search, sojourn_decisions, sojourn_flags, sojourn_node). Add to Claude Code with: claude mcp add sojourn -- soj mcp",
+    )
+    .action(async () => {
+      // stdout belongs to the MCP stdio transport from here on — the command
+      // deliberately prints nothing itself.
+      const { runMcpServer } = await import("./mcp.js");
+      await runMcpServer({ baseUrl: deps.baseUrl, cwd: deps.cwd });
+    });
+
   return program;
+}
+
+/** `[kind] node-id  gist` (+ active-flag markers) — shared by `soj why` and `soj decisions`. */
+function formatHitLine(hit: SearchHit): string {
+  const flagged = activeFlags(hit.node);
+  const flagNote = flagged.length > 0 ? `  ⚑ ${flagged.map((f) => f.kind).join(",")}` : "";
+  return `[${hit.node.kind}] ${hit.node.id}  ${gistOf(hit.node)}${flagNote}`;
+}
+
+/** Active (non-dismissed, non-auto-resolved) flags across nodes, optionally scoped to a session. */
+function collectActiveFlags(
+  nodes: ChronoNode[],
+  sessionId: string | undefined,
+  includeAdvisory: boolean,
+): Array<StoredFlag & { nodeId: string }> {
+  const out: Array<StoredFlag & { nodeId: string }> = [];
+  for (const node of nodes) {
+    if (sessionId !== undefined && node.sessionId !== sessionId) continue;
+    for (const flag of activeFlags(node)) {
+      if (!includeAdvisory && flag.tier !== "verified") continue;
+      out.push({ ...flag, nodeId: node.id });
+    }
+  }
+  return out;
 }
 
 async function resolveLatestSessionId(
