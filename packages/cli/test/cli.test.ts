@@ -656,6 +656,17 @@ describe("soj CLI", () => {
 
       expect(out.join("\n")).toContain("gc complete.");
 
+      // gc keeps a 5-minute grace for young unreachable objects
+      // (`gc --prune=5.minutes.ago`, protecting a concurrent writer's fresh
+      // objects), and everything in this test is seconds old — so force
+      // object-level expiry (test-only; `git gc` never removes reachable
+      // objects) to observe that gc genuinely severed the old tree.
+      await runGit(["gc", "--prune=now"], {
+        GIT_DIR: shadowDir,
+        GIT_WORK_TREE: projectRoot,
+        GIT_INDEX_FILE: join(shadowDir, "prune-test-index"),
+      });
+
       const snapshotter = new ShadowSnapshotter({ projectRoot, shadowDir });
       expect(await snapshotter.hasTree(oldTree)).toBe(false);
       expect(await snapshotter.hasTree(recentTree)).toBe(true);
@@ -701,7 +712,11 @@ describe("soj CLI", () => {
 
       const text = out.join("\n");
       expect(text).toContain(`daemon is running (pid ${process.pid})`);
-      expect(text).toContain("safe to do concurrently with capture");
+      // Pinned wording: gc must NOT claim to be safe concurrently with
+      // capture — it aborts safely (CAS on refs/sojourn/head) and asks the
+      // user to retry instead.
+      expect(text).toContain("gc will abort safely without pruning");
+      expect(text).toContain("re-run soj gc later");
       expect(exitCodes).toEqual([]);
     });
 
@@ -729,6 +744,16 @@ describe("soj CLI", () => {
       const { deps } = makeDeps({ baseUrl: stub.baseUrl, sojournHome: home, cwd });
       const program = buildProgram(deps);
       await run(program, ["gc", "--days", "10", "--run"]);
+
+      // Force object-level expiry of anything unreachable (test-only;
+      // bypasses gc's 5-minute young-object grace) so the survival
+      // assertions prove the manifest pin kept the tree REACHABLE, not just
+      // physically present.
+      await runGit(["gc", "--prune=now"], {
+        GIT_DIR: shadowDir,
+        GIT_WORK_TREE: projectRoot,
+        GIT_INDEX_FILE: join(shadowDir, "prune-test-index"),
+      });
 
       const snapshotter = new ShadowSnapshotter({ projectRoot, shadowDir });
       expect(await snapshotter.hasTree(oldTree)).toBe(true); // protected by the worktree manifest

@@ -89,6 +89,23 @@ describe("gcShadowRepo", () => {
     return map;
   }
 
+  /** TEST-ONLY: force object-level removal of unreachable objects
+   * immediately. Production gc deliberately runs `gc --prune=5.minutes.ago`
+   * so a concurrent writer's just-created objects survive; every object in
+   * these tests is seconds old (and modern git parks unreachable objects in
+   * a cruft pack rather than deleting them), so nothing pruned by
+   * gcShadowRepo physically disappears within the test's lifetime. Running
+   * `git gc --prune=now` here bypasses that grace window (the --prune flag
+   * overrides gc.pruneExpire config, so an in-repo config override can't do
+   * this — hence a test-side command, not test-repo config), letting tests
+   * observe UNREACHABILITY: git gc never removes reachable objects, so
+   * anything that vanishes after this call was genuinely severed from every
+   * ref by gcShadowRepo, and anything that survives is genuinely still
+   * reachable. */
+  async function pruneUnreachableNowForTest(): Promise<void> {
+    await runGit(["gc", "--prune=now"], env);
+  }
+
   it("dry run reports pruning #1, #2, #4 only (pin #3, keepDays covers #5-6), mutating nothing", async () => {
     const pins = new Set([treeHashes[2]]);
     const before = await currentRefs();
@@ -128,6 +145,10 @@ describe("gcShadowRepo", () => {
     expect(result.keptCommits).toBe(3);
     expect(result.prunedCommits).toBe(3);
 
+    // gcShadowRepo keeps a 5-minute loose-object grace window (protecting a
+    // concurrent writer's fresh objects), so assert UNREACHABILITY, not
+    // immediate physical deletion — see pruneUnreachableNowForTest.
+    await pruneUnreachableNowForTest();
     for (const i of [0, 1, 3]) {
       expect(await snapshotter.hasTree(treeHashes[i])).toBe(false);
     }
@@ -183,6 +204,7 @@ describe("gcShadowRepo", () => {
       { keepDays: 3, pins, dryRun: false, now: fixedNow() },
     );
     expect(result.archived).toBeNull();
+    await pruneUnreachableNowForTest();
     expect(await snapshotter.hasTree(treeHashes[0])).toBe(false);
   });
 
@@ -201,6 +223,9 @@ describe("gcShadowRepo", () => {
 
     await gcShadowRepo({ shadowDir }, { keepDays: 3, pins: new Set(), dryRun: false, now: fixedNow() });
 
+    // Force object-level pruning of anything unreachable so the survival
+    // assertion below proves reachability, not just the 5-minute grace.
+    await pruneUnreachableNowForTest();
     expect(await snapshotter.hasTree(safetyTree)).toBe(true);
     // refs/sojourn/safety itself must be untouched by gc.
     const refs = await currentRefs();
@@ -246,6 +271,7 @@ describe("gcShadowRepo", () => {
     );
     expect(result.prunedCommits).toBe(1);
     expect(result.keptCommits).toBe(2);
+    await pruneUnreachableNowForTest();
     expect(await snapshotter.hasTree(treeHashes[2])).toBe(false);
     expect(await snapshotter.hasTree(treeHashes[4])).toBe(true);
     expect(await snapshotter.hasTree(treeHashes[5])).toBe(true);
@@ -255,6 +281,58 @@ describe("gcShadowRepo", () => {
     // The stale keep ref for the now-unpinned #3 must not just accumulate
     // alongside the new ones.
     expect(keepRefsAfterSecond.length).toBe(2);
+  });
+
+  it("aborts the whole mutating tail (nothing pruned, head not clobbered) when a concurrent snapshot lands mid-gc", async () => {
+    const pins = new Set([treeHashes[2]]);
+    let concurrentTree: string | null = null;
+
+    const result = await gcShadowRepo(
+      { shadowDir },
+      {
+        keepDays: 3,
+        pins,
+        dryRun: false,
+        now: fixedNow(),
+        // Deterministically reproduce the race: a concurrently-running
+        // daemon lands a brand-new snapshot on refs/sojourn/head in the
+        // window between gc's keeper rebuild and its final head repoint.
+        onBeforeFinalize: async () => {
+          await fsp.writeFile(path.join(projectRoot, "state.txt"), "concurrent-snapshot");
+          concurrentTree = await snapshotter.snapshot();
+        },
+      },
+    );
+
+    expect(concurrentTree).not.toBeNull();
+    expect(result.aborted).toBe("concurrent_write");
+    expect(result.dryRun).toBe(false);
+    expect(result.prunedCommits).toBe(0);
+
+    // refs/sojourn/head points at the NEW snapshot — gc did not clobber it
+    // with its keeper tip.
+    const headTree = (await runGit(["rev-parse", `${SOJOURN_HEAD_REF}^{tree}`], env)).trim();
+    expect(headTree).toBe(concurrentTree);
+
+    // Nothing was pruned: every original tree — including would-be prune
+    // candidates #1/#2/#4 — and the concurrent snapshot's tree survive even
+    // a forced object-level prune, i.e. they are all still fully reachable
+    // (gc's reflog-expire / git-gc tail never ran).
+    await pruneUnreachableNowForTest();
+    for (let i = 0; i < 6; i++) {
+      expect(await snapshotter.hasTree(treeHashes[i])).toBe(true);
+    }
+    expect(await snapshotter.hasTree(concurrentTree!)).toBe(true);
+
+    // The concurrent snapshot is intact AND restorable.
+    const dest = fs.mkdtempSync(path.join(os.tmpdir(), "sojourn-gc-concurrent-restore-"));
+    try {
+      await snapshotter.restoreToWorktree(concurrentTree!, dest);
+      const content = await fsp.readFile(path.join(dest, "state.txt"), "utf8");
+      expect(content).toBe("concurrent-snapshot");
+    } finally {
+      fs.rmSync(dest, { recursive: true, force: true });
+    }
   });
 
   it("returns an all-zero result for a freshly-initialized shadow repo with no snapshots yet", async () => {

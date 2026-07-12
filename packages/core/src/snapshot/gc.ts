@@ -69,20 +69,34 @@ export interface GcOptions {
   archiveDir?: string;
   /** Injectable clock for tests. */
   now?: () => Date;
+  /** Test-only hook, invoked on real (non-dry) runs immediately before the
+   * final compare-and-swap head repoint — lets tests deterministically land
+   * a concurrent write inside the race window. Never set in production. */
+  onBeforeFinalize?: () => Promise<void>;
 }
 
 export interface GcResult {
   keptCommits: number;
   prunedCommits: number;
   /** Bytes reclaimed on disk. For a real run this is an exact
-   * du-before/du-after measurement of shadowDir. For a dry run it is an
-   * estimate: the on-disk size of objects reachable ONLY from commits that
-   * would be pruned (i.e. not shared with anything kept). */
+   * du-before/du-after measurement of shadowDir — note that the figure
+   * therefore also includes `git gc`'s repack/recompression savings, not
+   * just the pruned snapshots' own data. For a dry run it is an estimate:
+   * the on-disk size of objects reachable ONLY from commits that would be
+   * pruned (i.e. not shared with anything kept). */
   reclaimedBytes: number;
   /** Path to the pre-prune backup bundle, or null when archiveDir was not
    * given, there was nothing to prune, or this was a dry run. */
   archived: string | null;
   dryRun: boolean;
+  /** Set (only) when a real run detected that refs/sojourn/head moved while
+   * gc was working — i.e. a concurrently-running daemon landed a new
+   * snapshot. The whole mutating tail was aborted BEFORE any reflog expire
+   * or `git gc`: nothing was pruned, the concurrent snapshot is untouched,
+   * and a later re-run will complete the job. (A backup bundle written
+   * before the abort, if any, is left in place — `archived` still reports
+   * it.) */
+  aborted?: "concurrent_write";
 }
 
 interface ChainEntry {
@@ -225,7 +239,17 @@ async function deleteExistingKeepRefs(env: ShadowGitEnv): Promise<void> {
  * `archiveDir` is set, only after a full pre-prune backup bundle is written
  * — do old objects actually get removed, via `reflog expire --expire=now`
  * (drop the safety net the ref update itself would otherwise leave behind)
- * followed by `gc --prune=now`.
+ * followed by `gc --prune=5.minutes.ago` (the grace window preserves loose
+ * objects a concurrent writer may have created moments ago).
+ *
+ * Concurrency: a daemon may be capturing snapshots into this same shadow
+ * repo while gc runs. The final head repoint is therefore a compare-and-swap
+ * against the tip read at the start (`update-ref <ref> <new> <expected-old>`).
+ * If refs/sojourn/head moved in the window — the daemon landed a snapshot —
+ * the ENTIRE mutating tail aborts BEFORE any reflog expire or `git gc`:
+ * nothing is pruned, the daemon's snapshot stays head, and the result
+ * carries `aborted: "concurrent_write"` so callers can tell the user to
+ * simply re-run later. (An archive bundle already written is left in place.)
  *
  * `dryRun` (default true) computes and returns the identical result shape
  * WITHOUT writing a single object or moving a single ref — every mutating
@@ -314,16 +338,48 @@ export async function gcShadowRepo(target: GcTarget, opts: GcOptions): Promise<G
     await runGit(["update-ref", `${SOJOURN_KEEP_PREFIX}${i}`, sha], env);
   }
 
-  if (parent) {
-    await runGit(["update-ref", SOJOURN_HEAD_REF, parent], env);
-  } else {
-    // Nothing survived retention at all — leave no head rather than point
-    // it at a lie; the next snapshot() call starts a fresh chain.
-    await runGit(["update-ref", "-d", SOJOURN_HEAD_REF], env).catch(() => {});
+  // Test-only hook: opens a deterministic window for tests to land a
+  // concurrent snapshot between the keeper rebuild and the CAS below.
+  if (opts.onBeforeFinalize) await opts.onBeforeFinalize();
+
+  // Final head repoint is a compare-and-swap: the 3-arg update-ref form
+  // (and the delete form with an expected old value) only succeeds while
+  // refs/sojourn/head still equals the tip read at the start. If a
+  // concurrently-running daemon landed a snapshot in the window, ABORT the
+  // whole mutating tail here — before any reflog expire / gc — so the
+  // daemon's snapshot is neither clobbered nor at risk of being reaped.
+  try {
+    if (parent) {
+      await runGit(["update-ref", SOJOURN_HEAD_REF, parent, headTip], env);
+    } else {
+      // Nothing survived retention at all — leave no head rather than point
+      // it at a lie; the next snapshot() call starts a fresh chain.
+      await runGit(["update-ref", "-d", SOJOURN_HEAD_REF, headTip], env);
+    }
+  } catch (err) {
+    const headNow = await revParseOrNull(env, SOJOURN_HEAD_REF);
+    if (headNow !== headTip) {
+      // Head moved under us: concurrent write. Nothing has been pruned (the
+      // bundle, keep refs, and synthetic keeper commits only ADD data), so
+      // aborting here is clean; a later re-run completes the job.
+      return {
+        keptCommits: keepers.length,
+        prunedCommits: 0,
+        reclaimedBytes: 0,
+        archived,
+        dryRun,
+        aborted: "concurrent_write",
+      };
+    }
+    throw err;
   }
 
   await runGit(["reflog", "expire", "--expire=now", "--all"], env);
-  await runGit(["gc", "--prune=now"], env);
+  // --prune=5.minutes.ago, NOT --prune=now: git's default grace protects
+  // loose objects created in the last few minutes, which is exactly what a
+  // concurrent writer's in-flight objects look like. Unreachable objects
+  // still get removed — just on the next gc after the grace elapses.
+  await runGit(["gc", "--prune=5.minutes.ago"], env);
 
   const duAfter = await duBytes(target.shadowDir);
   const reclaimedBytes = Math.max(0, duBefore - duAfter);

@@ -386,10 +386,10 @@ export function buildProgram(deps: ProgramDeps): Command {
     .description(
       "prune old snapshot history from a project's shadow repo (dry-run by default). " +
         "Operates directly on $SOJOURN_HOME — the daemon does not need to be running. " +
-        "Safe to run alongside a live daemon: gc only rewrites refs/sojourn/head and " +
-        "refs/sojourn/keep/* inside the project's SHADOW repo (never the daemon's shared " +
-        "capture index or the user's own working tree/.git), the same isolation the " +
-        "snapshotter itself relies on.",
+        "gc only rewrites refs inside the project's SHADOW repo (never the user's own " +
+        "working tree/.git). If a live daemon lands a new snapshot while gc is running, " +
+        "gc detects it and aborts safely without pruning anything — re-run later to " +
+        "complete it.",
     )
     .option("--project <id>", "project id (default: project for cwd)")
     .option("--days <n>", "keep snapshots younger than this many days", "30")
@@ -414,7 +414,7 @@ export function buildProgram(deps: ProgramDeps): Command {
         const daemonPid = readPid(deps.sojournHome);
         if (daemonPid !== null && isPidAlive(daemonPid)) {
           deps.stdout(
-            `note: daemon is running (pid ${daemonPid}) — gc only touches this project's shadow-repo refs, which is safe to do concurrently with capture.`,
+            `note: daemon is running (pid ${daemonPid}) — if capture writes a snapshot while gc runs, gc will abort safely without pruning; re-run soj gc later to complete it.`,
           );
         }
 
@@ -459,7 +459,11 @@ export function buildProgram(deps: ProgramDeps): Command {
           if (result.archived) {
             deps.stdout(`archived pruned history to: ${result.archived}`);
           }
-          if (result.dryRun) {
+          if (result.aborted === "concurrent_write") {
+            deps.stdout(
+              "gc aborted: a new snapshot landed while gc was running — nothing was pruned. Re-run soj gc to complete it.",
+            );
+          } else if (result.dryRun) {
             deps.stdout(
               result.prunedCommits > 0
                 ? "dry run only — nothing was deleted. Re-run with --run to execute."
