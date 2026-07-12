@@ -16,3 +16,5 @@ export {
 export type { ClaimKind, EditClaim } from "./claims.js";
 export { runCritic, MAX_TEXT_CHARS, MAX_DIFF_FILES } from "./critic.js";
 export type { CriticLLM } from "./critic.js";
+export { applyBudgets, getSessionHealth } from "./budget.js";
+export type { DigestFlag, BudgetOptions, BudgetResult } from "./budget.js";

@@ -301,6 +301,125 @@ describe("autoResolveFlags", () => {
   });
 });
 
+describe("autoResolveFlags digest (suppressedCount > 0) group semantics", () => {
+  // A digest flag's evidence names only the SAMPLE claim; the other
+  // suppressed claims' evidence was never persisted. Per-claim matching
+  // therefore CANNOT be used to decide whether a digest still holds — it
+  // must resolve only when its whole kind+tier group clears at re-eval.
+
+  it("does NOT resolve a digest when only the sample claim is fixed but a sibling suppressed claim still reproduces", async () => {
+    // Node A claimed edits to BOTH auth.py and billing.py; budgets kept the
+    // auth.py flag as the digest's sample and suppressed the rest.
+    const nodeA = makeNode({
+      content:
+        "I updated `auth.py` to handle refresh tokens and updated `billing.py` for the new plan.",
+    });
+    const digestFlag: StoredFlag = {
+      ...makeFlag({
+        kind: "edit_claim_mismatch",
+        evidence:
+          "claimed edit to `auth.py`; snapshot diff shows no change to that file …and similar claims suppressed",
+      }),
+      id: 701,
+      nodeId: nodeA.id,
+      dismissed: false,
+      createdAt: new Date().toISOString(),
+      suppressedCount: 4,
+    };
+    const nodeB = makeNode({ content: "Following up." });
+    const flagsByNode = new Map<string, StoredFlag[]>([[nodeA.id, [digestFlag]]]);
+    const store = makeFakeStore(flagsByNode, [nodeA, nodeB]);
+
+    // Later diff fixes ONLY the sample (auth.py). billing.py's claim still
+    // reproduces at re-eval, so the group has NOT cleared: the digest must
+    // stay active — resolving it would silently eat the suppressed true
+    // positives it stands in for.
+    const ctxB = makeCtx(nodeB, { diff: [{ path: "auth.py", status: "M" }] });
+
+    const count = await autoResolveFlags(store, nodeB, ctxB);
+    expect(count).toBe(0);
+    expect(store.resolved).toEqual([]);
+  });
+
+  it("DOES resolve a digest once the entire kind+tier group clears at re-evaluation", async () => {
+    const nodeA = makeNode({
+      content:
+        "I updated `auth.py` to handle refresh tokens and updated `billing.py` for the new plan.",
+    });
+    const digestFlag: StoredFlag = {
+      ...makeFlag({
+        kind: "edit_claim_mismatch",
+        evidence:
+          "claimed edit to `auth.py`; snapshot diff shows no change to that file …and similar claims suppressed",
+      }),
+      id: 702,
+      nodeId: nodeA.id,
+      dismissed: false,
+      createdAt: new Date().toISOString(),
+      suppressedCount: 4,
+    };
+    const nodeB = makeNode({ content: "Following up." });
+    const flagsByNode = new Map<string, StoredFlag[]>([[nodeA.id, [digestFlag]]]);
+    const store = makeFakeStore(flagsByNode, [nodeA, nodeB]);
+
+    // Every claimed file now shows up in the diff: the re-run check produces
+    // no edit_claim_mismatch flag at all, so the group cleared.
+    const ctxB = makeCtx(nodeB, {
+      diff: [
+        { path: "auth.py", status: "M" },
+        { path: "billing.py", status: "M" },
+      ],
+    });
+
+    const count = await autoResolveFlags(store, nodeB, ctxB);
+    expect(count).toBe(1);
+    expect(store.resolved).toEqual([702]);
+  });
+
+  it("still resolves an ORDINARY flag per-claim on the same node while a digest sibling stays held by the group", async () => {
+    // One node carries BOTH an ordinary flag (auth.py) and a digest whose
+    // sample is billing.py. The later diff fixes auth.py only: the ordinary
+    // flag resolves per-claim; the digest stays (its group still reproduces).
+    const nodeA = makeNode({
+      content:
+        "I updated `auth.py` to handle refresh tokens and updated `billing.py` for the new plan.",
+    });
+    const ordinaryFlag: StoredFlag = {
+      ...makeFlag({
+        kind: "edit_claim_mismatch",
+        evidence: "claimed edit to `auth.py`; snapshot diff shows no change to that file",
+      }),
+      id: 703,
+      nodeId: nodeA.id,
+      dismissed: false,
+      createdAt: new Date().toISOString(),
+    };
+    const digestFlag: StoredFlag = {
+      ...makeFlag({
+        kind: "edit_claim_mismatch",
+        evidence:
+          "claimed edit to `billing.py`; snapshot diff shows no change to that file …and similar claims suppressed",
+      }),
+      id: 704,
+      nodeId: nodeA.id,
+      dismissed: false,
+      createdAt: new Date().toISOString(),
+      suppressedCount: 3,
+    };
+    const nodeB = makeNode({ content: "Following up." });
+    const flagsByNode = new Map<string, StoredFlag[]>([
+      [nodeA.id, [ordinaryFlag, digestFlag]],
+    ]);
+    const store = makeFakeStore(flagsByNode, [nodeA, nodeB]);
+
+    const ctxB = makeCtx(nodeB, { diff: [{ path: "auth.py", status: "M" }] });
+
+    const count = await autoResolveFlags(store, nodeB, ctxB);
+    expect(count).toBe(1);
+    expect(store.resolved).toEqual([703]);
+  });
+});
+
 describe("autoResolveFlags with turnBaseOf (span re-evaluation)", () => {
   const BASE_OLD = "base-old-turn";
   const BASE_CURRENT = "base-current-turn";

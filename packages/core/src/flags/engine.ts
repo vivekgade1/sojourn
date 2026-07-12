@@ -37,32 +37,35 @@ export interface GraphStoreLike {
 }
 
 /**
- * Two flags refer to the "same claim" iff they share a `kind` AND the same
- * claimed subject. The subject is derived as the FULL ORDERED LIST of
- * backtick-quoted tokens in the evidence string (both sides extracted the
- * same way), falling back to exact evidence-string equality when a side has
- * no backticked tokens at all.
+ * THE canonical definition of claim identity, shared by auto-resolve (below)
+ * and per-turn dedup (`applyBudgets` in ./budget.ts) so "same claim" means
+ * exactly one thing everywhere. Two flags are the same claim iff their keys
+ * are equal: same `kind` AND same claimed subject. The subject is the FULL
+ * ORDERED LIST of backtick-quoted tokens in the evidence string, falling
+ * back to the exact evidence string when it has no backticked tokens at all
+ * (the "T"/"E" prefix keeps those two namespaces from ever colliding, and
+ * JSON.stringify makes the token list unambiguous even if a token contains
+ * the join character).
  *
  * Using only the *first* backticked token is not enough: symbol_not_found's
  * evidence is "claimed symbol `sym` in `file`; ..." — if two flags on the
  * same node are about the SAME symbol name in TWO DIFFERENT files, comparing
  * only the first token (`sym`) would treat them as the same claim, so fixing
  * the symbol in one file would incorrectly auto-resolve the flag for the
- * other file too. Comparing the full ordered token list (`sym`, `file`)
- * disambiguates them while still letting a node with multiple flags of the
- * same kind (e.g. two edit_claim_mismatch flags for two different files)
- * resolve independently.
+ * other file too. The full ordered token list (`sym`, `file`) disambiguates
+ * them while still letting a node with multiple flags of the same kind
+ * (e.g. two edit_claim_mismatch flags for two different files) resolve
+ * independently.
  */
+export function claimIdentityKey(flag: Flag): string {
+  const tokens = allBacktickedTokens(flag.evidence);
+  return tokens.length > 0
+    ? `${flag.kind}|T|${JSON.stringify(tokens)}`
+    : `${flag.kind}|E|${flag.evidence}`;
+}
+
 function flagsMatchSameClaim(a: Flag, b: Flag): boolean {
-  if (a.kind !== b.kind) return false;
-  const tokensA = allBacktickedTokens(a.evidence);
-  const tokensB = allBacktickedTokens(b.evidence);
-  if (tokensA.length > 0 && tokensB.length > 0) {
-    return (
-      tokensA.length === tokensB.length && tokensA.every((t, i) => t === tokensB[i])
-    );
-  }
-  return a.evidence === b.evidence;
+  return claimIdentityKey(a) === claimIdentityKey(b);
 }
 
 /**
@@ -152,7 +155,20 @@ export async function autoResolveFlags(
       };
 
       const stillFlagged = await check.run(reEvalCtx);
-      const stillHolds = stillFlagged.some((f) => flagsMatchSameClaim(f, flag));
+
+      // DIGEST flags (suppressedCount > 0) get GROUP semantics, not
+      // per-claim matching. A digest's evidence names only its SAMPLE
+      // claim — the suppressedCount other claims it stands in for were
+      // never persisted, so their identities are unrecoverable here.
+      // Matching per-claim would auto-resolve the whole digest the moment
+      // the sample alone is fixed, silently eating the suppressed true
+      // positives. Instead, a digest "still holds" while the re-run check
+      // produces ANY flag of the same kind+tier at all; it resolves only
+      // when its entire kind+tier group clears at re-evaluation.
+      const isDigest = (flag.suppressedCount ?? 0) > 0;
+      const stillHolds = isDigest
+        ? stillFlagged.some((f) => f.kind === flag.kind && f.tier === flag.tier)
+        : stillFlagged.some((f) => flagsMatchSameClaim(f, flag));
 
       if (!stillHolds) {
         await store.resolveFlag(flag.id);
