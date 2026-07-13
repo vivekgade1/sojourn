@@ -339,7 +339,9 @@ export function JourneyMap({
                 <title>
                   {`Turn ${turn.index} — ${turn.ask}\n${turn.toolCount} tool calls${
                     turn.toolNames.length ? ` (${turn.toolNames.join(", ")})` : ""
-                  }${turn.verifiedCount ? `\n⚠ ${turn.verifiedCount} verified flag(s)` : ""}`}
+                  }${turn.verifiedCount ? `\n⚠ ${turn.verifiedCount} verified flag(s)` : ""}${
+                    turn.hasRestorable ? `\n⤺ ${turn.restorableCount} restore point(s)` : ""
+                  }`}
                 </title>
                 <g
                   className="map-waypoint-inner"
@@ -379,6 +381,16 @@ export function JourneyMap({
                     <path d="M 0 8 C -6 0 -6 -6 0 -10 C 6 -6 6 0 0 8 Z" />
                     <circle cy={-4} r={2.2} />
                   </g>
+                )}
+                {/* Restore anchor — a subtle dot at the lower-left, kept quiet
+                    so the common all-restorable trail doesn't read as noise. */}
+                {turn.hasRestorable && (
+                  <circle
+                    className="map-restore-dot"
+                    cx={-p.r * 0.72}
+                    cy={p.r * 0.72}
+                    r={3}
+                  />
                 )}
                 <text className="map-waypoint-ask" y={p.r + 16}>
                   {turn.ask.length > 34 ? `${turn.ask.slice(0, 33)}…` : turn.ask}

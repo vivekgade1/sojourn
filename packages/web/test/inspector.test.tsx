@@ -283,3 +283,79 @@ describe("Inspector / flag-context restore targets the parent", () => {
     await waitFor(() => expect(preflightSpy).toHaveBeenCalledWith("claude:root"));
   });
 });
+
+describe("Inspector / restorability gates the restore button", () => {
+  function restoreAtButton() {
+    return screen.getByRole("button", { name: /restore at this node/i }) as HTMLButtonElement;
+  }
+
+  it("disables the outer restore button and shows a tooltip when the node is not restorable", () => {
+    const node = makeNode("claude:thinned", { restorable: false });
+    const preflightSpy = vi.spyOn(api, "preflight");
+
+    render(<Inspector node={node} onFlagDismissed={() => {}} onAnnotationAdded={() => {}} />);
+
+    const btn = restoreAtButton();
+    expect(btn.disabled).toBe(true);
+    expect(btn.getAttribute("title")).toMatch(/snapshot unavailable/i);
+    // A disabled button must never reach preflight.
+    fireEvent.click(btn);
+    expect(preflightSpy).not.toHaveBeenCalled();
+  });
+
+  it("enables the outer restore button when the node is restorable", () => {
+    const node = makeNode("claude:ok", { restorable: true });
+    render(<Inspector node={node} onFlagDismissed={() => {}} onAnnotationAdded={() => {}} />);
+    expect(restoreAtButton().disabled).toBe(false);
+  });
+
+  it("enables the outer restore button when restorable is undefined (backward-safe)", () => {
+    // makeNode omits `restorable` → undefined → must NOT disable restore.
+    const node = makeNode("claude:legacy");
+    render(<Inspector node={node} onFlagDismissed={() => {}} onAnnotationAdded={() => {}} />);
+    expect(restoreAtButton().disabled).toBe(false);
+  });
+
+  it("gates 'restore to before this node' on the PARENT's restorability", () => {
+    const parent = makeNode("claude:parent", { restorable: false });
+    const child = makeNode("claude:child", {
+      kind: "assistant",
+      parentId: "claude:parent",
+      flags: [makeStoredFlag({ nodeId: "claude:child" })],
+    });
+
+    render(
+      <Inspector
+        node={child}
+        path={[parent, child]}
+        onFlagDismissed={() => {}}
+        onAnnotationAdded={() => {}}
+      />,
+    );
+
+    // The child itself is restorable (undefined), but the parent — the actual
+    // restore target for "before this node" — is not, so the button is disabled.
+    const beforeBtn = screen.getByRole("button", {
+      name: /restore to before this node/i,
+    }) as HTMLButtonElement;
+    expect(beforeBtn.disabled).toBe(true);
+    expect(beforeBtn.getAttribute("title")).toMatch(/snapshot unavailable/i);
+  });
+
+  it("leaves 'restore to before this node' enabled when the parent is missing from the path (unknown-safe)", () => {
+    const child = makeNode("claude:orphan", {
+      kind: "assistant",
+      parentId: "claude:absent",
+      flags: [makeStoredFlag({ nodeId: "claude:orphan" })],
+    });
+
+    render(
+      <Inspector node={child} path={[child]} onFlagDismissed={() => {}} onAnnotationAdded={() => {}} />,
+    );
+
+    const beforeBtn = screen.getByRole("button", {
+      name: /restore to before this node/i,
+    }) as HTMLButtonElement;
+    expect(beforeBtn.disabled).toBe(false);
+  });
+});

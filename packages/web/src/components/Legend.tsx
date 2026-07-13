@@ -36,6 +36,10 @@ export function Legend({ nodeCount, sessionCount, totalSessionCount, view }: Leg
             decision / checkpoint
           </span>
           <span className="legend-chip">
+            <span className="legend-glyph legend-glyph-restore" />
+            restore point
+          </span>
+          <span className="legend-chip">
             <span className="legend-glyph legend-glyph-here" />
             you are here
           </span>
@@ -51,6 +55,10 @@ export function Legend({ nodeCount, sessionCount, totalSessionCount, view }: Leg
               {KIND_LABEL[kind]}
             </span>
           ))}
+          <span className="legend-chip">
+            <span className="legend-glyph legend-glyph-restore" />
+            restore point
+          </span>
           <span className="legend-hint">
             time flows left → right · stacked nodes = parallel tool calls · hover a node to light
             its path

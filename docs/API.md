@@ -8,7 +8,7 @@ Base: `http://localhost:4177` (env `SOJOURN_PORT`). All JSON. Types refer to `@s
 |---|---|---|---|
 | GET | `/api/health` | — | `{ ok: true, version: string }` |
 | GET | `/api/projects` | — | `Project[]` |
-| GET | `/api/projects/:id/graph` | — | `{ project: Project, sessions: SessionRow[], nodes: ChronoNode[] }` (nodes carry `flags`) |
+| GET | `/api/projects/:id/graph` | — | `{ project: Project, sessions: SessionRow[], nodes: ChronoNode[] }` (each node carries `flags` and `restorable: boolean`) |
 | GET | `/api/nodes/:id` | — | `ChronoNode` with `flags` + `annotations` (404 if missing) |
 | GET | `/api/nodes/:id/diff` | — | `{ changes: FileChange[] }` — parent snapshot → node snapshot; `{ changes: [] }` when no snapshots |
 | GET | `/api/nodes/:id/diff/file?path=P` | — | `{ patch: string }` |
@@ -46,3 +46,4 @@ Server → client events (JSON):
 - Node ids are `"<cli>:<nativeUuid>"` and appear URL-encoded in routes (`encodeURIComponent`).
 - Errors: `{ error: string }` with appropriate 4xx/5xx status.
 - The daemon never mutates the user's `.git`; restores land in `$SOJOURN_HOME/worktrees/...`.
+- `restorable` (graph route): a node is `restorable: true` when its *effective* snapshot tree — its own `snapshotRef`, or the nearest snapshotted ancestor's if it has none — exists and is reachable in the shadow snapshot repo. This equals the `treeValid` a `POST /api/nodes/:id/preflight` would report for that node. It is computed entirely over the returned in-memory node set (no per-node git call — the graph route is hit on every page load and websocket reconnect), and it is **fail-open**: a transient shadow-git error while probing a tree keeps `restorable: true` (preflight remains the hard gate before any checkout). A node with no snapshot on itself or any ancestor is always `restorable: false`.

@@ -116,4 +116,38 @@ describe("buildJourneys", () => {
     expect(index.get("a1")).toBe("p1");
     expect(index.get("p2")).toBe("p2");
   });
+
+  it("marks a turn restore-ready when it holds >=1 snapshot-bearing restorable node", () => {
+    const nodes = [
+      makeNode("p1", "prompt"),
+      makeNode("a1", "assistant", { snapshotRef: "tree-abc", restorable: true }),
+    ];
+    const [journey] = buildJourneys(nodes);
+    expect(journey!.turns[0]!.hasRestorable).toBe(true);
+    expect(journey!.turns[0]!.restorableCount).toBe(1);
+  });
+
+  it("treats a snapshot-bearing node with a MISSING restorable field as restore-ready (backward-safe)", () => {
+    const nodes = [
+      makeNode("p1", "prompt"),
+      // snapshotRef present, restorable undefined → unknown-safe → counts.
+      makeNode("a1", "assistant", { snapshotRef: "tree-def" }),
+    ];
+    const [journey] = buildJourneys(nodes);
+    expect(journey!.turns[0]!.hasRestorable).toBe(true);
+    expect(journey!.turns[0]!.restorableCount).toBe(1);
+  });
+
+  it("is NOT restore-ready when every node is thinned or unsnapshotted", () => {
+    const nodes = [
+      makeNode("p1", "prompt"), // no snapshot
+      // thinned: snapshot recorded but no longer restorable (gc'd)
+      makeNode("a1", "assistant", { snapshotRef: "tree-gone", restorable: false }),
+      // unsnapshotted but nominally restorable via an ancestor — not a restore anchor itself
+      makeNode("t1", "tool_use", { snapshotRef: null, restorable: true }),
+    ];
+    const [journey] = buildJourneys(nodes);
+    expect(journey!.turns[0]!.hasRestorable).toBe(false);
+    expect(journey!.turns[0]!.restorableCount).toBe(0);
+  });
 });

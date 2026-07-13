@@ -712,5 +712,37 @@ describe("daemon HTTP API", () => {
       expect(typeof res.body.error).toBe("string");
       expect(res.text).not.toMatch(/<html/i);
     });
+
+    it("returns 500 JSON (does not HANG) when the async graph route's getGraph throws — e.g. a corrupted row's JSON.parse", async () => {
+      // The graph route became async to compute `restorable`; Express 4 does
+      // not forward async rejections to the error middleware, so an unguarded
+      // throw would hang the hottest route. Its own try/catch must catch it.
+      const fakeProject = { id: "pgraph", root: "/tmp/x", createdAt: "t" };
+      const throwingStore = {
+        ...store,
+        getProject: () => fakeProject,
+        getSessions: () => [],
+        getGraph: () => {
+          throw new Error("corrupted row: unexpected token in JSON");
+        },
+      };
+      const deps: ServerDeps = {
+        store: throwingStore as unknown as typeof store,
+        snapshotterFor,
+        flagEngine,
+        restoreEngine,
+        events: sink,
+        version: "test-version",
+        fetchJson,
+      };
+      const throwingApp = createApp(deps);
+
+      const res = await request(throwingApp).get("/api/projects/pgraph/graph");
+
+      expect(res.status).toBe(500);
+      expect(res.headers["content-type"]).toMatch(/json/);
+      expect(typeof res.body.error).toBe("string");
+      expect(res.text).not.toMatch(/<html/i);
+    });
   });
 });

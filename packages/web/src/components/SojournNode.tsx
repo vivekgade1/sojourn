@@ -1,4 +1,5 @@
 import type { ChronoNode } from "../types";
+import { isRestoreReady, isThinned } from "../restore";
 import { FlagBadge } from "./FlagBadge";
 
 export interface SojournNodeProps {
@@ -36,6 +37,11 @@ export function SojournNode({
 }: SojournNodeProps) {
   const flags = node.flags ?? [];
   const gist = node.label ?? node.summary;
+  // Restore markers key off the node's OWN snapshot: a snapshot-bearing node is
+  // an actual rollback anchor. "restore-ready" and "thinned" are mutually
+  // exclusive; nodes with no snapshot of their own get neither.
+  const restoreReady = isRestoreReady(node);
+  const thinned = isThinned(node);
   const classes = [
     "sojourn-node",
     `sojourn-node-cli-${node.cli}`,
@@ -44,6 +50,8 @@ export function SojournNode({
     dimmed ? "dimmed" : "",
     receded ? "receded" : "",
     searchHit ? "search-hit" : "",
+    restoreReady ? "restore-ready" : "",
+    thinned ? "thinned" : "",
   ]
     .filter(Boolean)
     .join(" ");
@@ -58,6 +66,15 @@ export function SojournNode({
     >
       <div className="sojourn-node-kind-bar" style={{ background: `var(--kind-${node.kind})` }} />
       {isHere && <div className="sojourn-node-here">you are here</div>}
+      {restoreReady && (
+        <span className="sojourn-node-restore-dot" title="Restore point — a snapshot is captured here" />
+      )}
+      {thinned && (
+        <span
+          className="sojourn-node-thinned-mark"
+          title="Snapshot thinned by retention (soj gc) — restore unavailable"
+        />
+      )}
       <div className="sojourn-node-header">
         <span className="sojourn-node-kind" style={{ color: `var(--kind-${node.kind})` }}>
           {KIND_LABEL[node.kind]}

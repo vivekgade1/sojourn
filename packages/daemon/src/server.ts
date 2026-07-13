@@ -394,16 +394,40 @@ export function createApp(deps: ServerDeps): Express {
     res.json(deps.store.getProjects());
   });
 
-  app.get("/api/projects/:id/graph", (req: Request, res: Response) => {
+  app.get("/api/projects/:id/graph", async (req: Request, res: Response) => {
     const id = decodeId(req.params.id);
-    const project = deps.store.getProject(id);
-    if (!project) {
-      res.status(404).json({ error: `Project not found: ${id}` });
-      return;
+    try {
+      const project = deps.store.getProject(id);
+      if (!project) {
+        res.status(404).json({ error: `Project not found: ${id}` });
+        return;
+      }
+      const sessions = deps.store.getSessions(id);
+      const nodes = deps.store.getGraph(id);
+
+      // Each node carries `restorable` — whether the restore button should be
+      // live — computed SCALE-SAFELY over the in-memory `nodes` array (this is
+      // the exact route the O(n^2) ingest-OOM fix, commit d22b490, was about:
+      // it is hit on every page load AND every websocket reconnect). No
+      // per-node store round-trip, no per-node git call: see computeRestorable.
+      // computeRestorable never throws — it fails open internally — so the
+      // graph always renders even if the shadow git repo is momentarily
+      // unavailable (preflight remains the hard gate before any checkout).
+      const restorable = await computeRestorable(deps, project, nodes);
+
+      res.json({
+        project,
+        sessions,
+        nodes: nodes.map((n) => ({ ...n, restorable: restorable.get(n.id) ?? false })),
+      });
+    } catch (err) {
+      // The route is async, and Express 4 does NOT forward async-handler
+      // rejections to the error middleware — an unguarded throw here (e.g.
+      // JSON.parse of a row corrupted by a crash mid-write) would HANG the
+      // hottest route in the app. Match the file's other async routes: 500 JSON.
+      logError(`[sojourn] graph route failed for project ${id}:`, err);
+      res.status(500).json({ error: "Failed to load project graph" });
     }
-    const sessions = deps.store.getSessions(id);
-    const nodes = deps.store.getGraph(id);
-    res.json({ project, sessions, nodes });
   });
 
   app.get("/api/nodes/:id", (req: Request, res: Response) => {
@@ -981,6 +1005,114 @@ export function createApp(deps: ServerDeps): Express {
   });
 
   return app;
+}
+
+/**
+ * Per-node `restorable` for the graph route, computed SCALE-SAFELY over the
+ * IN-MEMORY `nodes` array — never a per-node store round-trip and never a
+ * per-node git call (the O(n^2) ingest-OOM lesson, commit d22b490; this is
+ * that same hot route). Two passes:
+ *
+ *   1. Effective-tree resolution, pure and in-memory. Mirrors
+ *      findEffectiveTree()'s canonical self-first, cycle-guarded
+ *      nearest-ancestor-snapshot walk (so this matches restore/gc/preflight
+ *      by construction), but reads parents from a Map built ONCE from
+ *      `nodes` instead of store.getNode(), and MEMOIZES the resolved tree for
+ *      every node visited on a walk (path-compression, like d22b490's
+ *      turn-base memo) so the whole array resolves in O(n) total. A node with
+ *      no own snapshotRef and no snapshotted ancestor -> effective tree null.
+ *      This pass cannot throw.
+ *   2. hasTree() called ONCE per DISTINCT non-null effective tree (a small
+ *      capped concurrent pool), cached for the request. A node is restorable
+ *      iff its effective tree is non-null AND that tree validates — exactly
+ *      the preflight `treeValid` semantics (RestoreEngine.preflight:
+ *      `treeHash !== null && await hasTree(treeHash)`).
+ *
+ * Fail-open, two ways, because preflight is the hard gate before any actual
+ * checkout and a flaky probe must never grey out a genuinely-restorable
+ * node's button: (a) hasTree throwing for a tree -> that tree is treated as
+ * VALID; (b) a catastrophic failure obtaining the snapshotter at all -> every
+ * distinct tree treated valid. A node that simply has no snapshot anywhere
+ * stays restorable:false in every case (its effective tree is null).
+ */
+async function computeRestorable(
+  deps: ServerDeps,
+  project: Project,
+  nodes: ChronoNode[],
+): Promise<Map<string, boolean>> {
+  // ---- Pass 1: in-memory effective trees (pure; cannot throw) ----
+  const byId = new Map<string, ChronoNode>();
+  for (const n of nodes) byId.set(n.id, n);
+
+  // nodeId -> effective tree hash (null = no own/ancestor snapshot).
+  const effTree = new Map<string, string | null>();
+
+  const resolveEffTree = (startId: string): string | null => {
+    const chain: string[] = [];
+    const seen = new Set<string>();
+    let curId: string | null = startId;
+    let result: string | null = null;
+    while (curId !== null) {
+      if (effTree.has(curId)) {
+        result = effTree.get(curId) ?? null; // memo hit (path compression)
+        break;
+      }
+      if (seen.has(curId)) break; // cycle guard -> result stays null
+      seen.add(curId);
+      const cur = byId.get(curId);
+      if (!cur) break; // parent absent from graph -> null (findEffectiveTree parity)
+      if (cur.snapshotRef !== null) {
+        result = cur.snapshotRef; // self-first: nearest own/ancestor snapshot
+        effTree.set(curId, result); // memoize the snapshot-bearing node itself
+        break;
+      }
+      chain.push(curId);
+      curId = cur.parentId;
+    }
+    for (const id of chain) effTree.set(id, result);
+    return result;
+  };
+
+  const distinctTrees = new Set<string>();
+  for (const n of nodes) {
+    const t = resolveEffTree(n.id);
+    if (t !== null) distinctTrees.add(t);
+  }
+
+  // ---- Pass 2: hasTree ONCE per distinct tree (the only git work) ----
+  const valid = new Map<string, boolean>();
+  const treeList = [...distinctTrees];
+  try {
+    const snapshotter = deps.snapshotterFor(project);
+    const CONCURRENCY = 8;
+    let idx = 0;
+    const worker = async (): Promise<void> => {
+      while (idx < treeList.length) {
+        const tree = treeList[idx++];
+        try {
+          valid.set(tree, await snapshotter.hasTree(tree));
+        } catch {
+          valid.set(tree, true); // fail-open: transient git error -> keep the button live
+        }
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(CONCURRENCY, treeList.length) }, () => worker()),
+    );
+  } catch (err) {
+    // Couldn't even obtain a snapshotter (or the whole batch rejected): fail
+    // OPEN for every distinct tree rather than 500 the page every reader
+    // loads. Nodes with a null effective tree still resolve to false below.
+    logError("[sojourn] graph route: restorable hasTree pass failed (failing open):", err);
+    for (const tree of treeList) if (!valid.has(tree)) valid.set(tree, true);
+  }
+
+  const restorable = new Map<string, boolean>();
+  for (const n of nodes) {
+    const t = effTree.get(n.id) ?? null;
+    restorable.set(n.id, t !== null && valid.get(t) === true);
+  }
+  return restorable;
 }
 
 function findParentSnapshotRef(

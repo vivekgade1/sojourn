@@ -174,6 +174,9 @@ function AnnotationsSection({
   );
 }
 
+const RESTORE_UNAVAILABLE_TITLE =
+  "Snapshot unavailable — thinned by retention (soj gc) or never captured.";
+
 interface RestoreFlowProps {
   /** The node id whose snapshot the restore actually targets. */
   targetNodeId: string;
@@ -183,9 +186,21 @@ interface RestoreFlowProps {
   modalDescription: string;
   /** Optional section heading; omit to render the buttons inline (flag context). */
   heading?: string;
+  /**
+   * The TARGET node's restorability. `false` hard-disables the button (no
+   * snapshot to land on); `true`/`undefined` leave it enabled (undefined is the
+   * backward-safe unknown case — never disable on a missing field).
+   */
+  restorable?: boolean;
 }
 
-function RestoreFlow({ targetNodeId, buttonLabel, modalDescription, heading }: RestoreFlowProps) {
+function RestoreFlow({
+  targetNodeId,
+  buttonLabel,
+  modalDescription,
+  heading,
+  restorable,
+}: RestoreFlowProps) {
   const [preflight, setPreflight] = useState<RestorePreflight | null>(null);
   // The node id captured at the moment preflight was requested. This is the
   // ONLY id ever passed to api.restore — never the (possibly-changed)
@@ -229,10 +244,20 @@ function RestoreFlow({ targetNodeId, buttonLabel, modalDescription, heading }: R
     }
   }
 
+  // `restorable === false` means the target has no reachable snapshot — restore
+  // is impossible, so the button is hard-disabled with an explanatory tooltip.
+  // The in-modal `!treeValid` backstop below still guards the confirm action.
+  const unrestorable = restorable === false;
+
   return (
     <div className={heading ? "inspector-section" : "restore-inline"}>
       {heading && <h3>{heading}</h3>}
-      <button className="restore-btn" onClick={startPreflight} disabled={busy}>
+      <button
+        className="restore-btn"
+        onClick={startPreflight}
+        disabled={unrestorable || busy}
+        title={unrestorable ? RESTORE_UNAVAILABLE_TITLE : undefined}
+      >
         {busy ? "Checking…" : buttonLabel}
       </button>
       {error && <div className="flag-evidence">{error}</div>}
@@ -325,6 +350,14 @@ function InspectorContent({
   const activeFlags = allFlags.filter((f) => !f.dismissed && !f.autoResolved);
   const resolvedFlags = allFlags.filter((f) => !f.dismissed && f.autoResolved);
 
+  // Restorability of the "restore to before this node" target — the PARENT.
+  // We only have the lineage (`path`, root→here inclusive) to look in; if the
+  // parent isn't there (or there is no parent), the value is undefined, which
+  // the RestoreFlow reads as unknown-safe (button stays enabled). A root node
+  // (no parent) restores to itself, so use its own restorability there.
+  const parentNode = node.parentId ? path?.find((p) => p.id === node.parentId) : undefined;
+  const beforeTargetRestorable = node.parentId ? parentNode?.restorable : node.restorable;
+
   async function runAdvisoryCritic() {
     if (criticBusy) return;
     setCriticBusy(true);
@@ -411,6 +444,11 @@ function InspectorContent({
             // rollback is to the state BEFORE this node, i.e. its parent's
             // snapshot. Root nodes (no parent) fall back to the node itself.
             targetNodeId={node.parentId ?? node.id}
+            // Gate on the ACTUAL target's restorability: the parent for a
+            // "before this node" restore, or the node itself at a root. If the
+            // parent isn't in the lineage we were handed, its restorability is
+            // unknown → leave enabled (never disable on a missing field).
+            restorable={beforeTargetRestorable}
             buttonLabel="Restore to before this node"
             modalDescription={
               node.parentId
@@ -426,6 +464,7 @@ function InspectorContent({
       <RestoreFlow
         key={node.id}
         targetNodeId={node.id}
+        restorable={node.restorable}
         heading="Restore"
         buttonLabel="Restore at this node"
         modalDescription="This restores the files exactly as they were AT this node's snapshot, into a new worktree."

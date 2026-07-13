@@ -60,6 +60,14 @@ export interface ChronoNode {
   timestamp: string;
   /** git tree hash of the WHOLE working dir, from the shadow repo */
   snapshotRef: string | null;
+  /**
+   * True iff a restore at this node is possible — its own snapshot, else the
+   * nearest ancestor's, still exists in the shadow repo. `false` means restore
+   * is impossible (thinned by `soj gc`, or never captured). A MISSING field is
+   * treated as restorable/unknown-safe by the UI (backward compatibility —
+   * never disable restore on absence).
+   */
+  restorable?: boolean;
   label: string | null;
   summary: string;
   content: unknown;

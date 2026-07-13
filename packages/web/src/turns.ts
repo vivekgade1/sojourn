@@ -1,4 +1,5 @@
 import type { ChronoNode } from "./types";
+import { isRestoreReady } from "./restore";
 
 export interface Turn {
   /** id of the turn's first node — stable, unique within the journey. */
@@ -21,6 +22,10 @@ export interface Turn {
   marks: ChronoNode[];
   /** This turn contains the session's latest node. */
   isHere: boolean;
+  /** Count of snapshot-bearing, still-restorable nodes (restore anchors). */
+  restorableCount: number;
+  /** This turn holds >=1 restore anchor — a waypoint you can roll back to. */
+  hasRestorable: boolean;
 }
 
 export interface Journey {
@@ -85,6 +90,7 @@ export function buildJourneys(nodes: ChronoNode[]): Journey[] {
       const firstAssistant = group.find((n) => n.kind === "assistant");
       const toolUses = group.filter((n) => n.kind === "tool_use");
       const toolNames = [...new Set(toolUses.map(toolNameOf).filter((n): n is string => !!n))];
+      const restorableCount = group.filter(isRestoreReady).length;
       return {
         id: group[0]!.id,
         index: i + 1,
@@ -98,6 +104,8 @@ export function buildJourneys(nodes: ChronoNode[]): Journey[] {
         advisoryCount: group.reduce((sum, n) => sum + activeFlagCount(n, "advisory"), 0),
         marks: group.filter((n) => MARK_KINDS.has(n.kind)),
         isHere: group.some((n) => n.id === latestId),
+        restorableCount,
+        hasRestorable: restorableCount > 0,
       };
     });
 
