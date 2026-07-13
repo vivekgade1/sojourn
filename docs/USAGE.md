@@ -69,9 +69,9 @@ soj mark <label> [--kind decision|assumption|checkpoint] [--session <id>]
 soj checkpoint <name> [--session <id>]
                                  Shorthand for `soj mark <name> --kind checkpoint`.
 
-soj restore <nodeId>             PREFLIGHT ONLY: prints the target snapshot, validity, the full
-                                 side-effect warning list, and the resume command — then exits 1
-                                 without touching anything.
+soj restore <nodeId>             PREFLIGHT ONLY: prints the full side-effect warning list
+                                 (including whether the snapshot is missing/thinned) and the
+                                 resume command — then exits 1 without touching anything.
 soj restore <nodeId> --yes       Actually restore: safety snapshot → new worktree → prints the
                                  worktree path and resume command.
 
