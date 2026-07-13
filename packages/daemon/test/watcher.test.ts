@@ -96,3 +96,69 @@ describe("startWatcher — rewind sidecar tolerance (V2 must-fix I3)", () => {
     errorSpy.mockRestore();
   });
 });
+
+describe("startWatcher — scan-failure log dedup (no log storms)", () => {
+  let watchDir: string;
+  let shadowRoot: string;
+  let store: GraphStore;
+  let handle: WatcherHandle | null = null;
+
+  beforeEach(() => {
+    watchDir = fs.mkdtempSync(path.join(os.tmpdir(), "sojourn-watcher-dedup-"));
+    shadowRoot = fs.mkdtempSync(path.join(os.tmpdir(), "sojourn-watcher-dedup-shadow-"));
+    store = new GraphStore(":memory:");
+  });
+
+  afterEach(async () => {
+    if (handle) await handle.close();
+    handle = null;
+    store.close();
+    for (const d of [watchDir, shadowRoot]) fs.rmSync(d, { recursive: true, force: true });
+  });
+
+  function makeDeps(): IngestDeps {
+    return {
+      store,
+      flagEngine: new FlagEngine(),
+      events: { broadcast() {} },
+      fetchJson: vi.fn(async () => ({ status: 200, body: {} })) as unknown as FetchJson,
+      transcripts: new TranscriptIndex(),
+      snapshotterFor(project: Project): SnapshotterLike {
+        return new ShadowSnapshotter({
+          projectRoot: project.root,
+          shadowDir: path.join(shadowRoot, project.id),
+        });
+      },
+    };
+  }
+
+  it("a transcript that fails to scan logs once per file version, again after the version changes", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    handle = startWatcher(makeDeps(), watchDir);
+
+    // A DIRECTORY named *.jsonl: readFile fails with EISDIR every time.
+    const brokenPath = path.join(watchDir, "broken.jsonl");
+    fs.mkdirSync(brokenPath);
+
+    const scanFailures = () =>
+      errorSpy.mock.calls.filter((args) =>
+        args.some((a) => typeof a === "string" && a.includes("failed to scan")),
+      ).length;
+
+    await handle.rescan(brokenPath);
+    expect(scanFailures()).toBe(1);
+
+    // Same file version -> repeated scans stay silent.
+    await handle.rescan(brokenPath);
+    await handle.rescan(brokenPath);
+    expect(scanFailures()).toBe(1);
+
+    // Version bump (dir mtime/size changes when an entry lands) -> logs once more.
+    await new Promise((r) => setTimeout(r, 20)); // ensure a distinct mtime tick
+    fs.writeFileSync(path.join(brokenPath, "entry"), "x", "utf8");
+    await handle.rescan(brokenPath);
+    expect(scanFailures()).toBe(2);
+
+    errorSpy.mockRestore();
+  });
+});

@@ -1,4 +1,6 @@
+import type { SessionOption } from "../sessions";
 import type { Project } from "../types";
+import { SessionFilter } from "./SessionFilter";
 
 export interface ToolbarProps {
   projects: Project[];
@@ -18,6 +20,9 @@ export interface ToolbarProps {
   matchCount: number;
   activeMatchIndex: number; // 0-based; -1 when none
   onCycleMatch: (direction: 1 | -1) => void;
+  sessions: SessionOption[];
+  selectedSessionIds: Set<string>;
+  onSessionSelectionChange: (ids: string[]) => void;
 }
 
 export function Toolbar({
@@ -38,6 +43,9 @@ export function Toolbar({
   matchCount,
   activeMatchIndex,
   onCycleMatch,
+  sessions,
+  selectedSessionIds,
+  onSessionSelectionChange,
 }: ToolbarProps) {
   const searching = searchQuery.trim().length > 0;
   return (
@@ -75,6 +83,12 @@ export function Toolbar({
           Graph
         </button>
       </div>
+
+      <SessionFilter
+        sessions={sessions}
+        selectedIds={selectedSessionIds}
+        onChange={onSessionSelectionChange}
+      />
 
       <div className={`toolbar-search${searching ? " active" : ""}`}>
         <input

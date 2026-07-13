@@ -24,6 +24,8 @@ import {
   killPid,
   pollHealth,
   isDaemonProcess,
+  daemonLogPath,
+  tailLogLines,
   type PsCommandFn,
 } from "./daemonCtl.js";
 
@@ -59,21 +61,46 @@ export interface ProgramDeps {
 
 export function defaultDeps(overrides: Partial<ProgramDeps> = {}): ProgramDeps {
   const baseUrl = overrides.baseUrl ?? `http://localhost:${process.env.SOJOURN_PORT ?? "4177"}`;
+  const home = overrides.sojournHome ?? sojournHome();
   return {
     baseUrl,
-    sojournHome: overrides.sojournHome ?? sojournHome(),
+    sojournHome: home,
     cwd: overrides.cwd ?? process.cwd(),
     stdout: overrides.stdout ?? ((line) => process.stdout.write(line + "\n")),
     stderr: overrides.stderr ?? ((line) => process.stderr.write(line + "\n")),
     spawnDaemon:
       overrides.spawnDaemon ??
       ((entry, env) => {
+        // Pipe the child's stdout+stderr into $SOJOURN_HOME/daemon.log
+        // (append): output from a crash BEFORE the daemon's own logger
+        // initializes (bad require, syntax error, native module failure)
+        // must land somewhere readable, never a discarded pipe.
+        // SOJOURN_DAEMON_DETACHED tells the daemon's logger to skip console
+        // mirroring — its stdout already IS daemon.log here, and mirroring
+        // would double every line.
+        let stdio: "ignore" | Array<"ignore" | number> = "ignore";
+        let fd: number | null = null;
+        try {
+          fs.mkdirSync(home, { recursive: true });
+          fd = fs.openSync(daemonLogPath(home), "a");
+          stdio = ["ignore", fd, fd];
+        } catch {
+          // unwritable home: fall back to the old discard behavior rather
+          // than failing the start
+        }
         const child = spawn(process.execPath, [entry], {
           detached: true,
-          stdio: "ignore",
-          env,
+          stdio,
+          env: { ...env, SOJOURN_DAEMON_DETACHED: "1" },
         });
         child.unref();
+        if (fd !== null) {
+          try {
+            fs.closeSync(fd); // child holds its own copy of the fd
+          } catch {
+            // already closed — nothing to do
+          }
+        }
         return { pid: child.pid, unref: () => child.unref() };
       }),
     openUrl:
@@ -146,6 +173,12 @@ export function buildProgram(deps: ProgramDeps): Command {
       });
       if (!healthy) {
         deps.stderr(`daemon did not become healthy within timeout (pid ${child.pid})`);
+        const tail = tailLogLines(deps.sojournHome, 10);
+        if (tail.length > 0) {
+          deps.stderr("last daemon.log lines:");
+          for (const line of tail) deps.stderr(`  ${line}`);
+        }
+        deps.stderr(`see ${daemonLogPath(deps.sojournHome)}`);
         deps.exit(1);
         return;
       }
@@ -185,8 +218,20 @@ export function buildProgram(deps: ProgramDeps): Command {
     .description("show daemon status")
     .action(async () => {
       const pid = readPid(deps.sojournHome);
-      if (pid === null || !isPidAlive(pid)) {
+      if (pid === null) {
         deps.stdout("daemon: stopped");
+        return;
+      }
+      if (!isPidAlive(pid)) {
+        // Pidfile exists but its process is gone: the daemon crashed or was
+        // killed out-of-band. Surface the evidence right here.
+        deps.stdout(`daemon: stopped (pidfile pid ${pid} is dead — crashed or killed)`);
+        const tail = tailLogLines(deps.sojournHome, 5);
+        if (tail.length > 0) {
+          deps.stdout("last daemon.log lines:");
+          for (const line of tail) deps.stdout(`  ${line}`);
+        }
+        deps.stdout(`see ${daemonLogPath(deps.sojournHome)}`);
         return;
       }
       const res = await deps.fetchJson(`${deps.baseUrl.replace(/\/$/, "")}/api/health`).catch(

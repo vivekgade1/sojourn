@@ -1,3 +1,4 @@
+import { logError } from "./logger.js";
 import fs from "node:fs";
 import path from "node:path";
 import type {
@@ -11,6 +12,7 @@ import type {
   IngestBatch,
   Project,
   SnapshotterLike,
+  StoredFlag,
 } from "@sojourn/core";
 import { applyBudgets, autoResolveFlags } from "@sojourn/core";
 import { rewindSidecarPathFor } from "@sojourn/adapter-claude";
@@ -82,7 +84,7 @@ export function readRestoreManifest(root: string): WorktreeRestoreManifest | nul
     raw = fs.readFileSync(manifestPath, "utf8");
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
-      console.error(
+      logError(
         `[sojourn] ingest: failed to read worktree restore manifest at ${manifestPath}:`,
         err,
       );
@@ -99,12 +101,12 @@ export function readRestoreManifest(root: string): WorktreeRestoreManifest | nul
     if (typeof nodeId === "string" && nodeId.length > 0) {
       return { nodeId };
     }
-    console.error(
+    logError(
       `[sojourn] ingest: invalid worktree restore manifest at ${manifestPath}: missing "nodeId"`,
     );
     return null;
   } catch (err) {
-    console.error(
+    logError(
       `[sojourn] ingest: failed to parse worktree restore manifest at ${manifestPath}:`,
       err,
     );
@@ -146,7 +148,7 @@ function resolveRewindSidecar(
     raw = fs.readFileSync(sidecarPath, "utf8");
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
-      console.error(
+      logError(
         `[sojourn] ingest: failed to read rewind sidecar at ${sidecarPath}:`,
         err,
       );
@@ -157,7 +159,7 @@ function resolveRewindSidecar(
   try {
     const parsed: unknown = JSON.parse(raw);
     if (parsed === null || typeof parsed !== "object") {
-      console.error(`[sojourn] ingest: invalid rewind sidecar at ${sidecarPath}: not an object`);
+      logError(`[sojourn] ingest: invalid rewind sidecar at ${sidecarPath}: not an object`);
       return null;
     }
     const originNodeId = (parsed as { originNodeId?: unknown }).originNodeId;
@@ -168,14 +170,14 @@ function resolveRewindSidecar(
       !Array.isArray(lineUuids) ||
       !lineUuids.every((u): u is string => typeof u === "string" && u.length > 0)
     ) {
-      console.error(
+      logError(
         `[sojourn] ingest: invalid rewind sidecar at ${sidecarPath}: missing "originNodeId"/"lineUuids"`,
       );
       return null;
     }
     return { originNodeId, lineUuids: new Set(lineUuids) };
   } catch (err) {
-    console.error(`[sojourn] ingest: failed to parse rewind sidecar at ${sidecarPath}:`, err);
+    logError(`[sojourn] ingest: failed to parse rewind sidecar at ${sidecarPath}:`, err);
     return null;
   }
 }
@@ -220,7 +222,7 @@ function resolveWorktreeAlias(
 
   const originNode = store.getNode(manifest.nodeId);
   if (!originNode) {
-    console.error(
+    logError(
       `[sojourn] ingest: worktree restore manifest at ${diskRoot} references unknown node ` +
         `${manifest.nodeId}; ingesting as a normal (non-aliased) project`,
     );
@@ -229,7 +231,7 @@ function resolveWorktreeAlias(
 
   const originProject = store.getProject(originNode.projectId);
   if (!originProject) {
-    console.error(
+    logError(
       `[sojourn] ingest: worktree restore manifest at ${diskRoot} references node ` +
         `${manifest.nodeId} whose project ${originNode.projectId} no longer exists; ingesting ` +
         `as a normal (non-aliased) project`,
@@ -274,7 +276,7 @@ export async function ingestBatch(
       project = store.upsertProject(batch.project.root, batch.project.name);
     }
   } catch (err) {
-    console.error("[sojourn] ingest: failed to upsert project:", err);
+    logError("[sojourn] ingest: failed to upsert project:", err);
     return { added };
   }
 
@@ -293,14 +295,14 @@ export async function ingestBatch(
       if (store.getNode(sidecar.originNodeId)) {
         rewindOriginId = sidecar.originNodeId;
       } else {
-        console.error(
+        logError(
           `[sojourn] ingest: rewind sidecar for session ${batch.session.id} references unknown ` +
             `node ${sidecar.originNodeId}; ingesting without a rewind parent edge`,
         );
       }
     }
   } catch (err) {
-    console.error("[sojourn] ingest: rewind sidecar resolution failed:", err);
+    logError("[sojourn] ingest: rewind sidecar resolution failed:", err);
   }
 
   try {
@@ -311,7 +313,7 @@ export async function ingestBatch(
       title: originNodeId !== null ? `worktree:${shortNodeId(originNodeId)}` : batch.session.title,
     });
   } catch (err) {
-    console.error("[sojourn] ingest: failed to upsert session:", err);
+    logError("[sojourn] ingest: failed to upsert session:", err);
   }
 
   const newNodes: ChronoNode[] = [];
@@ -377,7 +379,7 @@ export async function ingestBatch(
         added.push(node.id);
       }
     } catch (err) {
-      console.error(`[sojourn] ingest: failed to upsert node ${node.id}:`, err);
+      logError(`[sojourn] ingest: failed to upsert node ${node.id}:`, err);
     }
   }
 
@@ -425,7 +427,7 @@ export async function ingestBatch(
       store.setSnapshotRef(last.id, nodeTree);
       last.snapshotRef = nodeTree;
     } catch (err) {
-      console.error("[sojourn] ingest: snapshot failed:", err);
+      logError("[sojourn] ingest: snapshot failed:", err);
       snapshotter = null;
       nodeTree = null;
     }
@@ -454,24 +456,81 @@ export async function ingestBatch(
       diffComputed: boolean;
     }
 
+    // ---- Scale guards (the 11k-step lesson) ------------------------------
+    // A first-ever scan of a big existing transcript arrives as ONE batch
+    // with thousands of new assistant nodes. The flag phases below used to
+    // (a) call store.getSessionNodes() once PER assistant node — each call
+    //     re-materializes the ENTIRE session (content JSON.parse + flags +
+    //     annotations queries per node) into a FRESH array that stayed
+    //     retained in `productions[].ctx.priorNodes` — O(n²) retained
+    //     memory. On a real 11k-step transcript this OOM-killed the daemon
+    //     (~100MB/s of heap growth; dead in about a minute, silently when
+    //     stdio was discarded).
+    // (b) walk parent chains via store.getNode() per node — O(n²) queries.
+    // (c) compute a FULL-TREE git diff (base null) per assistant node.
+    // All phases now share ONE session materialization, one node-id lookup
+    // map over it, one memoized (path-compressed) turn-base resolution, and
+    // skip the diff entirely when there is no grounded base.
+    const sessionNodesCache = new Map<string, ChronoNode[]>();
+    const sessionNodesFor = (sessionId: string): ChronoNode[] => {
+      let nodes = sessionNodesCache.get(sessionId);
+      if (!nodes) {
+        nodes = store.getSessionNodes(sessionId);
+        sessionNodesCache.set(sessionId, nodes);
+      }
+      return nodes;
+    };
+    const nodeById = new Map<string, ChronoNode>();
+    for (const n of sessionNodesFor(batch.session.id)) nodeById.set(n.id, n);
+    // Cross-session parents (fork/rewind edges) miss the map -> store lookup.
+    const lookupNode = (id: string): ChronoNode | null => nodeById.get(id) ?? store.getNode(id);
+    const turnBaseMemo = new Map<string, string | null>();
+    const turnBaseOf = (n: ChronoNode): string | null =>
+      resolveTurnBaseTree(store, n, { getNode: lookupNode, memo: turnBaseMemo });
+
+    // Phase-5 store facade: autoResolveFlags calls getSessionNodes() itself
+    // and getFlags() once per prior node — per production. Serve both from
+    // the shared caches; resolveFlag stays live and drops the flag cache
+    // (resolves are rare, correctness over cleverness).
+    const flagsCache = new Map<string, StoredFlag[]>();
+    const autoResolveStore = {
+      getSessionNodes: (sessionId: string) => sessionNodesFor(sessionId),
+      getFlags: (nodeId: string): StoredFlag[] => {
+        let flags = flagsCache.get(nodeId);
+        if (!flags) {
+          flags = store.getFlags(nodeId);
+          flagsCache.set(nodeId, flags);
+        }
+        return flags;
+      },
+      resolveFlag: (id: number): void => {
+        store.resolveFlag(id);
+        flagsCache.clear();
+      },
+    };
+
     // Phase 1: run the checks per node — nothing is persisted yet, so
     // budgets below can see one whole turn segment's flags at once.
     const productions: FlagProduction[] = [];
     for (const node of newAssistantNodes) {
       try {
-        const sessionNodes = store.getSessionNodes(node.sessionId);
-        const turnPrompt = resolveTurnPrompt(store, node);
-        const parentTree = resolveTurnBaseTree(store, node);
+        const sessionNodes = sessionNodesFor(node.sessionId);
+        const turnPrompt = resolveTurnPrompt(store, node, lookupNode);
+        const parentTree = turnBaseOf(node);
         const effectiveNodeTree = node.snapshotRef ?? nodeTree;
 
         let diff: FileChange[] = [];
         let diffComputed = false;
-        if (snapshotter && effectiveNodeTree !== null) {
+        // parentTree null means "no grounded turn base": every diff-scoped
+        // check goes silent then, and diff(null, tree) would list the WHOLE
+        // tree (one git spawn + a full FileChange[] retained per node) for
+        // nothing — skip it.
+        if (snapshotter && effectiveNodeTree !== null && parentTree !== null) {
           try {
             diff = await snapshotter.diff(parentTree, effectiveNodeTree);
             diffComputed = true;
           } catch (err) {
-            console.error("[sojourn] ingest: diff failed for flag context:", err);
+            logError("[sojourn] ingest: diff failed for flag context:", err);
           }
         }
 
@@ -496,7 +555,7 @@ export async function ingestBatch(
           diffComputed,
         });
       } catch (err) {
-        console.error(`[sojourn] ingest: flag run failed for node ${node.id}:`, err);
+        logError(`[sojourn] ingest: flag run failed for node ${node.id}:`, err);
       }
     }
 
@@ -567,7 +626,7 @@ export async function ingestBatch(
           }
         }
       } catch (err) {
-        console.error("[sojourn] ingest: flag budgeting/persist failed:", err);
+        logError("[sojourn] ingest: flag budgeting/persist failed:", err);
       }
 
       // Phase 4: index the turn's files (decision-memory `node_files`) onto
@@ -586,7 +645,7 @@ export async function ingestBatch(
           break;
         }
       } catch (err) {
-        console.error("[sojourn] ingest: indexNodeFiles failed:", err);
+        logError("[sojourn] ingest: indexNodeFiles failed:", err);
       }
 
       // Phase 5: auto-resolve earlier flags against each node's ground
@@ -598,16 +657,16 @@ export async function ingestBatch(
       for (const p of segment) {
         try {
           await autoResolveFlags(
-            store,
+            autoResolveStore,
             p.node,
             p.ctx,
             (resolvedNodeId) => {
               resolvedNodeIds.add(resolvedNodeId);
             },
-            (n) => resolveTurnBaseTree(store, n),
+            turnBaseOf,
           );
         } catch (err) {
-          console.error("[sojourn] ingest: autoResolveFlags failed:", err);
+          logError("[sojourn] ingest: autoResolveFlags failed:", err);
         }
       }
 
@@ -621,7 +680,7 @@ export async function ingestBatch(
             flags: store.getFlags(nodeId),
           });
         } catch (err) {
-          console.error("[sojourn] ingest: failed to broadcast flags_updated:", err);
+          logError("[sojourn] ingest: failed to broadcast flags_updated:", err);
         }
       }
     }
@@ -632,7 +691,7 @@ export async function ingestBatch(
     try {
       deps.events.broadcast({ type: "node_added", node });
     } catch (err) {
-      console.error("[sojourn] ingest: failed to broadcast node_added:", err);
+      logError("[sojourn] ingest: failed to broadcast node_added:", err);
     }
   }
 
@@ -640,7 +699,7 @@ export async function ingestBatch(
     try {
       deps.events.broadcast({ type: "project_updated", projectId: project.id });
     } catch (err) {
-      console.error("[sojourn] ingest: failed to broadcast project_updated:", err);
+      logError("[sojourn] ingest: failed to broadcast project_updated:", err);
     }
   }
 
@@ -652,18 +711,38 @@ export async function ingestBatch(
  * node's turn. Cycle-guarded; null when the chain reaches a root (or a
  * missing/cyclic parent) without meeting a prompt.
  */
-export function resolveTurnPrompt(store: GraphStore, node: ChronoNode): ChronoNode | null {
+export function resolveTurnPrompt(
+  store: GraphStore,
+  node: ChronoNode,
+  // Injectable node lookup so batch ingest can serve the walk from an
+  // in-memory map instead of one store query (SELECT + flags + annotations)
+  // per step — the walks are O(n²) across a big batch otherwise.
+  getNode: (id: string) => ChronoNode | null = (id) => store.getNode(id),
+): ChronoNode | null {
   const seen = new Set<string>([node.id]);
   let current: ChronoNode | null = node;
   while (current && current.parentId !== null) {
     if (seen.has(current.parentId)) break;
     seen.add(current.parentId);
-    const parent = store.getNode(current.parentId);
+    const parent = getNode(current.parentId);
     if (!parent) break;
     if (parent.kind === "prompt") return parent;
     current = parent;
   }
   return null;
+}
+
+export interface TurnBaseOptions {
+  /** Injectable node lookup (see resolveTurnPrompt). */
+  getNode?: (id: string) => ChronoNode | null;
+  /**
+   * Batch-local memo: node id -> nearest snapshot at-or-before that node.
+   * Path-compressed — every node visited on a walk records the walk's
+   * answer, so N walks over one long unsnapshotted chain cost O(chain)
+   * total instead of O(chain²). Only valid while snapshotRefs don't change
+   * (i.e. within one ingest batch's flag phases).
+   */
+  memo?: Map<string, string | null>;
 }
 
 /**
@@ -683,23 +762,42 @@ export function resolveTurnPrompt(store: GraphStore, node: ChronoNode): ChronoNo
  * Grounding at the turn's prompt makes ctx.diff cover the WHOLE turn's
  * changes, which is what the assistant's prose is actually describing.
  */
-export function resolveTurnBaseTree(store: GraphStore, node: ChronoNode): string | null {
+export function resolveTurnBaseTree(
+  store: GraphStore,
+  node: ChronoNode,
+  opts: TurnBaseOptions = {},
+): string | null {
+  const getNode = opts.getNode ?? ((id: string) => store.getNode(id));
+
   // 1) Find the nearest ancestor prompt node (strictly above `node`).
-  const turnPrompt = resolveTurnPrompt(store, node);
+  const turnPrompt = resolveTurnPrompt(store, node, getNode);
   if (!turnPrompt) return null;
 
   // 2) Nearest snapshot at-or-before the prompt: the prompt itself first,
-  //    then its ancestors.
-  if (turnPrompt.snapshotRef !== null) return turnPrompt.snapshotRef;
+  //    then its ancestors. Nodes visited without an answer are recorded in
+  //    the memo (when provided) with the walk's final result.
+  const memo = opts.memo;
+  const visited: string[] = [];
+  let result: string | null = null;
   const seenAbove = new Set<string>([turnPrompt.id]);
   let cursor: ChronoNode | null = turnPrompt;
-  while (cursor && cursor.parentId !== null) {
-    if (seenAbove.has(cursor.parentId)) break;
+  while (cursor) {
+    const memoized = memo?.get(cursor.id);
+    if (memoized !== undefined) {
+      result = memoized;
+      break;
+    }
+    if (cursor.snapshotRef !== null) {
+      result = cursor.snapshotRef;
+      break;
+    }
+    visited.push(cursor.id);
+    if (cursor.parentId === null || seenAbove.has(cursor.parentId)) break;
     seenAbove.add(cursor.parentId);
-    const parent = store.getNode(cursor.parentId);
-    if (!parent) break;
-    if (parent.snapshotRef !== null) return parent.snapshotRef;
-    cursor = parent;
+    cursor = getNode(cursor.parentId);
   }
-  return null;
+  if (memo) {
+    for (const id of visited) memo.set(id, result);
+  }
+  return result;
 }

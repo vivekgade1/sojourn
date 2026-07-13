@@ -1,3 +1,4 @@
+import { logError } from "./logger.js";
 import path from "node:path";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
@@ -178,7 +179,7 @@ async function buildCheckContext(
       );
       diff = await snapshotter.diff(parentTree, nodeTree);
     } catch (err) {
-      console.error("[sojourn] flags/run: diff failed:", err);
+      logError("[sojourn] flags/run: diff failed:", err);
     }
   }
 
@@ -266,7 +267,7 @@ async function maybeRewindForRestore(deps: ServerDeps, nodeId: string): Promise<
     const executed = await executeRewind(planned.plan, planned.rawLines);
     return publicRewindPlan(executed);
   } catch (err) {
-    console.error(`[sojourn] restore: rewind companion failed for node ${nodeId}:`, err);
+    logError(`[sojourn] restore: rewind companion failed for node ${nodeId}:`, err);
     return null;
   }
 }
@@ -369,12 +370,12 @@ function handleHarvestError(err: unknown, res: Response): void {
     if (err.partial) body.partial = err.partial;
     const status = err.code === "partial_apply" || err.code === "mainline_drift" ? 500 : 400;
     if (status >= 500) {
-      console.error("[sojourn] harvest failed mid-apply:", err);
+      logError("[sojourn] harvest failed mid-apply:", err);
     }
     res.status(status).json(body);
     return;
   }
-  console.error("[sojourn] harvest route failed:", err);
+  logError("[sojourn] harvest route failed:", err);
   res.status(500).json({ error: "Internal error" });
 }
 
@@ -441,7 +442,7 @@ export function createApp(deps: ServerDeps): Express {
       const changes = await snapshotter.diff(parentTree, nodeTree);
       res.json({ changes });
     } catch (err) {
-      console.error("[sojourn] diff route failed:", err);
+      logError("[sojourn] diff route failed:", err);
       res.json({ changes: [] });
     }
   });
@@ -473,7 +474,7 @@ export function createApp(deps: ServerDeps): Express {
       const patch = await snapshotter.diffFile(parentTree, nodeTree, filePath);
       res.json({ patch });
     } catch (err) {
-      console.error("[sojourn] diff/file route failed:", err);
+      logError("[sojourn] diff/file route failed:", err);
       res.json({ patch: "" });
     }
   });
@@ -512,12 +513,12 @@ export function createApp(deps: ServerDeps): Express {
         try {
           deps.events.broadcast({ type: "flags_updated", nodeId: node.id, flags: fullFlags });
         } catch (err) {
-          console.error("[sojourn] flags/run (T2): failed to broadcast:", err);
+          logError("[sojourn] flags/run (T2): failed to broadcast:", err);
         }
 
         res.json({ flags: fullFlags });
       } catch (err) {
-        console.error("[sojourn] flags/run (T2) failed:", err);
+        logError("[sojourn] flags/run (T2) failed:", err);
         res.status(502).json({ error: "T2 critic call failed" });
       }
       return;
@@ -548,12 +549,12 @@ export function createApp(deps: ServerDeps): Express {
       try {
         deps.events.broadcast({ type: "flags_updated", nodeId: node.id, flags: fullFlags });
       } catch (err) {
-        console.error("[sojourn] flags/run: failed to broadcast:", err);
+        logError("[sojourn] flags/run: failed to broadcast:", err);
       }
 
       res.json({ flags: fullFlags });
     } catch (err) {
-      console.error("[sojourn] flags/run failed:", err);
+      logError("[sojourn] flags/run failed:", err);
       res.status(500).json({ error: "Failed to run flags" });
     }
   });
@@ -649,12 +650,12 @@ export function createApp(deps: ServerDeps): Express {
       if (err instanceof SojournRewindError) {
         const status = err.code === "transcript_exists" ? 409 : 500;
         if (status >= 500) {
-          console.error(`[sojourn] rewind failed for node ${id}:`, err);
+          logError(`[sojourn] rewind failed for node ${id}:`, err);
         }
         res.status(status).json({ error: err.message, code: err.code });
         return;
       }
-      console.error(`[sojourn] rewind failed for node ${id}:`, err);
+      logError(`[sojourn] rewind failed for node ${id}:`, err);
       res.status(500).json({ error: "Rewind failed" });
     }
   });
@@ -745,7 +746,7 @@ export function createApp(deps: ServerDeps): Express {
       });
       res.json({ hits });
     } catch (err) {
-      console.error("[sojourn] search route failed:", err);
+      logError("[sojourn] search route failed:", err);
       res.status(500).json({ error: "Search failed" });
     }
   });
@@ -809,7 +810,7 @@ export function createApp(deps: ServerDeps): Express {
             deps.events.broadcast({ type: "node_added", node: mergeNode });
             deps.events.broadcast({ type: "project_updated", projectId: mergeNode.projectId });
           } catch (err) {
-            console.error("[sojourn] harvest: failed to broadcast merge node:", err);
+            logError("[sojourn] harvest: failed to broadcast merge node:", err);
           }
         }
       }
@@ -899,7 +900,7 @@ export function createApp(deps: ServerDeps): Express {
     try {
       deps.events.broadcast({ type: "node_added", node: stored });
     } catch (err) {
-      console.error("[sojourn] mark: failed to broadcast node_added:", err);
+      logError("[sojourn] mark: failed to broadcast node_added:", err);
     }
 
     res.json(stored);
@@ -916,7 +917,7 @@ export function createApp(deps: ServerDeps): Express {
       try {
         await deps.rescanClaudeTranscript(transcriptPath);
       } catch (err) {
-        console.error("[sojourn] hooks/claude: rescan failed:", err);
+        logError("[sojourn] hooks/claude: rescan failed:", err);
       }
     }
   });
@@ -933,7 +934,7 @@ export function createApp(deps: ServerDeps): Express {
       try {
         await deps.rescanOpenCodeSession(sessionId);
       } catch (err) {
-        console.error("[sojourn] hooks/opencode: rescan failed:", err);
+        logError("[sojourn] hooks/opencode: rescan failed:", err);
       }
     }
   });
@@ -974,7 +975,7 @@ export function createApp(deps: ServerDeps): Express {
           : 500;
     const message = err instanceof Error ? err.message : "Internal error";
     if (status >= 500) {
-      console.error("[sojourn] unhandled error in request pipeline:", err);
+      logError("[sojourn] unhandled error in request pipeline:", err);
     }
     res.status(status).json({ error: message });
   });
@@ -1012,7 +1013,7 @@ function handleRestoreError(err: unknown, nodeId: string, res: Response): void {
         res.status(400).json({ error: `${message} (${THINNED_SNAPSHOT_PHRASE})` });
         return;
       case "dest_exhausted":
-        console.error(`[sojourn] restore-related route failed for node ${nodeId}:`, err);
+        logError(`[sojourn] restore-related route failed for node ${nodeId}:`, err);
         res.status(500).json({ error: message });
         return;
       default:
@@ -1027,6 +1028,6 @@ function handleRestoreError(err: unknown, nodeId: string, res: Response): void {
         return;
     }
   }
-  console.error(`[sojourn] restore-related route failed for node ${nodeId}:`, err);
+  logError(`[sojourn] restore-related route failed for node ${nodeId}:`, err);
   res.status(500).json({ error: "Internal error" });
 }

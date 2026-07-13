@@ -33,6 +33,24 @@ export function pidfilePath(sojournHome: string): string {
   return join(sojournHome, "daemon.pid");
 }
 
+/** The daemon's log file: both the daemon's own logger and the CLI's spawn
+ * piping (child stdout/stderr) append here. */
+export function daemonLogPath(sojournHome: string): string {
+  return join(sojournHome, "daemon.log");
+}
+
+/** Last `n` non-empty lines of $SOJOURN_HOME/daemon.log; [] when the file
+ * is missing or unreadable (forensics helpers must never throw). */
+export function tailLogLines(sojournHome: string, n: number): string[] {
+  try {
+    const raw = readFileSync(daemonLogPath(sojournHome), "utf8");
+    const lines = raw.split("\n").filter((line) => line.length > 0);
+    return lines.slice(-n);
+  } catch {
+    return [];
+  }
+}
+
 export function readPid(sojournHome: string): number | null {
   const file = pidfilePath(sojournHome);
   if (!existsSync(file)) return null;

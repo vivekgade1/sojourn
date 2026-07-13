@@ -1,3 +1,4 @@
+import { logError } from "./logger.js";
 import type { Server as HttpServer } from "node:http";
 import { WebSocketServer, WebSocket } from "ws";
 import type { ChronoNode, StoredFlag } from "@sojourn/core";
@@ -28,7 +29,7 @@ export class EventsHub {
           client.send(payload);
         }
       } catch (err) {
-        console.error("[sojourn] failed to send WS event to a client:", err);
+        logError("[sojourn] failed to send WS event to a client:", err);
       }
     }
   }

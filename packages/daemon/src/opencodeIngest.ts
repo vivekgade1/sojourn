@@ -1,3 +1,4 @@
+import { logError } from "./logger.js";
 import path from "node:path";
 import {
   OpenCodeClient,
@@ -45,7 +46,7 @@ let warnedUnreachable = false;
 function logUnreachableOnce(detail: string): void {
   if (warnedUnreachable) return;
   warnedUnreachable = true;
-  console.error(
+  logError(
     `[sojourn] opencode: server unreachable (${detail}); OpenCode capture is disabled until it responds (this is logged once)`,
   );
 }
@@ -74,7 +75,7 @@ export async function rescanOpenCodeSession(
     const session = await client.getSession(sessionId);
     if (!session.ok) {
       if (session.status === null) logUnreachableOnce(session.error);
-      else console.error(`[sojourn] opencode: getSession(${sessionId}) failed: HTTP ${session.status}`);
+      else logError(`[sojourn] opencode: getSession(${sessionId}) failed: HTTP ${session.status}`);
       return;
     }
     warnedUnreachable = false; // reachable again: re-arm the log-once latch
@@ -82,7 +83,7 @@ export async function rescanOpenCodeSession(
     const directory =
       session.data && typeof session.data.directory === "string" ? session.data.directory : "";
     if (!directory) {
-      console.error(
+      logError(
         `[sojourn] opencode: session ${sessionId} has no directory; skipping (cannot resolve project root)`,
       );
       return;
@@ -91,7 +92,7 @@ export async function rescanOpenCodeSession(
     const messages = await client.getMessages(sessionId);
     if (!messages.ok) {
       if (messages.status === null) logUnreachableOnce(messages.error);
-      else console.error(`[sojourn] opencode: getMessages(${sessionId}) failed: HTTP ${messages.status}`);
+      else logError(`[sojourn] opencode: getMessages(${sessionId}) failed: HTTP ${messages.status}`);
       return;
     }
 
@@ -109,7 +110,7 @@ export async function rescanOpenCodeSession(
     await runSerialized(key, () => ingestBatch(deps, batch));
   } catch (err) {
     // Absolute backstop: capture never throws out of a hook/rescan.
-    console.error(`[sojourn] opencode: rescan of session ${sessionId} failed:`, err);
+    logError(`[sojourn] opencode: rescan of session ${sessionId} failed:`, err);
   }
 }
 

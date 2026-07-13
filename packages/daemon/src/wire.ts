@@ -1,3 +1,4 @@
+import { logError } from "./logger.js";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
@@ -159,7 +160,7 @@ export function buildDaemon(): BuiltDaemon {
     // capture must never surface this as a user-facing failure).
     const projectsDir = claudeProjectsDir();
     if (!isPathInsideDir(transcriptPath, projectsDir)) {
-      console.error(
+      logError(
         `[sojourn] hooks/claude: rejected transcript_path outside ${projectsDir}: ${transcriptPath}`,
       );
       return;

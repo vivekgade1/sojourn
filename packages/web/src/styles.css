@@ -1237,3 +1237,148 @@ button {
 .theme-toggle:hover {
   border-color: var(--accent);
 }
+
+/* Daemon-down banner — the loud sibling of the quiet "disconnected" pill.
+   Static show/hide only (no animation), so reduced-motion needs no override;
+   colors ride the theme tokens in both light and dark. */
+
+.daemon-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 16px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  border-left: 4px solid var(--verified-red);
+  color: var(--text);
+  font-size: 12px;
+}
+
+.daemon-banner code {
+  font-family: var(--mono);
+  background: var(--panel-alt);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 5px;
+}
+
+.daemon-banner-dismiss {
+  margin-left: auto;
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  font-size: 16px;
+  line-height: 1;
+  padding: 2px 6px;
+}
+
+.daemon-banner-dismiss:hover {
+  color: var(--text);
+}
+
+/* Session filter — toolbar popover (Glacier: panel surfaces, token colors). */
+
+.session-filter {
+  position: relative;
+}
+
+.session-filter-button {
+  background: var(--panel-alt);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  border-radius: 6px;
+  padding: 5px 10px;
+  font-family: var(--mono);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.session-filter-button:hover,
+.session-filter-button.open {
+  border-color: var(--trail);
+  color: var(--text);
+}
+
+.session-filter-panel {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 40;
+  min-width: 280px;
+  max-height: 320px;
+  overflow-y: auto;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.18);
+  padding: 6px;
+}
+
+.session-filter-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 6px 8px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 6px;
+}
+
+.session-filter-all {
+  background: var(--panel-alt);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 4px;
+  padding: 3px 10px;
+  font-size: 11px;
+}
+
+.session-filter-all:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.session-filter-hint {
+  color: var(--text-dim);
+  font-size: 10px;
+  font-style: italic;
+}
+
+.session-filter-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 6px;
+  border-radius: 6px;
+  cursor: pointer;
+  user-select: none;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+.session-filter-row:hover {
+  background: var(--panel-alt);
+  color: var(--text);
+}
+
+.session-filter-row input {
+  accent-color: var(--accent);
+  margin: 0;
+  flex-shrink: 0;
+}
+
+.session-filter-when {
+  color: var(--text);
+  white-space: nowrap;
+}
+
+.session-filter-meta {
+  font-family: var(--mono);
+  white-space: nowrap;
+  margin-left: auto;
+}
+
+.session-filter-empty {
+  color: var(--text-dim);
+  padding: 6px;
+  font-size: 11px;
+}
