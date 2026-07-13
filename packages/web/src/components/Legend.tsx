@@ -11,10 +11,18 @@ export interface LegendProps {
   /** Total sessions in the project — keeps the count honest under filtering. */
   totalSessionCount: number;
   view: "map" | "graph";
+  /** The Restorable filter is active — surface the "actionable" palette key. */
+  restorableOnly: boolean;
 }
 
 /** Wayfinding strip: what the marks mean and how to read the view. */
-export function Legend({ nodeCount, sessionCount, totalSessionCount, view }: LegendProps) {
+export function Legend({
+  nodeCount,
+  sessionCount,
+  totalSessionCount,
+  view,
+  restorableOnly,
+}: LegendProps) {
   return (
     <div className="legend" data-testid="legend">
       {view === "map" ? (
@@ -64,6 +72,14 @@ export function Legend({ nodeCount, sessionCount, totalSessionCount, view }: Leg
             its path
           </span>
         </>
+      )}
+      {/* Only honest to show the action key while the filter is actually
+          painting the amber marks. */}
+      {restorableOnly && (
+        <span className="legend-chip">
+          <span className="legend-glyph legend-glyph-action" />
+          actionable (restore ready)
+        </span>
       )}
       <span className="legend-count">
         {nodeCount} steps ·{" "}

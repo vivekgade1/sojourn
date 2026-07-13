@@ -45,7 +45,7 @@ function renderMap(nodes: ChronoNode[]) {
       onSelectNode={() => {}}
       selectedNodeId={null}
       matchedTurnIds={null}
-      emphasizeSignal={false}
+      lenses={{ decision: false, flagged: false, restorable: false }}
       focusTurnId={null}
       focusNonce={0}
     />,

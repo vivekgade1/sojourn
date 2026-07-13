@@ -1,5 +1,5 @@
 import type { ChronoNode } from "./types";
-import { isRestoreReady, isThinned } from "./restore";
+import { isActionable, isRestoreReady, isThinned } from "./restore";
 
 export interface Turn {
   /** id of the turn's first node — stable, unique within the journey. */
@@ -32,6 +32,17 @@ export interface Turn {
    * thinned marker — a waypoint whose rollback point has been retired.
    */
   hasThinned: boolean;
+  /**
+   * STRICT count of nodes where a restore is PROVABLY possible (`restorable
+   * === true`, via `isActionable` — NOT `isRestoreReady`). A MISSING
+   * `restorable` field does NOT count here, unlike `restorableCount`. This is
+   * the aggregate the Restorable FILTER must use in every view (graph AND
+   * map) so a legacy payload (snapshot present, `restorable` field absent)
+   * can never pass in one view and fail in another.
+   */
+  actionableCount: number;
+  /** This turn holds >=1 node with `restorable === true` (strict). */
+  hasActionable: boolean;
 }
 
 export interface Journey {
@@ -98,6 +109,7 @@ export function buildJourneys(nodes: ChronoNode[]): Journey[] {
       const toolNames = [...new Set(toolUses.map(toolNameOf).filter((n): n is string => !!n))];
       const restorableCount = group.filter(isRestoreReady).length;
       const hasThinned = group.some(isThinned);
+      const actionableCount = group.filter(isActionable).length;
       return {
         id: group[0]!.id,
         index: i + 1,
@@ -114,6 +126,8 @@ export function buildJourneys(nodes: ChronoNode[]): Journey[] {
         restorableCount,
         hasRestorable: restorableCount > 0,
         hasThinned,
+        actionableCount,
+        hasActionable: actionableCount > 0,
       };
     });
 

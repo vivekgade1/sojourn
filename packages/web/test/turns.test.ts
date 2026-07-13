@@ -171,4 +171,40 @@ describe("buildJourneys", () => {
     const [journey] = buildJourneys(nodes);
     expect(journey!.turns[0]!.hasThinned).toBe(false);
   });
+
+  // hasActionable/actionableCount are the STRICT aggregate (restorable === true
+  // only) that the Restorable FILTER must use — deliberately distinct from
+  // hasRestorable's backward-safe "missing = still show the marker" default.
+  it("marks a turn actionable when it holds >=1 node with restorable === true", () => {
+    const nodes = [
+      makeNode("p1", "prompt"),
+      makeNode("a1", "assistant", { snapshotRef: "tree-abc", restorable: true }),
+    ];
+    const [journey] = buildJourneys(nodes);
+    expect(journey!.turns[0]!.hasActionable).toBe(true);
+    expect(journey!.turns[0]!.actionableCount).toBe(1);
+  });
+
+  it("is NOT actionable when the only snapshotted node has a MISSING restorable field — unlike hasRestorable, which IS true here", () => {
+    const nodes = [
+      makeNode("p1", "prompt"),
+      // snapshotRef present, restorable undefined (legacy payload).
+      makeNode("a1", "assistant", { snapshotRef: "tree-def" }),
+    ];
+    const [journey] = buildJourneys(nodes);
+    expect(journey!.turns[0]!.hasActionable).toBe(false);
+    expect(journey!.turns[0]!.actionableCount).toBe(0);
+    // Confirms the two aggregates genuinely diverge on this exact payload.
+    expect(journey!.turns[0]!.hasRestorable).toBe(true);
+  });
+
+  it("is NOT actionable when the only snapshotted node is restorable === false (thinned)", () => {
+    const nodes = [
+      makeNode("p1", "prompt"),
+      makeNode("a1", "assistant", { snapshotRef: "tree-gone", restorable: false }),
+    ];
+    const [journey] = buildJourneys(nodes);
+    expect(journey!.turns[0]!.hasActionable).toBe(false);
+    expect(journey!.turns[0]!.actionableCount).toBe(0);
+  });
 });

@@ -15,8 +15,19 @@ export interface JourneyMapProps {
   selectedNodeId: string | null;
   /** null = search inactive; otherwise turn ids containing a match. */
   matchedTurnIds: Set<string> | null;
-  /** When lens/flagged emphasis is on, waypoints without signal fade. */
-  emphasizeSignal: boolean;
+  /**
+   * Active emphasis lenses. A turn is emphasized iff it satisfies EVERY active
+   * lens (AND-composition, matching the graph's sequential filter):
+   *   decision   → the turn holds a decision/assumption/checkpoint mark
+   *   flagged    → the turn holds an active flag (verified or advisory)
+   *   restorable → the turn holds a PROVABLY restorable node (turn.hasActionable
+   *                — the STRICT aggregate, same `isActionable` semantics as the
+   *                graph filter). Deliberately NOT turn.hasRestorable, whose
+   *                backward-safe "missing restorable = still count" default
+   *                would let a legacy payload pass here but fail in the graph.
+   * No active lens → nothing fades. Search matches, when present, override all.
+   */
+  lenses: { decision: boolean; flagged: boolean; restorable: boolean };
   focusTurnId: string | null;
   focusNonce: number;
 }
@@ -94,7 +105,7 @@ export function JourneyMap({
   onSelectNode,
   selectedNodeId,
   matchedTurnIds,
-  emphasizeSignal,
+  lenses,
   focusTurnId,
   focusNonce,
 }: JourneyMapProps) {
@@ -246,8 +257,12 @@ export function JourneyMap({
   }
 
   function turnFaded(turn: Turn): boolean {
+    // Search wins outright: matched turns stay lit, everything else fades.
     if (matchedTurnIds !== null) return !matchedTurnIds.has(turn.id);
-    if (emphasizeSignal) return turn.verifiedCount + turn.advisoryCount === 0 && turn.marks.length === 0;
+    // Otherwise a turn fades unless it satisfies EVERY active lens (AND).
+    if (lenses.decision && turn.marks.length === 0) return true;
+    if (lenses.flagged && turn.verifiedCount + turn.advisoryCount === 0) return true;
+    if (lenses.restorable && !turn.hasActionable) return true;
     return false;
   }
 
@@ -320,6 +335,11 @@ export function JourneyMap({
             const faded = turnFaded(turn);
             const isSelected = turn.id === selectedTurnId;
             const isMatch = matchedTurnIds?.has(turn.id) ?? false;
+            // Under the Restorable lens, waypoints WITH a PROVABLY restorable
+            // node (strict — same as the graph filter) wear the distinct amber
+            // "action" palette. Not faded is implied once hasActionable is
+            // required, but kept explicit for clarity/defense-in-depth.
+            const isAction = lenses.restorable && turn.hasActionable && !faded;
             return (
               <g
                 key={turn.id}
@@ -329,6 +349,7 @@ export function JourneyMap({
                   isSelected ? "selected" : "",
                   faded ? "faded" : "",
                   isMatch ? "match" : "",
+                  isAction ? "action" : "",
                 ]
                   .filter(Boolean)
                   .join(" ")}

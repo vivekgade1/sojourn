@@ -14,6 +14,8 @@ export interface ToolbarProps {
   onToggleDecisionLens: () => void;
   flaggedOnly: boolean;
   onToggleFlaggedOnly: () => void;
+  restorableOnly: boolean;
+  onToggleRestorableOnly: () => void;
   wsConnected: boolean;
   searchQuery: string;
   onSearchQueryChange: (q: string) => void;
@@ -37,6 +39,8 @@ export function Toolbar({
   onToggleDecisionLens,
   flaggedOnly,
   onToggleFlaggedOnly,
+  restorableOnly,
+  onToggleRestorableOnly,
   wsConnected,
   searchQuery,
   onSearchQueryChange,
@@ -126,6 +130,11 @@ export function Toolbar({
       <label className={`toolbar-toggle${flaggedOnly ? " active" : ""}`}>
         <input type="checkbox" checked={flaggedOnly} onChange={onToggleFlaggedOnly} />
         Flagged only
+      </label>
+
+      <label className={`toolbar-toggle${restorableOnly ? " active action" : ""}`}>
+        <input type="checkbox" checked={restorableOnly} onChange={onToggleRestorableOnly} />
+        Restorable
       </label>
 
       <span className={`toolbar-status${wsConnected ? " live" : ""}`}>

@@ -22,3 +22,20 @@ export function isRestoreReady(node: Pick<ChronoNode, "snapshotRef" | "restorabl
 export function isThinned(node: Pick<ChronoNode, "snapshotRef" | "restorable">): boolean {
   return node.snapshotRef !== null && node.restorable === false;
 }
+
+/**
+ * "Actionable" for the Restorable filter: a restore AT this node is provably
+ * possible. Uses the server-computed `restorable` field (own snapshot, else the
+ * nearest ancestor's, still exists) — NOT the node's own snapshot, so a node
+ * with no snapshot of its own is still actionable when an ancestor's survives.
+ *
+ * Deliberately STRICT about absence: a MISSING `restorable` field is treated as
+ * NOT actionable. This is the opposite default from `isRestoreReady`'s
+ * backward-safe "absence = unknown-safe, still show the marker" — and
+ * intentionally so. The marker views must never hide restore on old payloads;
+ * this explicit "show only what can be restored" filter must never claim an
+ * unverified node is restorable. Absence flips per JOB, not globally.
+ */
+export function isActionable(node: Pick<ChronoNode, "restorable">): boolean {
+  return node.restorable === true;
+}

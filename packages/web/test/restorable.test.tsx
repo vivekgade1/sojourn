@@ -67,7 +67,7 @@ describe("SojournNode / restore-ready + thinned treatments", () => {
 describe("Legend / restore-point chip", () => {
   it("renders a restore-point chip with its glyph in the map view", () => {
     const { container, getByText } = render(
-      <Legend nodeCount={3} sessionCount={1} totalSessionCount={1} view="map" />,
+      <Legend nodeCount={3} sessionCount={1} totalSessionCount={1} view="map" restorableOnly={false} />,
     );
     expect(getByText(/restore point/i)).toBeTruthy();
     expect(container.querySelector(".legend-glyph-restore")).toBeTruthy();
@@ -75,7 +75,7 @@ describe("Legend / restore-point chip", () => {
 
   it("renders a restore-point chip in the graph view", () => {
     const { container, getByText } = render(
-      <Legend nodeCount={3} sessionCount={1} totalSessionCount={1} view="graph" />,
+      <Legend nodeCount={3} sessionCount={1} totalSessionCount={1} view="graph" restorableOnly={false} />,
     );
     expect(getByText(/restore point/i)).toBeTruthy();
     expect(container.querySelector(".legend-glyph-restore")).toBeTruthy();

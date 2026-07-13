@@ -29,6 +29,15 @@
   --restore-halo: rgba(27, 143, 176, 0.28);
   --thinned-line: #93a49d;
 
+  /* Action palette — the "Restorable" filter's isolate colour. A saturated
+     warm amber, chosen to sit ~complementary to the ice-cyan restore accent so
+     "actionable" can never be misread as the restore-ready marker, and louder
+     than the muted advisory-amber it shares a family with. Contrast 4.66:1 on
+     the node surface (--panel-alt), 5.35:1 on --panel — both clear AA. Static,
+     no motion. */
+  --action: #935e00;
+  --action-halo: rgba(147, 94, 0, 0.30);
+
   --trail: #0c8f7c;
   --trail-glow: rgba(12, 143, 124, 0.32);
   --route-claude: #0c8f7c;
@@ -67,6 +76,12 @@
   --restore-ready: #4dc3e0;
   --restore-halo: rgba(77, 195, 224, 0.30);
   --thinned-line: #5b6b63;
+
+  /* Action palette — dark surface: a brighter amber-gold. Contrast 7.36:1 on
+     --panel-alt, 8.26:1 on --panel — well above AA. Complementary to the dark
+     ice-cyan restore accent; louder than advisory-amber. Static, no motion. */
+  --action: #e6a636;
+  --action-halo: rgba(230, 166, 54, 0.34);
 
   --trail: #2bc7ac;
   --trail-glow: rgba(43, 199, 172, 0.35);
@@ -166,6 +181,16 @@ button {
 
 .toolbar-toggle.active {
   color: var(--text);
+}
+
+/* The Restorable toggle, when active, tints toward its amber action palette so
+   the toolbar itself signals which colour the isolated waypoints wear. */
+.toolbar-toggle.active.action {
+  color: var(--action);
+}
+
+.toolbar-toggle.action input {
+  accent-color: var(--action);
 }
 
 .toolbar-status {
@@ -367,6 +392,21 @@ button {
   background: var(--thinned-line);
   transform: rotate(-45deg);
   transform-origin: center;
+}
+
+/* Action highlight — the "Restorable" filter's distinct amber treatment on a
+   graph card. Deliberately rides a ::after overlay ring (its OWN box-shadow
+   layer) instead of the card's box-shadow, so it composes cleanly with the
+   restore-ready / on-trail / search-hit glow cascade above without any
+   compound-selector combinatorics. Static (no pulse) — reduced-motion safe. */
+.sojourn-node.action-highlight::after {
+  content: "";
+  position: absolute;
+  inset: -2px;
+  border-radius: 10px; /* card is 8px; +2px inset → 10px keeps the corners true */
+  border: 1.5px solid var(--action);
+  box-shadow: 0 0 0 3px var(--action-halo);
+  pointer-events: none;
 }
 
 /* Flag badge */
@@ -1114,6 +1154,18 @@ button {
   opacity: 0.25;
 }
 
+/* Action highlight on a waypoint — under the Restorable lens, a turn WITH a
+   restore anchor recolours its restore dot to the amber action palette and
+   grows a soft amber halo, so the actionable waypoints pop against the quiet
+   ice-cyan restore dots. isAction excludes faded turns, so this never fights
+   the faded dimming above. Static — nothing to gate under reduced-motion. */
+.map-waypoint.action .map-restore-dot {
+  fill: var(--action);
+  stroke: var(--action-halo);
+  stroke-width: 3;
+  opacity: 1;
+}
+
 /* Turn drawer */
 
 .turn-drawer {
@@ -1273,6 +1325,16 @@ button {
   border-radius: 999px;
   background: var(--restore-ready);
   box-shadow: 0 0 0 2px var(--restore-halo);
+}
+
+/* Action key — matches the amber waypoint dots / graph rings shown while the
+   Restorable filter is on. */
+.legend-glyph-action {
+  width: 9px;
+  height: 9px;
+  border-radius: 999px;
+  background: var(--action);
+  box-shadow: 0 0 0 2px var(--action-halo);
 }
 
 @media (prefers-reduced-motion: reduce) {

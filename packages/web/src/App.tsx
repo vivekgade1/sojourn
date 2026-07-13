@@ -13,6 +13,7 @@ import {
   saveSessionSelection,
   type SessionOption,
 } from "./sessions";
+import { isActionable } from "./restore";
 import { initTheme, toggleTheme, type Theme } from "./theme";
 import { buildJourneys, nodeToTurnIndex } from "./turns";
 import type { Annotation, ChronoNode, Project, StoredFlag } from "./types";
@@ -41,6 +42,9 @@ export function App() {
   const [view, setView] = useState<ViewMode>("map");
   const [decisionLens, setDecisionLens] = useState(false);
   const [flaggedOnly, setFlaggedOnly] = useState(false);
+  // Transient (not persisted): isolate nodes where a restore is provably
+  // possible. AND-composes with the other lenses and the session filter.
+  const [restorableOnly, setRestorableOnly] = useState(false);
   const [wsConnected, setWsConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
@@ -244,8 +248,15 @@ export function App() {
     if (flaggedOnly) {
       filtered = filtered.filter((n) => hasActiveFlags(n));
     }
+    // Composed LAST, same sequential (AND) style. isActionable treats a missing
+    // `restorable` field as EXCLUDED — this filter's whole job is to surface
+    // provably-restorable nodes, so absence is "not known restorable" here. The
+    // marker views keep their own backward-safe default (see restore.ts).
+    if (restorableOnly) {
+      filtered = filtered.filter(isActionable);
+    }
     return filtered;
-  }, [sessionNodes, decisionLens, flaggedOnly]);
+  }, [sessionNodes, decisionLens, flaggedOnly, restorableOnly]);
 
   const turnIndex = useMemo(() => nodeToTurnIndex(journeys), [journeys]);
 
@@ -366,6 +377,8 @@ export function App() {
         onToggleDecisionLens={() => setDecisionLens((v) => !v)}
         flaggedOnly={flaggedOnly}
         onToggleFlaggedOnly={() => setFlaggedOnly((v) => !v)}
+        restorableOnly={restorableOnly}
+        onToggleRestorableOnly={() => setRestorableOnly((v) => !v)}
         wsConnected={wsConnected}
         searchQuery={searchQuery}
         onSearchQueryChange={setSearchQuery}
@@ -396,6 +409,7 @@ export function App() {
         sessionCount={journeys.length}
         totalSessionCount={allJourneys.length}
         view={view}
+        restorableOnly={restorableOnly}
       />
       {error && <div className="inspector-meta" style={{ padding: 8 }}>{error}</div>}
       <div className="app-body">
@@ -407,7 +421,7 @@ export function App() {
             onSelectNode={setSelectedNodeId}
             selectedNodeId={selectedNodeId}
             matchedTurnIds={matchedTurnIds}
-            emphasizeSignal={decisionLens || flaggedOnly}
+            lenses={{ decision: decisionLens, flagged: flaggedOnly, restorable: restorableOnly }}
             focusTurnId={focus.id}
             focusNonce={focus.nonce}
           />
@@ -417,6 +431,7 @@ export function App() {
             selectedNodeId={selectedNodeId}
             onSelectNode={setSelectedNodeId}
             searchHits={searchHits}
+            actionActive={restorableOnly}
             focusNodeId={focus.id}
             focusNonce={focus.nonce}
           />

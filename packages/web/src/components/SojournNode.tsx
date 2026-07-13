@@ -12,6 +12,14 @@ export interface SojournNodeProps {
   /** Soft dim: a trail is lit and this node isn't on it. */
   receded?: boolean;
   searchHit?: boolean;
+  /**
+   * The Restorable filter is active AND this node is actionable — paint the
+   * distinct "action" (amber) treatment. Driven entirely by the caller so the
+   * card stays dumb; see GraphCanvas for the `filterActive && isActionable`
+   * gate. Rides a `::after` ring so it never clobbers the restore/trail/search
+   * box-shadow cascade.
+   */
+  actionHighlight?: boolean;
 }
 
 export const KIND_LABEL: Record<ChronoNode["kind"], string> = {
@@ -34,6 +42,7 @@ export function SojournNode({
   dimmed,
   receded,
   searchHit,
+  actionHighlight,
 }: SojournNodeProps) {
   const flags = node.flags ?? [];
   const gist = node.label ?? node.summary;
@@ -52,6 +61,7 @@ export function SojournNode({
     searchHit ? "search-hit" : "",
     restoreReady ? "restore-ready" : "",
     thinned ? "thinned" : "",
+    actionHighlight ? "action-highlight" : "",
   ]
     .filter(Boolean)
     .join(" ");

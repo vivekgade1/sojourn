@@ -6,6 +6,7 @@ import "d3-transition";
 import { zoom, zoomIdentity, type ZoomBehavior } from "d3-zoom";
 import { linkHorizontal } from "d3-shape";
 import { layoutGraph, trailOf, NODE_HEIGHT, NODE_WIDTH } from "../layout";
+import { isActionable } from "../restore";
 import type { ChronoNode } from "../types";
 import { SojournNode } from "./SojournNode";
 
@@ -15,6 +16,12 @@ export interface GraphCanvasProps {
   onSelectNode: (id: string) => void;
   /** null = search inactive; a Set (possibly empty) = search active. */
   searchHits: Set<string> | null;
+  /**
+   * The Restorable filter is active — paint actionable cards in the distinct
+   * "action" palette. The filter already removes non-restorable nodes, but the
+   * per-card gate re-checks isActionable so absence never lights up as action.
+   */
+  actionActive: boolean;
   /** Node to pan the viewport to; nonce re-triggers pans to the same node. */
   focusNodeId: string | null;
   focusNonce: number;
@@ -46,6 +53,7 @@ export function GraphCanvas({
   selectedNodeId,
   onSelectNode,
   searchHits,
+  actionActive,
   focusNodeId,
   focusNonce,
 }: GraphCanvasProps) {
@@ -196,6 +204,7 @@ export function GraphCanvas({
                     dimmed={dimmed}
                     receded={receded}
                     searchHit={isHit}
+                    actionHighlight={actionActive && isActionable(node)}
                   />
                 </foreignObject>
               );
