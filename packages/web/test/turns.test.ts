@@ -150,4 +150,25 @@ describe("buildJourneys", () => {
     expect(journey!.turns[0]!.hasRestorable).toBe(false);
     expect(journey!.turns[0]!.restorableCount).toBe(0);
   });
+
+  it("marks a turn as hasThinned when it holds >=1 snapshot-bearing NON-restorable node", () => {
+    const nodes = [
+      makeNode("p1", "prompt"),
+      // thinned: own snapshot recorded but gc'd away (restorable === false)
+      makeNode("a1", "assistant", { snapshotRef: "tree-gone", restorable: false }),
+    ];
+    const [journey] = buildJourneys(nodes);
+    expect(journey!.turns[0]!.hasThinned).toBe(true);
+  });
+
+  it("does NOT mark hasThinned when nodes are only restorable or unsnapshotted", () => {
+    const nodes = [
+      makeNode("p1", "prompt"), // no snapshot at all
+      makeNode("a1", "assistant", { snapshotRef: "tree-abc", restorable: true }), // restore-ready
+      // no own snapshot but nominally restorable via ancestor — NOT thinned (own-snapshot semantics)
+      makeNode("t1", "tool_use", { snapshotRef: null, restorable: false }),
+    ];
+    const [journey] = buildJourneys(nodes);
+    expect(journey!.turns[0]!.hasThinned).toBe(false);
+  });
 });

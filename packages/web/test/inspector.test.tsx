@@ -284,6 +284,25 @@ describe("Inspector / flag-context restore targets the parent", () => {
   });
 });
 
+describe("Inspector / restore modal copy is accurate for the ancestor-fallback case", () => {
+  it("'Restore at this node' modal wording covers the no-own-snapshot case", async () => {
+    // A node with NO own snapshot but restorable via an ancestor: the copy must
+    // not promise "AT this node's snapshot" — it lands on the nearest earlier one.
+    const node = makeNode("claude:fallback", { snapshotRef: null, restorable: true });
+    vi.spyOn(api, "preflight").mockImplementation(async (id: string) => makePreflight(id));
+
+    render(<Inspector node={node} onFlagDismissed={() => {}} onAnnotationAdded={() => {}} />);
+
+    fireEvent.click(screen.getByRole("button", { name: /restore at this node/i }));
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeTruthy());
+
+    const copy = screen.getByText(/nearest earlier snapshot/i);
+    expect(copy).toBeTruthy();
+    // The stale, always-"AT this node" phrasing must be gone.
+    expect(screen.queryByText(/exactly as they were AT this node's snapshot/i)).toBeNull();
+  });
+});
+
 describe("Inspector / restorability gates the restore button", () => {
   function restoreAtButton() {
     return screen.getByRole("button", { name: /restore at this node/i }) as HTMLButtonElement;

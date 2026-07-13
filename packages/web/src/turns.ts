@@ -1,5 +1,5 @@
 import type { ChronoNode } from "./types";
-import { isRestoreReady } from "./restore";
+import { isRestoreReady, isThinned } from "./restore";
 
 export interface Turn {
   /** id of the turn's first node — stable, unique within the journey. */
@@ -26,6 +26,12 @@ export interface Turn {
   restorableCount: number;
   /** This turn holds >=1 restore anchor — a waypoint you can roll back to. */
   hasRestorable: boolean;
+  /**
+   * This turn holds >=1 THINNED anchor: a node with its own snapshot that is no
+   * longer restorable (gc'd). Same own-snapshot semantics as SojournNode's
+   * thinned marker — a waypoint whose rollback point has been retired.
+   */
+  hasThinned: boolean;
 }
 
 export interface Journey {
@@ -91,6 +97,7 @@ export function buildJourneys(nodes: ChronoNode[]): Journey[] {
       const toolUses = group.filter((n) => n.kind === "tool_use");
       const toolNames = [...new Set(toolUses.map(toolNameOf).filter((n): n is string => !!n))];
       const restorableCount = group.filter(isRestoreReady).length;
+      const hasThinned = group.some(isThinned);
       return {
         id: group[0]!.id,
         index: i + 1,
@@ -106,6 +113,7 @@ export function buildJourneys(nodes: ChronoNode[]): Journey[] {
         isHere: group.some((n) => n.id === latestId),
         restorableCount,
         hasRestorable: restorableCount > 0,
+        hasThinned,
       };
     });
 

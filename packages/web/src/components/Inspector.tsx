@@ -467,7 +467,7 @@ function InspectorContent({
         restorable={node.restorable}
         heading="Restore"
         buttonLabel="Restore at this node"
-        modalDescription="This restores the files exactly as they were AT this node's snapshot, into a new worktree."
+        modalDescription="Restores the working tree to this node's snapshot (or the nearest earlier snapshot if this step didn't take one), into a new worktree."
       />
     </div>
   );

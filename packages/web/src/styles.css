@@ -287,6 +287,25 @@ button {
   box-shadow: inset 0 0 0 1px var(--restore-halo);
 }
 
+/* The restore ring is common (no-GC case), so it must LAYER with — never
+   replace — the on-trail / search-hit glows (all three are `.sojourn-node.X`,
+   equal specificity, so the later-declared ring would otherwise clobber them).
+   Compound selectors (0-0-3-0 / 0-0-4-0) combine the shadows so both render. */
+.sojourn-node.restore-ready.on-trail {
+  box-shadow: inset 0 0 0 1px var(--restore-halo), 0 0 0 1px var(--trail-glow);
+}
+
+.sojourn-node.restore-ready.search-hit {
+  box-shadow: inset 0 0 0 1px var(--restore-halo), 0 0 10px var(--trail-glow);
+}
+
+.sojourn-node.restore-ready.on-trail.search-hit {
+  box-shadow:
+    inset 0 0 0 1px var(--restore-halo),
+    0 0 0 1px var(--trail-glow),
+    0 0 10px var(--trail-glow);
+}
+
 .sojourn-node-restore-dot {
   position: absolute;
   bottom: 6px;
@@ -299,10 +318,25 @@ button {
   pointer-events: none;
 }
 
+/* Thinned = a former restore point whose snapshot was gc'd. It must NOT touch
+   border-STYLE: that channel encodes CLI identity (solid = claude, dashed =
+   opencode). The "unavailable" cue rides a muted border-COLOR + reduced
+   opacity + a struck summary + the slashed corner glyph below. */
 .sojourn-node.thinned {
-  border-style: dashed;
   border-color: var(--thinned-line);
   opacity: 0.6;
+}
+
+/* Out-of-focus dim/recede must WIN the low opacity over thinned's 0.6,
+   regardless of source order. Compound selectors (0-0-3-0) outrank
+   `.sojourn-node.thinned` (0-0-2-0). Ordered recede-then-dim so that if a node
+   is somehow both, the stronger dim (0.28) prevails on the specificity tie. */
+.sojourn-node.thinned.receded {
+  opacity: 0.55;
+}
+
+.sojourn-node.thinned.dimmed {
+  opacity: 0.28;
 }
 
 .sojourn-node.thinned .sojourn-node-summary {
@@ -1053,6 +1087,30 @@ button {
 }
 
 .map-waypoint.faded .map-restore-dot {
+  opacity: 0.25;
+}
+
+/* Thinned/unavailable restore point on a waypoint — a muted open ring with a
+   slash, echoing the graph card's thinned glyph. Deliberately quiet and
+   distinct from the ice-cyan restore dot. Rides --thinned-line in both themes;
+   static (no animation), so reduced-motion needs no override. */
+.map-thinned {
+  pointer-events: none;
+}
+
+.map-thinned-ring {
+  fill: var(--panel);
+  stroke: var(--thinned-line);
+  stroke-width: 1.3;
+}
+
+.map-thinned-slash {
+  stroke: var(--thinned-line);
+  stroke-width: 1.3;
+  stroke-linecap: round;
+}
+
+.map-waypoint.faded .map-thinned {
   opacity: 0.25;
 }
 

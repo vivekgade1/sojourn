@@ -341,6 +341,10 @@ export function JourneyMap({
                     turn.toolNames.length ? ` (${turn.toolNames.join(", ")})` : ""
                   }${turn.verifiedCount ? `\n⚠ ${turn.verifiedCount} verified flag(s)` : ""}${
                     turn.hasRestorable ? `\n⤺ ${turn.restorableCount} restore point(s)` : ""
+                  }${
+                    turn.hasThinned
+                      ? "\n⊘ a restore point here was thinned (soj gc) — unavailable"
+                      : ""
                   }`}
                 </title>
                 <g
@@ -391,6 +395,22 @@ export function JourneyMap({
                     cy={p.r * 0.72}
                     r={3}
                   />
+                )}
+                {/* Thinned/unavailable restore point — a muted open ring with a
+                    slash, echoing the graph card's thinned glyph. Distinct from
+                    the restore-ready dot; shares the lower-left "restore status"
+                    corner but stacks just below it when both are present. */}
+                {turn.hasThinned && (
+                  <g
+                    className="map-thinned"
+                    data-testid="map-thinned"
+                    transform={`translate(${-p.r * 0.72}, ${
+                      p.r * 0.72 + (turn.hasRestorable ? 11 : 0)
+                    })`}
+                  >
+                    <circle className="map-thinned-ring" r={3.4} />
+                    <path className="map-thinned-slash" d="M -2.5 2.5 L 2.5 -2.5" />
+                  </g>
                 )}
                 <text className="map-waypoint-ask" y={p.r + 16}>
                   {turn.ask.length > 34 ? `${turn.ask.slice(0, 33)}…` : turn.ask}
