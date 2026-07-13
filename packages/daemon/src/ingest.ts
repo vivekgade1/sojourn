@@ -492,6 +492,15 @@ export async function ingestBatch(
     // and getFlags() once per prior node — per production. Serve both from
     // the shared caches; resolveFlag stays live and drops the flag cache
     // (resolves are rare, correctness over cleverness).
+    //
+    // INVARIANT this cache depends on: exactly ONE snapshot per batch (only the
+    // batch tail gets setSnapshotRef), so every new assistant node in a batch
+    // shares one (turnBase, nodeTree) pair — a same-batch flag's re-evaluation
+    // reproduces its forward check exactly and cannot flip state in-batch. The
+    // flag cache therefore only ever elides same-batch flags, which can't
+    // resolve in-batch anyway; cross-batch resolution reads live (fresh facade
+    // per batch). If snapshotting ever becomes per-turn WITHIN a batch, this
+    // cache must invalidate on Phase-3 addFlag too.
     const flagsCache = new Map<string, StoredFlag[]>();
     const autoResolveStore = {
       getSessionNodes: (sessionId: string) => sessionNodesFor(sessionId),
