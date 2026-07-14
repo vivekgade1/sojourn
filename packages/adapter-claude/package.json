@@ -1,13 +1,22 @@
 {
   "name": "@sojourn/adapter-claude",
   "private": true,
-  "version": "0.1.0",
+  "version": "1.2.0",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
-  "bin": { "sojourn-claude-hook": "./dist/hooks/postToolUse.js" },
-  "files": ["dist"],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "sojourn-claude-hook": "./dist/hooks/postToolUse.js"
+  },
+  "files": [
+    "dist"
+  ],
   "dependencies": {
     "@sojourn/core": "*"
   }

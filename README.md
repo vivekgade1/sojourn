@@ -1,4 +1,4 @@
-# Sojourn
+# Sojourn v1.2.0
 
 > Retrace and rewind your agent's path.
 
@@ -11,6 +11,32 @@ Sojourn records everything your agentic coding CLI does — every prompt, tool c
 - Claude Code plugin details: [plugins/claude/README.md](plugins/claude/README.md).
 
 > **Install status:** Sojourn is not published to npm yet. You install it from this repository — clone, build, link. Everything below assumes that.
+
+## What's in v1.2.0
+
+v1.2.0 is the complete V1 + V2 feature set, hardened for daily use. Everything runs locally against one daemon; nothing leaves your machine. At a glance:
+
+**Capture & navigation**
+- Passive, cross-session, cross-CLI **decision graph** with whole-working-tree shadow-git **snapshots at every step** — never touching your project's `.git`.
+- Web UI (`soj open`) with a **map view** (turn waypoints sized by work, flag badges, decision pennants, minimap, search) and a **graph view** (node tree with lineage highlighting and a path breadcrumb).
+- **Multi-select session filter** — the UI opens on the latest session only (fast on large histories) and lets you union in more sessions or show all.
+- **Restore-point highlighting** — nodes you can restore to are visually marked; nodes whose snapshot is gone (thinned by GC or never captured) are muted and their restore button is **disabled up front**, not after a dead-end click.
+- **"Restorable" filter** — isolate just the actionable nodes (where restore can be performed) in a distinct color palette, across both views.
+- Live WebSocket updates with **automatic reconnect + refetch** and a "daemon unreachable" banner that self-clears on recovery.
+
+**Trust — verified vs advisory flags**
+- Five deterministic **verified** checks (edit-claim-mismatch flagship, package hallucination, symbol / file-ref grounding, test-claim verification) with evidence, auto-resolve, and per-turn budgets/digests; an opt-in Tier-2 LLM critic that can never masquerade as verified.
+
+**Restore, rewind & harvest**
+- Whole-tree **restore** into an isolated worktree (safety snapshot first, your `.git` untouched); **exact-node conversation rewind** for Claude Code with honest refusal; **harvest** a worktree's changes back to mainline (HTTP API).
+
+**Decision memory, gate & retention**
+- `soj why` / `soj decisions` full-text search + a files-touched index; `soj mcp` read-only MCP server; `soj gate` CI-style exit codes; `soj gc` pin-aware retention with dry-run default.
+
+**Reliability (hardened in v1.2.0)**
+- The daemon is crash-proofed: a **rotating log** at `~/.sojourn/daemon.log`, process guards that **log and survive** (one bad transcript can never take capture down, with a crash-storm breaker), and `soj start` / `soj status` that surface the log tail when something is wrong instead of failing silently. A prior O(n²) ingest path that could OOM the daemon on very large sessions is **fixed and guarded by a scale test**. The daemon binds **loopback (127.0.0.1) only** — its write routes are never reachable from the network.
+
+Each feature below carries the exact command or surface. Every command is real and copy-pasteable.
 
 ## Quick start
 
@@ -76,7 +102,14 @@ Either way the hook always exits 0 within ~3.5 seconds, daemon up or not — it 
 
 Every prompt, assistant message, tool call, tool result, and user mark becomes a node in one graph per repository, across every session and both CLIs, linked by parentage — parallel tool calls are kept as siblings, never dropped. At each node boundary the whole working tree is snapshotted (`.gitignore`-aware, secrets excluded) into a shadow git repo under `~/.sojourn/snapshots/<projectId>/` — never your project's `.git`.
 
-`soj open` gives you two views: the **map view** (turn-level waypoints with flag badges, decision pennants, a minimap, and search) and the **graph view** (the raw node tree with lineage highlighting and a clickable path breadcrumb). Mark moments worth finding later:
+`soj open` gives you two views: the **map view** (turn-level waypoints with flag badges, decision pennants, a minimap, and search) and the **graph view** (the raw node tree with lineage highlighting and a clickable path breadcrumb). Both open on the **latest session only** — a multi-select **session filter** lets you union in more or show all, so a repo with hundreds of turns across many sessions stays fast and legible. Search, the decision/flagged lenses, and the filters all compose.
+
+Two navigation aids make restore actionable at a glance:
+
+- **Restore-point highlighting** — every node carries whether it can actually be restored (its snapshot, or the nearest ancestor's, still exists). Restorable nodes are marked; nodes whose snapshot was thinned by GC or never captured are muted, and their restore button is disabled up front with a tooltip — no more clicking into a dead-end "snapshot no longer valid" dialog.
+- **"Restorable" filter** — a toolbar toggle that isolates just the actionable nodes (where restore can be performed) in a distinct action color palette, in both the map and graph.
+
+The UI reconnects on its own if the daemon restarts, refetches so you never see a stale graph, and shows a clear "daemon unreachable — run `soj start`" banner while it's down. Mark moments worth finding later:
 
 ```bash
 soj mark "chose sqlite over postgres" --kind decision   # also: assumption
@@ -193,6 +226,16 @@ Verified-only by contract and by a second in-hook guard (any line mentioning "ad
 ```bash
 curl -s localhost:4177/api/sessions/<sessionId>/health
 ```
+
+### Reliability and operations
+
+Capture must never fail loudly or take your agent session with it, so the daemon is built to stay up and stay diagnosable:
+
+- **Rotating log** at `~/.sojourn/daemon.log` (size-capped, one generation kept) — the startup line records pid, version, node version, `SOJOURN_HOME`, and port.
+- **Process guards** log and survive: an unhandled error while ingesting a single bad transcript is logged and the daemon keeps running (only a genuine startup failure — DB open, port bind — exits, and a runaway crash storm trips a breaker). Capture is passive by contract.
+- **Diagnosable startup:** `soj start` polls health and, on failure, prints the tail of `daemon.log`; `soj status` does the same when the recorded pid is dead — no more silent death.
+- **Scale-safe ingest:** a very large session (10k+ steps) ingests in seconds with bounded memory, guarded by a permanent stress test.
+- **Loopback-only:** the daemon listens on `127.0.0.1`. Its write routes (restore, harvest, rewind) are single-user-local by design and are never exposed to the network.
 
 ## How Sojourn compares
 
