@@ -452,6 +452,39 @@ button {
   padding: 16px;
 }
 
+.inspector-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.inspector-head h2 {
+  margin: 0;
+}
+
+.inspector-close {
+  flex-shrink: 0;
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  font-size: 18px;
+  line-height: 1;
+  padding: 0 2px;
+  cursor: pointer;
+  border-radius: 4px;
+}
+
+.inspector-close:hover {
+  color: var(--text);
+  background: var(--border);
+}
+
+.inspector-close:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
 .inspector h2 {
   font-size: 14px;
   margin: 0 0 4px;

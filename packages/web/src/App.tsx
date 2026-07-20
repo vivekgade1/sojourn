@@ -565,6 +565,9 @@ export function App() {
           onSelectNode={selectAndFocus}
           markedNode={markedNode}
           onMarkForCombine={setMarkedNodeId}
+          // Clears the SELECTION only. A node marked for combine survives
+          // this on purpose — closing the panel is not unmarking.
+          onClose={() => setSelectedNodeId(null)}
         />
       </div>
     </div>

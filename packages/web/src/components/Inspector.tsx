@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { api, ApiError, isCombinePartial, isHarvestPartial } from "../api";
 import type {
   Annotation,
@@ -34,6 +34,12 @@ export interface InspectorProps {
   markedNode?: ChronoNode | null;
   /** Mark the inspected node as the combine partner. */
   onMarkForCombine?: (nodeId: string) => void;
+  /**
+   * Dismiss the panel. Clears the SELECTION at the App level (so the graph
+   * reflows and lineage highlighting clears) — it does NOT unmark a node
+   * marked for combine, which deliberately outlives selection changes.
+   */
+  onClose?: () => void;
 }
 
 /**
@@ -990,7 +996,23 @@ function InspectorContent({
   onSelectNode,
   markedNode,
   onMarkForCombine,
+  onClose,
 }: InspectorProps & { node: ChronoNode }) {
+  // Escape closes the panel — but NEVER out from under an open modal. The
+  // restore/harvest/combine modals do not handle Escape themselves (a known
+  // deferred a11y item), so without this guard Escape would dismiss the panel
+  // behind a modal that stays on screen, stranding the user mid-flow.
+  useEffect(() => {
+    if (!onClose) return;
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.key !== "Escape") return;
+      if (document.querySelector(".modal-overlay")) return;
+      onClose!();
+    }
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [onClose]);
+
   const [payloadOpen, setPayloadOpen] = useState(false);
   const [criticBusy, setCriticBusy] = useState(false);
   const [criticError, setCriticError] = useState<string | null>(null);
@@ -1035,7 +1057,20 @@ function InspectorContent({
 
   return (
     <div className="inspector" data-testid="inspector">
-      <h2>{node.label ?? node.kind}</h2>
+      <div className="inspector-head">
+        <h2>{node.label ?? node.kind}</h2>
+        {onClose && (
+          <button
+            type="button"
+            className="inspector-close"
+            onClick={onClose}
+            aria-label="Close inspector"
+            title="Close (Esc)"
+          >
+            ×
+          </button>
+        )}
+      </div>
       <div className="inspector-meta">
         {node.cli} · {node.kind} · {new Date(node.timestamp).toLocaleString()}
       </div>
@@ -1159,6 +1194,7 @@ export function Inspector({
   onSelectNode,
   markedNode,
   onMarkForCombine,
+  onClose,
 }: InspectorProps) {
   if (!node) {
     return <div className="inspector-empty">Select a node to inspect it.</div>;
@@ -1179,6 +1215,7 @@ export function Inspector({
       onSelectNode={onSelectNode}
       markedNode={markedNode}
       onMarkForCombine={onMarkForCombine}
+      onClose={onClose}
     />
   );
 }
