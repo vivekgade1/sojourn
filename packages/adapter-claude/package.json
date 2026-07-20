@@ -1,6 +1,5 @@
 {
   "name": "@sojourn/adapter-claude",
-  "private": true,
   "version": "1.2.0",
   "type": "module",
   "main": "./dist/index.js",
@@ -17,7 +16,19 @@
   "files": [
     "dist"
   ],
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vivekgade1/sojourn.git",
+    "directory": "packages/adapter-claude"
+  },
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
   "dependencies": {
-    "@sojourn/core": "*"
+    "@sojourn/core": "^1.2.0"
   }
 }

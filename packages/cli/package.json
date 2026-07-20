@@ -1,14 +1,28 @@
 {
   "name": "@sojourn/cli",
-  "private": true,
   "version": "1.2.0",
   "type": "module",
+  "description": "Sojourn CLI (soj) — retrace and rewind your coding agent's path",
+  "keywords": [
+    "sojourn",
+    "soj",
+    "agent",
+    "provenance",
+    "snapshot",
+    "rewind"
+  ],
   "bin": {
     "soj": "./dist/main.js"
   },
   "files": [
     "dist"
   ],
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/vivekgade1/sojourn.git",
@@ -17,8 +31,9 @@
   "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "@sojourn/adapter-claude": "*",
-    "@sojourn/core": "*",
+    "@sojourn/adapter-claude": "^1.2.0",
+    "@sojourn/core": "^1.2.0",
+    "@sojourn/daemon": "^1.2.0",
     "commander": "^13.0.0"
   }
 }

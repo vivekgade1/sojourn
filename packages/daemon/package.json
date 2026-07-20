@@ -1,6 +1,5 @@
 {
   "name": "@sojourn/daemon",
-  "private": true,
   "version": "1.2.0",
   "type": "module",
   "main": "./dist/wire.js",
@@ -16,10 +15,17 @@
     "directory": "packages/daemon"
   },
   "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "dependencies": {
-    "@sojourn/adapter-claude": "*",
-    "@sojourn/adapter-opencode": "*",
-    "@sojourn/core": "*",
+    "@sojourn/adapter-claude": "^1.2.0",
+    "@sojourn/adapter-opencode": "^1.2.0",
+    "@sojourn/core": "^1.2.0",
+    "@sojourn/web": "^1.2.0",
     "chokidar": "^4.0.0",
     "express": "^4.21.0",
     "ws": "^8.18.0"

@@ -1,22 +1,35 @@
 {
   "name": "@sojourn/web",
-  "private": true,
   "version": "1.2.0",
   "type": "module",
+  "description": "Sojourn web UI — the built static bundle served by the daemon at /",
   "scripts": {
     "build": "vite build",
     "dev": "vite"
   },
-  "dependencies": {
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vivekgade1/sojourn.git",
+    "directory": "packages/web"
+  },
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "devDependencies": {
     "d3-hierarchy": "^3.1.2",
     "d3-selection": "^3.0.0",
     "d3-shape": "^3.2.0",
     "d3-transition": "^3.0.1",
     "d3-zoom": "^3.0.0",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
-  },
-  "devDependencies": {
+    "react-dom": "^18.3.1",
     "@testing-library/react": "^16.0.0",
     "@types/d3-hierarchy": "^3.1.7",
     "@types/d3-selection": "^3.0.11",
