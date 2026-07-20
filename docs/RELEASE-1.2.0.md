@@ -265,7 +265,7 @@ Reproduce all of it from a clean checkout:
 
 ```bash
 npm install && npm run build
-npm test                        # 877 tests, 58 files
+npm test                        # 878 tests, 58 files
 npm run validate:plugin         # 17/17
 bash scripts/e2e/run-cycle.sh   # 62/62 API checks against an isolated daemon
 bash scripts/demo/run-demo.sh   # 24 sections, 0 failing checks
@@ -274,7 +274,7 @@ bash scripts/demo/run-demo.sh   # 24 sections, 0 failing checks
 | Gate | Result |
 |---|---|
 | `npm run build` | clean (tsc + vite + plugin bundle) |
-| `npm test` | 877 passed, 58 files (see the known flakes under *Honest limits*) |
+| `npm test` | 878 passed, 58 files (see the known flakes under *Honest limits*) |
 | `npm run validate:plugin` | 17/17 |
 | `bash scripts/e2e/run-cycle.sh` | 62/62, 0 failed |
 | `packages/web` `tsc --noEmit` | exit 0 |
@@ -337,8 +337,8 @@ These are real and unresolved. Read this section as carefully as the feature lis
   watcher event — which is deferred rather than papered over with a longer
   timeout.
 
-  Practically: expect `npm test` to report **877 passed** on a clean run, and
-  occasionally 876 with that one watcher test failing.
+  Practically: expect `npm test` to report **878 passed** on a clean run, and
+  occasionally 877 with that one watcher test failing.
 
   A second test has also been observed to flake under load:
   `packages/daemon/test/api.test.ts`'s opencode-hook test. It is timing-sensitive
@@ -370,5 +370,3 @@ A stale pidfile left by a crashed daemon is handled by dead-pid detection.
 - [DEMO.md](DEMO.md) — end-to-end walkthrough with real captured output
 - [../plugins/claude/README.md](../plugins/claude/README.md) — plugin install modes
   and hook internals
-</content>
-</invoke>

@@ -456,7 +456,7 @@ Treat terminal delivery as a cheap nudge that costs your session nothing, and `s
 
 ## 15. HTTP & WebSocket API
 
-The daemon exposes a full local API (projects, graph, node diffs, flags/run, preflight/restore, annotations, mark, dismiss, hooks, search, session health, turn-flags, rewind, harvest) plus `node_added` / `flags_updated` / `project_updated` WebSocket events — see [docs/API.md](API.md) for the route table and payload shapes. Everything the CLI and web UI do goes through this API, so you can script against it.
+The daemon exposes a full local API (projects, graph, node diffs, flags/run, preflight/restore, annotations, mark, dismiss, hooks, search, session health, turn-flags, rewind, harvest, combine) plus `node_added` / `flags_updated` / `project_updated` WebSocket events — see [docs/API.md](API.md) for the route table and payload shapes. Everything the CLI and web UI do goes through this API, so you can script against it.
 
 ## 16. Troubleshooting
 

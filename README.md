@@ -375,7 +375,7 @@ If you want zero moving parts, use the native checkpoints. Sojourn earns its dae
 An npm-workspaces monorepo around one external daemon: `packages/core` (graph store on SQLite, shadow-git snapshotter, restore engine, flag engine, harvest, combine, GC) · `packages/daemon` (HTTP/WS API + transcript watchers — the contract is [docs/API.md](docs/API.md)) · `packages/adapter-claude` / `packages/adapter-opencode` (per-CLI ingestion and conversation restore; the transcript is always ground truth, hooks are just timing signals) · `packages/web` (React Flow UI, including the Inspector's restore/harvest surfaces and the mark/combine pairing flow) · `packages/cli` (`soj` — including `soj harvest` and `soj combine`, the CLI front ends to the harvest and combine routes, and the `soj gc` transcript sweep) · `plugins/claude` / `plugins/opencode` (install artifacts). Everything the CLI and web UI do goes through the daemon's localhost API, so you can script against all of it. Design spec: [SOJOURN_BUILD_PLAN_V1.md](SOJOURN_BUILD_PLAN_V1.md).
 
 ```bash
-npm test                        # vitest across all packages          -> 877 tests, 58 files
+npm test                        # vitest across all packages          -> 878 tests, 58 files
 npm run build                   # tsc -b + vite build + plugin hook bundle
 npm run validate:plugin         # plugin packaging checks             -> 17/17
 bash scripts/e2e/run-cycle.sh   # full E2E cycle, isolated daemon     -> 62/62 API checks
