@@ -1,0 +1,30 @@
+{
+  "name": "sojourn",
+  "owner": {
+    "name": "vivekgade1"
+  },
+  "description": "Sojourn — record what your coding agent actually did, verify its claims against real diffs, and rewind to any step.",
+  "plugins": [
+    {
+      "name": "sojourn",
+      "source": "./plugins/claude",
+      "displayName": "Sojourn",
+      "description": "Streams Claude Code session activity to the local Sojourn daemon for immediate timeline capture, and teaches Claude Code to drive `soj` itself. Optional: Sojourn's transcript watcher already works with zero configuration; this plugin makes ingestion immediate rather than debounce-delayed.",
+      "version": "1.2.0",
+      "author": {
+        "name": "vivekgade1"
+      },
+      "homepage": "https://github.com/vivekgade1/sojourn",
+      "repository": "https://github.com/vivekgade1/sojourn",
+      "license": "MIT",
+      "category": "productivity",
+      "keywords": [
+        "provenance",
+        "snapshot",
+        "rewind",
+        "verification",
+        "observability"
+      ]
+    }
+  ]
+}

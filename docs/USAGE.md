@@ -389,7 +389,16 @@ The pull-based transcript watcher is the **source of truth** — Sojourn works w
 
 ### Installing the plugin
 
-The plugin is a **self-contained bundle** — it does not assume you're working inside a Sojourn repo checkout. There are two install modes:
+The plugin is a **self-contained bundle** — it does not assume you're working inside a Sojourn repo checkout.
+
+**From the marketplace** — the shortest path, and the one to use unless you're developing Sojourn itself. In Claude Code:
+
+```
+/plugin marketplace add vivekgade1/sojourn
+/plugin install sojourn@sojourn
+```
+
+The repo root carries `.claude-plugin/marketplace.json`, whose single entry points at `./plugins/claude`. Nothing is cloned into your workspace — Claude Code caches the plugin under `~/.claude/plugins/`. Updates arrive when the plugin's `version` field changes, not on every commit, so a `git push` alone will not push an update to installed users.
 
 **In-repo dev checkout** — you have (or are working in) a full clone of the `sojourn` repo:
 

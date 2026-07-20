@@ -29,14 +29,33 @@ self-contained ESM script (Node shebang, zero runtime imports outside Node
 builtins — esbuild-bundled from
 `packages/adapter-claude/src/hooks/postToolUse.ts`). Because it doesn't
 reach outside itself, this plugin works the same way regardless of how it
-got onto disk — see the two install modes below.
+got onto disk — see the install modes below.
+
+## Install mode 0: the marketplace (recommended)
+
+Nothing to clone. In Claude Code:
+
+```
+/plugin marketplace add vivekgade1/sojourn
+/plugin install sojourn@sojourn
+```
+
+The marketplace manifest lives at the repo root (`.claude-plugin/marketplace.json`)
+and its one entry sources `./plugins/claude` — this directory. Claude Code caches
+the plugin under `~/.claude/plugins/`, which is why every path in `hooks/hooks.json`
+must go through `${CLAUDE_PLUGIN_ROOT}`: the plugin does not run from the location
+it was installed from.
+
+Note that installed users only see an update when the `version` in
+`.claude-plugin/plugin.json` changes. Pushing commits without bumping it leaves
+them on the cached copy, reporting "already at the latest version".
 
 ## Install mode 1: in-repo dev checkout
 
 You have (or are working in) a full clone of the `sojourn` repo.
 
 ```bash
-git clone <this-repo> sojourn
+git clone https://github.com/vivekgade1/sojourn.git
 cd sojourn
 npm install
 npm run build            # tsc for all packages + web + build:plugin (regenerates the hook bundle)

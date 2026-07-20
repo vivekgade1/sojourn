@@ -84,7 +84,14 @@ soj projects      # projects Sojourn has captured
 
 ### 2. Add the Claude Code plugin (optional, recommended)
 
-The transcript watcher is the source of truth — Sojourn works with **zero** Claude Code configuration. The plugin in [`plugins/claude/`](plugins/claude/README.md) adds push-timing hooks (ingestion becomes immediate instead of debounce-delayed) and a `sojourn` skill that teaches Claude Code to drive `soj` itself. Two install modes:
+The transcript watcher is the source of truth — Sojourn works with **zero** Claude Code configuration. The plugin in [`plugins/claude/`](plugins/claude/README.md) adds push-timing hooks (ingestion becomes immediate instead of debounce-delayed) and a `sojourn` skill that teaches Claude Code to drive `soj` itself.
+
+**From the marketplace** (no checkout needed) — in Claude Code:
+
+```
+/plugin marketplace add vivekgade1/sojourn
+/plugin install sojourn@sojourn
+```
 
 **From your repo checkout** (after `npm run build` above):
 

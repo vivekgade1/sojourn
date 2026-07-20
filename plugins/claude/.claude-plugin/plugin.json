@@ -1,5 +1,18 @@
 {
   "name": "sojourn",
-  "version": "0.1.0",
-  "description": "Streams Claude Code session activity to the local Sojourn daemon for real-time timeline capture and conversation restore."
+  "version": "1.2.0",
+  "description": "Streams Claude Code session activity to the local Sojourn daemon for real-time timeline capture and conversation restore.",
+  "author": {
+    "name": "vivekgade1"
+  },
+  "homepage": "https://github.com/vivekgade1/sojourn",
+  "repository": "https://github.com/vivekgade1/sojourn",
+  "license": "MIT",
+  "keywords": [
+    "provenance",
+    "snapshot",
+    "rewind",
+    "verification",
+    "observability"
+  ]
 }
