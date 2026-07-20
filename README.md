@@ -6,6 +6,8 @@ Sojourn records everything your agentic coding CLI does — every prompt, tool c
 
 **The core loop:** *spot where the agent guessed or slipped → rewind to just before it → branch correctly.*
 
+- Release notes: [docs/RELEASE-1.2.0.md](docs/RELEASE-1.2.0.md) — what's in v1.2.0, verification results, upgrade notes, and the honest limits.
+- See it run: [docs/DEMO.md](docs/DEMO.md) — a full end-to-end walkthrough with **real captured output**, reproducible with one command.
 - Complete user guide: [docs/USAGE.md](docs/USAGE.md) — CLI reference, web UI tour, flag semantics, restore guarantees, troubleshooting.
 - HTTP/WS API: [docs/API.md](docs/API.md).
 - Claude Code plugin details: [plugins/claude/README.md](plugins/claude/README.md).
@@ -14,12 +16,13 @@ Sojourn records everything your agentic coding CLI does — every prompt, tool c
 
 ## What's in v1.2.0
 
-v1.2.0 is the complete V1 + V2 feature set, hardened for daily use. Everything runs locally against one daemon; nothing leaves your machine. At a glance:
+v1.2.0 is the complete V1 + V2 feature set, hardened for daily use. Everything runs locally against one daemon; nothing leaves your machine. Full release notes — including what changed, how it was verified, and upgrade steps — are in [docs/RELEASE-1.2.0.md](docs/RELEASE-1.2.0.md). At a glance:
 
 **Capture & navigation**
 - Passive, cross-session, cross-CLI **decision graph** with whole-working-tree shadow-git **snapshots at every step** — never touching your project's `.git`.
 - Web UI (`soj open`) with a **map view** (turn waypoints sized by work, flag badges, decision pennants, minimap, search) and a **graph view** (node tree with lineage highlighting and a path breadcrumb).
-- **Multi-select session filter** — the UI opens on the latest session only (fast on large histories) and lets you union in more sessions or show all.
+- **Multi-select session filter** — the UI opens on the latest session only (fast on large histories) and lets you union in more sessions or show all. Once you've made an explicit selection, a banner tells you when new sessions are being hidden by it ("N new sessions aren't shown"), with Show / Dismiss — a filter you set yesterday can't quietly hide today's work.
+- **Harvest from the Inspector** — after a restore, the restore result grows a *"Harvest changes into project"* button: preflight in a modal (per-file clean/conflict/identical, apply-vs-patch, an allow-conflicts opt-in that only appears when there are conflicts), and a mid-apply failure renders the partial-state report instead of a bare error.
 - **Restore-point highlighting** — nodes you can restore to are visually marked; nodes whose snapshot is gone (thinned by GC or never captured) are muted and their restore button is **disabled up front**, not after a dead-end click.
 - **"Restorable" filter** — isolate just the actionable nodes (where restore can be performed) in a distinct color palette, across both views.
 - Live WebSocket updates with **automatic reconnect + refetch** and a "daemon unreachable" banner that self-clears on recovery.
@@ -27,11 +30,12 @@ v1.2.0 is the complete V1 + V2 feature set, hardened for daily use. Everything r
 **Trust — verified vs advisory flags**
 - Five deterministic **verified** checks (edit-claim-mismatch flagship, package hallucination, symbol / file-ref grounding, test-claim verification) with evidence, auto-resolve, and per-turn budgets/digests; an opt-in Tier-2 LLM critic that can never masquerade as verified.
 
-**Restore, rewind & harvest**
-- Whole-tree **restore** into an isolated worktree (safety snapshot first, your `.git` untouched); **exact-node conversation rewind** for Claude Code with honest refusal; **harvest** a worktree's changes back to mainline (HTTP API).
+**Restore, rewind, harvest & combine**
+- Whole-tree **restore** into an isolated worktree (safety snapshot first, your `.git` untouched); **exact-node conversation rewind** for Claude Code with honest refusal; **harvest** a worktree's changes back to mainline (`soj harvest`, the web UI, or the HTTP API).
+- **Combine** (`soj combine <nodeIdA> <nodeIdB>`) three-way merges the **file states** of two nodes — typically from two *different* sessions — against their nearest common ancestor, into one new worktree. It emits **files only: no conversation transcript is ever synthesized.** The graph stays a tree — `parentId` is still single, and the second ancestor is recorded as provenance in `meta.mergedFrom`. Two-step "Mark for combine" → "Combine with marked node" in the web UI, or the HTTP API.
 
 **Decision memory, gate & retention**
-- `soj why` / `soj decisions` full-text search + a files-touched index; `soj mcp` read-only MCP server; `soj gate` CI-style exit codes; `soj gc` pin-aware retention with dry-run default.
+- `soj why` / `soj decisions` full-text search + a files-touched index; `soj mcp` read-only MCP server; `soj gate` CI-style exit codes; `soj harvest` preflight-by-default return path; `soj combine` cross-session file-state merge (files only); `soj gc` pin-aware retention (snapshots *and* synthesized rewind transcripts) with dry-run default.
 
 **Reliability (hardened in v1.2.0)**
 - The daemon is crash-proofed: a **rotating log** at `~/.sojourn/daemon.log`, process guards that **log and survive** (one bad transcript can never take capture down, with a crash-storm breaker), and `soj start` / `soj status` that surface the log tail when something is wrong instead of failing silently. A prior O(n²) ingest path that could OOM the daemon on very large sessions is **fixed and guarded by a scale test**. The daemon binds **loopback (127.0.0.1) only** — its write routes are never reachable from the network.
@@ -96,6 +100,39 @@ Either way the hook always exits 0 within ~3.5 seconds, daemon up or not — it 
 
    Node ids come from `soj flags` output or the web UI inspector.
 
+### Or watch the whole thing run
+
+If you'd rather see every feature exercised before wiring Sojourn into your own
+work, the demo does exactly that — against a **real daemon**, in a **throwaway
+home**, in one command:
+
+```bash
+bash scripts/demo/run-demo.sh
+```
+
+It provisions its own `SOJOURN_HOME` and `CLAUDE_CONFIG_DIR` in a temp directory
+and fingerprints your real `~/.sojourn` and `~/.claude` before and after, so it
+can prove it left them untouched. 24 sections, each asserting a real exit code or
+filesystem fact; it exits non-zero if any check fails.
+
+It walks daemon lifecycle → capture → flags → the Tier-2 critic → mark/checkpoint
+→ decision memory → `soj gate` → exact rewind and its refusal → sidecar ordering →
+restore → harvest (apply, patch, conflict-abort, allow-conflicts) → snapshot
+excludes → combine (a real cross-session merge, its refusals, and the assertion
+that **no transcript was synthesized**) → the flag-delivery race → GC → MCP →
+the web UI → log rotation, and finishes by diffing your real home directories to
+prove it touched nothing.
+
+The write-up of a real run — every command with its **actual** output, nothing
+reconstructed — is [docs/DEMO.md](docs/DEMO.md). It is also candid about what the
+demo does *not* prove: the sections it had to skip (no `ANTHROPIC_API_KEY`, so
+only the Tier-2 critic's refusal is captured) and the ones that are described
+rather than captured (the web UI, since the run is headless).
+
+Two real defects were found by building that demo, and both are fixed — it now
+guards against them. The details are in
+[docs/DEMO.md](docs/DEMO.md#defects-found-while-building-this-demo).
+
 ## Features
 
 ### Capture and the map
@@ -147,9 +184,22 @@ Conversation restore has two modes for Claude Code:
 
 Sojourn **refuses exact rewind honestly** — with a `refusedReason` — whenever it can't guarantee the reconstruction: an incomplete ancestor chain, a parentage cycle, or a chain crossing a compaction boundary. OpenCode sessions always restore in tip mode. And the preflight warns you every time about what no restore can undo: Bash side effects, DB migrations, network calls, `git push`.
 
-### Harvest — the return path (HTTP API only today)
+### Harvest — the return path
 
-When work in a restore worktree turns out to be worth keeping, **harvest** merges it back into your mainline project — the only Sojourn feature that ever writes into your actual project directory, and it takes a mainline safety snapshot first, unconditionally, in every mode. There is **no `soj harvest` subcommand yet in this release** — harvest is driven entirely through the HTTP API:
+When work in a restore worktree turns out to be worth keeping, **harvest** merges it back into your mainline project — the only Sojourn feature that ever writes into your actual project directory, and it takes a mainline safety snapshot first, unconditionally, in every mode.
+
+```bash
+soj harvest                     # from inside the restored worktree: PREFLIGHT ONLY —
+                                # prints every changed file as clean/conflict/identical
+                                # and exits 1 without touching your project
+soj harvest <worktreePath>      # same, for a worktree you're not standing in
+soj harvest --yes               # actually harvest: mainline safety snapshot -> apply
+soj harvest --yes --mode patch  # write .sojourn-harvest.patch in the worktree instead
+soj harvest --yes --allow-conflicts   # apply mode only: write conflict markers rather
+                                      # than aborting the whole apply
+```
+
+`--allow-conflicts` with `--mode patch` is rejected locally rather than silently ignored — a patch never writes conflict markers into your mainline. The same thing is available from the web UI's Inspector after a restore, and directly over HTTP for scripting:
 
 ```bash
 # dry run: classify every changed file as clean / conflict / identical
@@ -164,7 +214,54 @@ curl -s -X POST localhost:4177/api/worktrees/harvest \
   -d '{"worktreePath":"...","mode":"apply"}'
 ```
 
-Failures are typed and honest (`no_manifest`, `stale_base`, `conflicts`, `patch_incomplete`, `partial_apply`, `mainline_drift`) — a mid-apply failure never leaves a half-applied mainline pretending to be a success. A successful apply that lands at least one file also lands a checkpoint node in the graph, parented to the restore's origin (an all-identical apply changes nothing and adds no node). Full semantics and known limits: [docs/USAGE.md §7](docs/USAGE.md).
+Failures are typed and honest (`no_manifest`, `stale_base`, `conflicts`, `patch_incomplete`, `read_failed`, `partial_apply`, `mainline_drift`) — a mid-apply failure never leaves a half-applied mainline pretending to be a success. `soj harvest` makes that distinction machine-readable: exit **1** for anything that stopped *before* writing (preflight, local validation, every 400, daemon unreachable), exit **2** only for `partial_apply` / `mainline_drift` — the mainline *was* written to, and the full applied / conflicted / remaining / safety-snapshot dump goes to stderr. A successful apply that lands at least one file also lands a checkpoint node in the graph, parented to the restore's origin (an all-identical apply changes nothing and adds no node). Full semantics and known limits: [docs/USAGE.md §7](docs/USAGE.md).
+
+### Combine — merging two sessions' file states
+
+Two sessions branched from the same point and both did work worth keeping.
+**Combine** three-way merges their **file states** — against their nearest
+common ancestor — into one new worktree:
+
+```bash
+soj combine <nodeIdA> <nodeIdB>          # PREFLIGHT ONLY: prints the merge base, the
+                                         # per-file clean/conflict/identical table and
+                                         # the warnings, then exits 1 having written
+                                         # nothing anywhere
+soj combine <nodeIdA> <nodeIdB> --yes    # actually combine, into a new worktree
+soj combine <nodeIdA> <nodeIdB> --yes --allow-conflicts   # write conflict markers
+                                                          # instead of aborting
+```
+
+> **Combine emits FILES ONLY. No conversation transcript is ever synthesized.**
+> Neither source session is continued. Merging two conversations would mean
+> inventing an interleaving that never happened — exactly the guess Sojourn
+> refuses to make. You start a genuinely fresh session in the output worktree,
+> and Sojourn's worktree aliasing links it back to node A by itself.
+
+The result is a new worktree under `~/.sojourn/worktrees/` holding node A's tree
+with node B's changes merged on top. Nothing outside that worktree is written —
+neither source snapshot, neither source worktree, and never your project or its
+`.git`. A combine that lands at least one file also records a **checkpoint node**
+in the graph, parented to node A, with node B recorded as provenance in
+`meta.mergedFrom` (schema migration V4's `nodes.merged_from` column). **The graph
+stays a tree:** `parentId` is still single, and Sojourn is not a DAG.
+
+In the web UI it is a two-step pairing: **Mark for combine** on one node's
+Inspector raises a banner (with a Clear button) that survives changing the
+selection *and* the session filter — which is what makes pairing nodes from two
+different sessions possible at all — then **Combine with marked node** on the
+node you actually want to merge into. The inspected node is A; the marked node
+is B.
+
+Combine refuses rather than guessing: two nodes with **no common ancestor**, two
+nodes from **different projects**, a node with **no effective snapshot tree**, or
+an unresolved **conflict** without `--allow-conflicts` all abort with a typed
+code — and every one of those refusals is **provably zero-write**, raised before
+an output directory is even claimed. The single exception is `write_failed`
+(exit **2**), where a half-built worktree does exist; it is deliberately **not**
+deleted, because it holds real merged content and removing it would make combine
+a source of data loss. The full applied/conflicted/remaining dump goes to stderr.
+Routes and error codes: [docs/API.md](docs/API.md).
 
 ### Decision memory — `soj why`, `soj decisions`, `soj mcp`
 
@@ -203,7 +300,9 @@ soj gc --archive-dir ~/sojourn-archive --run   # on --run, writes a git-bundle b
 soj gc --run                              # actually prune
 ```
 
-Never pruned, regardless of age: snapshots pinned by decision/assumption/checkpoint nodes, flagged nodes, live restored worktrees (their manifests are scanned automatically), and the safety-snapshot history itself. `soj gc` is safe to run against a live daemon — if capture lands a snapshot mid-run, gc detects it and **aborts without pruning anything**; just re-run later.
+The same run also sweeps the **synthesized rewind transcripts** an exact rewind wrote (and any inert leftover sidecar), under the identical `--days` cutoff and the identical dry-run-unless-`--run` gate. Your **native Claude Code session transcripts are never touched** — a `.jsonl` with no Sojourn sidecar is the ordinary shape of a real session, and the sweep can only ever delete a transcript it can prove it wrote.
+
+Never pruned, regardless of age: snapshots pinned by decision/assumption/checkpoint nodes, flagged nodes, live restored worktrees (their manifests are scanned automatically), and the safety-snapshot history itself. Rewind transcripts inherit the same pin rule — one whose origin node is a decision/assumption/checkpoint or carries any flag is kept. `soj gc` is safe to run against a live daemon — if capture lands a snapshot mid-run, gc detects it and **aborts without pruning anything**; just re-run later.
 
 ### Terminal flag delivery
 
@@ -218,6 +317,8 @@ Sojourn: edit_claim_mismatch — claimed src/x.ts:42 edited, snapshot shows no c
 ```
 
 Verified-only by contract and by a second in-hook guard (any line mentioning "advisory" is dropped as defense in depth); budgeted to at most 3 lines plus a `+n more` marker; silent when the daemon is slow or down; never changes the hook's exit code.
+
+**Timing caveat — these lines usually show the *previous* turn's state.** The same `Stop` hook that asks the daemon for flags is what tells it to re-scan the transcript in the first place, and it gives the answer 500ms before giving up. The daemon replies from whatever it has already ingested — it never waits for the rescan — so within that budget you generally read the state as of *before* the turn that just ended. This falls directly out of "capture never blocks": the hook will not stall your session waiting on ingestion. Treat the terminal lines as a fast nudge, not a verdict — and in particular **do not read silence as a clean bill of health**. Run `soj flags` or refresh the web UI for the settled picture.
 
 ### Session health
 
@@ -262,7 +363,8 @@ If you want zero moving parts, use the native checkpoints. Sojourn earns its dae
 
 - **Not on npm yet.** Install is from this repository (clone, build, link). No launchd/system autostart either — `soj start` is manual.
 - **OpenCode support is not live-verified.** The adapter was written against OpenCode's documented API and is not yet live-integration-tested; every module carries that header, and everything fails soft. See [docs/USAGE.md §13](docs/USAGE.md).
-- **Harvest is API-only** (no `soj harvest` subcommand yet) and transfers file *contents* only — file-mode changes aren't preserved, symlinked branch entries are materialized as regular files, and patch mode emits git's "Binary files differ" stub for binary paths.
+- **Combine merges files, never conversations.** `soj combine` produces a worktree and nothing else — no merged transcript is synthesized, because inventing an interleaving of two real conversations is exactly the kind of guess Sojourn refuses to make. You start a fresh session in the output worktree. The same contents-only caveats as harvest apply (no file modes, symlinks materialized as regular files), and a binary path that both sides changed is reported as an **unmarkable** conflict where node A's content is kept and B's side is simply not present.
+- **Harvest transfers file *contents* only** — file-mode changes (e.g. the executable bit) aren't preserved, symlinked branch entries are materialized as regular files containing the target path, and patch mode emits git's ordinary "Binary files differ" stub for binary paths rather than a binary-aware patch.
 - **The critic costs an API key.** Tier-2 advisory flags require `ANTHROPIC_API_KEY` in the daemon's environment and are opt-in, per-node, and advisory-only.
 - **Flags are not a correctness proof.** Sojourn will not catch every hallucination; a clean node is not a guarantee. Verified checks stay silent when ground truth is unavailable (precision over recall). No logprob-based detection for Claude Code — the API doesn't expose logprobs, and Sojourn doesn't pretend otherwise.
 - **Restore cannot undo side effects** — Bash effects (`rm`, `mv`), DB migrations, network calls, `git push`. The preflight warns you every time.
@@ -270,16 +372,23 @@ If you want zero moving parts, use the native checkpoints. Sojourn earns its dae
 
 ## Architecture
 
-An npm-workspaces monorepo around one external daemon: `packages/core` (graph store on SQLite, shadow-git snapshotter, restore engine, flag engine, harvest, GC) · `packages/daemon` (HTTP/WS API + transcript watchers — the contract is [docs/API.md](docs/API.md)) · `packages/adapter-claude` / `packages/adapter-opencode` (per-CLI ingestion and conversation restore; the transcript is always ground truth, hooks are just timing signals) · `packages/web` (React Flow UI) · `packages/cli` (`soj`) · `plugins/claude` / `plugins/opencode` (install artifacts). Everything the CLI and web UI do goes through the daemon's localhost API, so you can script against all of it. Design spec: [SOJOURN_BUILD_PLAN_V1.md](SOJOURN_BUILD_PLAN_V1.md).
+An npm-workspaces monorepo around one external daemon: `packages/core` (graph store on SQLite, shadow-git snapshotter, restore engine, flag engine, harvest, combine, GC) · `packages/daemon` (HTTP/WS API + transcript watchers — the contract is [docs/API.md](docs/API.md)) · `packages/adapter-claude` / `packages/adapter-opencode` (per-CLI ingestion and conversation restore; the transcript is always ground truth, hooks are just timing signals) · `packages/web` (React Flow UI, including the Inspector's restore/harvest surfaces and the mark/combine pairing flow) · `packages/cli` (`soj` — including `soj harvest` and `soj combine`, the CLI front ends to the harvest and combine routes, and the `soj gc` transcript sweep) · `plugins/claude` / `plugins/opencode` (install artifacts). Everything the CLI and web UI do goes through the daemon's localhost API, so you can script against all of it. Design spec: [SOJOURN_BUILD_PLAN_V1.md](SOJOURN_BUILD_PLAN_V1.md).
 
 ```bash
-npm test                        # vitest across all packages
+npm test                        # vitest across all packages          -> 877 tests, 58 files
 npm run build                   # tsc -b + vite build + plugin hook bundle
-bash scripts/e2e/run-cycle.sh   # full E2E cycle against an isolated daemon
+npm run validate:plugin         # plugin packaging checks             -> 17/17
+bash scripts/e2e/run-cycle.sh   # full E2E cycle, isolated daemon     -> 62/62 API checks
+bash scripts/demo/run-demo.sh   # end-to-end feature demo, isolated   -> 24 sections
 ```
+
+`npm run build -w @sojourn/web` is `vite build` only and does **not** typecheck the
+web package; run `cd packages/web && npx tsc --noEmit` for that.
 
 ## Documentation
 
+- [docs/RELEASE-1.2.0.md](docs/RELEASE-1.2.0.md) — v1.2.0 release notes: full feature inventory, what's new, verification results, upgrade steps, and honest limits
+- [docs/DEMO.md](docs/DEMO.md) — end-to-end walkthrough with real captured output (`bash scripts/demo/run-demo.sh` to reproduce)
 - [docs/USAGE.md](docs/USAGE.md) — the complete user guide (CLI reference, web UI, flags, restore, harvest, GC, decision memory, gate, MCP, troubleshooting)
 - [docs/API.md](docs/API.md) — HTTP + WebSocket API
 - [plugins/claude/README.md](plugins/claude/README.md) — Claude Code plugin install modes and hook internals

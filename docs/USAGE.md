@@ -75,6 +75,42 @@ soj restore <nodeId>             PREFLIGHT ONLY: prints the full side-effect war
 soj restore <nodeId> --yes       Actually restore: safety snapshot → new worktree → prints the
                                  worktree path and resume command.
 
+soj harvest [worktreePath] [--yes] [--mode apply|patch] [--allow-conflicts]
+                                 Restore's inverse: carry a restored worktree's changes back to
+                                 the mainline project. Run it from inside the worktree, or pass
+                                 the path. PREFLIGHT ONLY without --yes: prints every changed
+                                 file as clean/conflict/identical plus whether the mainline moved
+                                 on the paths this harvest touches, then exits 1 having written
+                                 nothing. --yes performs it (mainline safety snapshot first,
+                                 always, in every mode). --mode patch writes a
+                                 .sojourn-harvest.patch inside the worktree and never touches the
+                                 mainline. --allow-conflicts (apply mode only — it is rejected
+                                 with --mode patch rather than silently ignored) writes conflict
+                                 markers instead of aborting the whole apply. Exit 1 = stopped
+                                 before writing anything (preflight, bad flags, any 400, daemon
+                                 unreachable); exit 2 = the mainline WAS partially written
+                                 (partial_apply / mainline_drift) and the applied/conflicted/
+                                 remaining/safety-snapshot dump is on stderr. See §7.
+
+soj combine <nodeIdA> <nodeIdB> [--yes] [--allow-conflicts]
+                                 Merge the FILE STATES of two nodes — usually from DIFFERENT
+                                 sessions — into ONE new worktree, three-way merged against their
+                                 nearest common ancestor. NO TRANSCRIPT IS SYNTHESIZED: combine
+                                 emits files only; start a genuinely fresh session in the output
+                                 worktree. PREFLIGHT ONLY without --yes: prints both node ids, the
+                                 resolved merge base, all three tree hashes, every path as
+                                 clean/conflict/identical (conflicts that can never take markers
+                                 are shown as "conflict (unmarkable)") and the warnings, then
+                                 exits 1 having written nothing anywhere — not even into the
+                                 shadow repo. --yes performs it. --allow-conflicts writes conflict
+                                 markers instead of aborting. Node A is "ours": its tree is the
+                                 starting content and the combine node is parented to it; node B
+                                 is recorded as provenance in meta.mergedFrom. Exit 1 = stopped
+                                 before writing anything (preflight, local validation, any 400,
+                                 daemon unreachable); exit 2 = write_failed, where a half-built
+                                 worktree WAS left on disk (deliberately not deleted) and the
+                                 partial dump is on stderr. See §7.
+
 soj gc [--project <id>] [--days N] [--archive-dir <path>] [--run]
                                  Prune old snapshot history in a project's shadow repo. Dry-run by
                                  default (prints what WOULD be pruned/reclaimed); pass --run to
@@ -84,7 +120,9 @@ soj gc [--project <id>] [--days N] [--archive-dir <path>] [--run]
                                  restored worktree (its .sojourn-restore.json is scanned
                                  automatically). If a live daemon lands a new snapshot mid-run, gc
                                  detects it and aborts safely without pruning anything — re-run
-                                 soj gc later to complete it. See §8.
+                                 soj gc later to complete it. The same run also sweeps synthesized
+                                 rewind transcripts under the same cutoff and the same --run gate;
+                                 native Claude session transcripts are never touched. See §8.
 
 soj why "<query>" [--project <id>] [--file <path>]
                                  Full-text search over prompts, gists, marks, and annotations —
@@ -118,6 +156,9 @@ Node ids come from `soj flags` output or the web UI inspector. They contain a `:
 - **Toolbar** — project selector, **decision lens** (collapse the graph to decision/assumption/checkpoint *and flagged* nodes — the "how did we get here, and where did it guess?" view), and a flagged-only filter.
 - **Inspector** (click a node) — summary, raw payload, **on-demand file diff** for that node's step, annotations (add free-text notes), and every flag with its evidence. Dismiss buttons remember your dismissals. A **"Run advisory critic"** button triggers the T2 pass for that node.
 - **Restore buttons** — *"Restore at this node"* (the node's own snapshot) and, from a flag, *"Restore to before this node"* (the parent's snapshot — i.e. just before the flagged step). Both show a modal with the daemon's warning list verbatim; nothing happens until you confirm.
+- **Harvest** — a restore's result block grows a *"Harvest changes into project"* button (the worktree path is only known from that restore's own result, which is why harvest lives here and not on arbitrary nodes). It runs the preflight and shows a confirm modal: every changed file with its `clean` / `conflict` / `identical` status, a warning when your project has itself moved on files the harvest would touch, an apply-vs-patch choice, and — only when there actually are conflicts — an explicit "harvest anyway with N conflict(s)" checkbox. Confirm is disabled until you tick it, mirroring the server's own refusal. The worktree is re-read on confirm, and the path harvested is the one you reviewed, never a path that changed underneath you. A mid-apply failure renders the full partial-state report (applied / conflicted / remaining / safety snapshot) rather than a bare error.
+- **Mark for combine → Combine with marked node** — combine is a deliberate two-step pairing, because its whole point is joining nodes from two *different* sessions. **Mark for combine** in one node's Inspector raises a persistent banner naming what is marked, with a **Clear** button; that mark survives changing the selection **and** changing the session filter, which is what makes it possible to go find the second node at all (dismissing the banner *is* un-marking — there is no invisible-but-armed state). Then open any other node and press **Combine with marked node**: the inspected node is A, the marked node is B. A confirm modal shows both ids, the resolved merge base, the per-file `clean` / `conflict` / `identical` table, the preflight warnings, and — prominently — the notice that combine merges **files only** and never the conversation. An "allow conflicts" opt-in appears only when there actually are conflicts, mirroring the server's own refusal. On success you get the output worktree path; on a `write_failed` you get the full partial-state report (worktree, applied, conflicted, remaining) rather than a bare error. See §7.
+- **Session filter banner** — once you've made an explicit session selection, a banner appears when new sessions are being hidden by it ("N new sessions aren't shown"), with *Show them* and a dismiss ×. It never appears on the default path, where the newest session is shown automatically.
 
 ## 5. Confidence flags
 
@@ -161,22 +202,96 @@ Every restore, in order:
 
 **Conversation restore — two modes.** For Claude Code sessions, every restore also attempts an **exact-node rewind**: the daemon synthesizes a brand-new transcript file containing only the chain of lines from the root to the node you chose (the original transcript is never touched), and the resume command becomes `claude --resume <newSessionId>` — the resumed *conversation* genuinely starts at that node, not just the session's tip. Sojourn refuses exact rewind, honestly and by design, whenever it can't guarantee the reconstruction is correct — an incomplete ancestor chain (orphaned parentage), a parentage cycle, or a chain that crosses a compaction/summary boundary (Claude Code compacted the conversation, so the exact prior turns no longer exist to replay) all refuse, with a `refusedReason` explaining why. A refusal — or an OpenCode session, which restores in tip mode only — falls back to the **tip-mode** resume command you'd get in V1: `claude --resume <sessionId> --fork-session`, which continues the conversation from wherever the session currently stands, while the *filesystem* in the worktree is still restored exactly to the node you chose. A rewind failure never fails the restore itself — the `rewind` field is simply omitted from the response and you still get a working tip-mode resume command.
 
-## 7. Harvest — bringing worktree work back
+## 7. Harvest and combine — bringing worktree work back
 
 A restore drops you into a **new, disposable worktree**, deliberately isolated from your mainline project so nothing you do there touches real state by accident. When work in that worktree turns out to be worth keeping, **harvest** merges it back into your mainline project root — the first (and only) Sojourn feature that ever writes into your actual project directory.
 
-There is no dedicated `soj harvest` subcommand yet in this release — harvest is driven entirely through the HTTP API (`docs/API.md`); script it or drive it from a client of your choosing.
+Three surfaces, one engine: the `soj harvest` CLI, the web UI's Inspector button on a restore result (§4), and the HTTP routes (`docs/API.md`) if you'd rather script it.
+
+```bash
+cd ~/.sojourn/worktrees/<projectId>/<worktree>
+soj harvest                          # PREFLIGHT ONLY — classifies every changed file,
+                                     # writes nothing, exits 1
+soj harvest --yes                    # apply: mainline safety snapshot, then write
+soj harvest --yes --mode patch       # write .sojourn-harvest.patch in the worktree instead
+soj harvest --yes --allow-conflicts  # apply mode only: conflict markers instead of an abort
+
+soj harvest /path/to/worktree        # or name the worktree instead of standing in it
+```
+
+The path is resolved locally before it is sent, so a relative path (including the default `.`) works. `--allow-conflicts` together with `--mode patch` is **rejected locally** rather than accepted and ignored: a patch never writes conflict markers into your mainline, and a flag that looks accepted but does nothing is a lie.
 
 A typical harvest, in order:
 
-1. **Preflight** (`POST /api/worktrees/harvest/preflight {worktreePath}`) — a pure, zero-write dry run. Reads the worktree's `.sojourn-restore.json` manifest to resolve the origin project (mainline root + the shared shadow git repo the worktree branched from) and classifies every changed file as `clean` (safe to apply), `conflict` (both sides touched it since the branch point), or `identical`. No manifest, or it doesn't resolve → `code: "no_manifest"`.
-2. **Harvest** (`POST /api/worktrees/harvest {worktreePath, mode}`) — internally: **mainline safety snapshot first, unconditionally, before anything else, in EVERY mode** (same non-negotiable guarantee as restore — even `patch` mode takes one, despite never writing to the mainline itself), then classification is re-run, then:
+1. **Preflight** (`soj harvest` with no `--yes`, or `POST /api/worktrees/harvest/preflight {worktreePath}`) — a dry run that never writes to your mainline. Reads the worktree's `.sojourn-restore.json` manifest to resolve the origin project (mainline root + the shared shadow git repo the worktree branched from) and classifies every changed file as `clean` (safe to apply), `conflict` (both sides touched it since the branch point), or `identical`. No manifest, or it doesn't resolve → `code: "no_manifest"`; a base tree that has aged out of the shadow repo → `stale_base`; an unreadable worktree file → `read_failed`. (Preflight does take a snapshot of the *worktree* into the shadow repo in order to diff it — "no writes" here means no writes to your mainline project, which is the part that matters.)
+2. **Harvest** (`soj harvest --yes`, or `POST /api/worktrees/harvest {worktreePath, mode}`) — internally: **mainline safety snapshot first, unconditionally, before anything else, in EVERY mode** (same non-negotiable guarantee as restore — even `patch` mode takes one, despite never writing to the mainline itself), then classification is re-run, then:
    - `mode: "apply"` — writes the worktree's clean changes onto the mainline. Any conflict aborts the **whole** apply cleanly (nothing written) unless you pass `allowConflicts: true`, in which case clean files land and conflicting ones are named in the response. A successful apply that lands at least one file gets a **checkpoint node** in the graph, parented to the restore's origin node — the worktree session joins the origin project's graph instead of living in a disconnected branch.
    - `mode: "patch"` — composes a `base..branch` patch file (`.sojourn-harvest.patch`) inside the worktree and never touches the mainline, for when you'd rather review and apply by hand.
 
-**Conflict and failure handling is honest, not silent.** A mid-apply failure (e.g. a read-only destination) never leaves a half-applied mainline pretending to be a success — it aborts with a typed error naming exactly what applied, what conflicted, and what's left (a `.partial` payload), with the mainline safety snapshot always there as the fallback. Typed error codes: `no_manifest`, `stale_base`, `conflicts`, `patch_incomplete` (400s); `partial_apply`, `mainline_drift` (500s, `.partial` in the body). `mainline_drift` fires when the mainline itself changed underneath the harvest between classification and write — nothing further is written once that's detected.
+**Conflict and failure handling is honest, not silent.** A mid-apply failure (e.g. a read-only destination) never leaves a half-applied mainline pretending to be a success — it aborts with a typed error naming exactly what applied, what conflicted, and what's left (a `.partial` payload), with the mainline safety snapshot always there as the fallback. Typed error codes: `no_manifest`, `stale_base`, `conflicts`, `patch_incomplete`, `read_failed` (400s — **all of them abort-clean, with nothing written to the mainline**); `partial_apply`, `mainline_drift` (500s, `.partial` in the body). `read_failed` is a 400 even though the apply path can raise it too: both sites wrap the same dry classification pass over temp files, so it always stops before any mainline write. `mainline_drift` fires when the mainline itself changed underneath the harvest between classification and write — nothing further is written once that's detected.
+
+`soj harvest` makes that distinction scriptable, because it is the distinction that matters at 2am:
+
+| Exit | Meaning |
+|---|---|
+| `0` | Harvest completed (or the patch was written) |
+| `1` | Stopped **before** writing anything — the default preflight, a bad flag combination, any typed 400, or an unreachable daemon |
+| `2` | **The mainline was partially written** — `partial_apply` or `mainline_drift`. The full applied / conflicted / remaining / safety-snapshot state is dumped to stderr; the safety snapshot named there is your pre-harvest tree |
+
+A script can never mistake "we stopped before touching anything" for "your project is now half-harvested."
 
 **Known limits (documented, not hidden):** harvest transfers file *contents* only — file-mode changes (e.g. the executable bit) aren't preserved; a branch entry that is itself a symlink is materialized as a regular file containing the target path; patch mode emits git's ordinary "Binary files differ" stub for binary paths rather than a binary-aware patch.
+
+### `soj combine` — merging two sessions' file states
+
+Harvest carries **one** worktree back to the mainline. **Combine** answers the other question: two sessions branched from the same point, both did work worth keeping, and you want one tree that has both.
+
+```bash
+soj combine <nodeIdA> <nodeIdB>                        # PREFLIGHT ONLY — exits 1, writes nothing
+soj combine <nodeIdA> <nodeIdB> --yes                  # combine into a NEW worktree
+soj combine <nodeIdA> <nodeIdB> --yes --allow-conflicts   # conflict markers instead of an abort
+```
+
+> **Combine emits FILES ONLY. No conversation transcript is ever synthesized, in any mode.**
+>
+> This is a deliberate boundary, not a missing feature. Neither original session is continued: interleaving two real conversations into a third would mean inventing turns that never happened, and Sojourn refuses to guess where it cannot reconstruct faithfully (the same rule that makes exact rewind refuse across a compaction boundary — §6). What you get is a worktree. You start a genuinely **fresh** session in it, and Sojourn's existing worktree aliasing links that session to node A automatically, so it still joins the project's graph. If you were expecting a merged conversation, this feature does not do that and never will.
+
+The mechanics, in order:
+
+1. **Resolve the merge base.** Combine walks both nodes' ancestor chains and takes the **nearest common ancestor**, resolving every side's tree through the same shared `findEffectiveTree` that restore and GC's pinning use. No common ancestor → `no_common_ancestor`, refused: there is no shared state to merge against, and picking an arbitrary base would be a guess. Both nodes must also belong to the **same project**, so that base, A and B all live in one shadow object database → otherwise `cross_project`.
+2. **Classify** every path that node B moved since the base, three-way against node A, using the exact same `clean` / `conflict` / `identical` vocabulary as harvest. Paths only A touched are already correct in A's tree and need no work. The whole pass is a dry run over temp files — `git merge-file -p` against `os.tmpdir()` scratch, never git plumbing against your repo.
+3. **Materialize.** Node A's tree is checked out into a **new** worktree under `~/.sojourn/worktrees/<projectId>/combine-…`, then node B's side is merged on top. Nothing outside that new directory is ever written: not your project, not its `.git`, not either source worktree, not either source snapshot.
+4. **Record it.** A combine that lands at least one file inserts a **`checkpoint` node** whose `parentId` is node A and whose `meta.mergedFrom` is node B (schema migration **V4** added the backing `nodes.merged_from` column). **The graph stays a tree** — `parentId` is still single and Sojourn is not a DAG; the second ancestor is provenance, not structure. `combineNodeId: null` in the response is a legitimate outcome, **not** an error: it means no store was reachable, the combine wrote zero files (an all-identical combine is not a merge), or the origin node was unknown.
+
+Preflight is the purest of Sojourn's three preflights. `restore`'s validates a tree, `harvest`'s snapshots the live worktree into the shadow repo — combine's writes **nothing anywhere**, because base, A and B are all pre-existing trees. It is safe to run as often as you like.
+
+**`unmarkable` is not a synonym for `conflicted`, and the CLI prints them as separate blocks.** A `conflicted` file was written **with** conflict markers, so both sides are visible in it. An `unmarkable` file is a conflict that could never take text markers (binary content on some side), so node A's content was kept verbatim and **node B's side is not present in the output worktree at all**. Unmarkable paths appear in *both* lists — they are conflicts; the extra list is what tells you which of them silently kept A. Collapsing the two would misreport what is actually on disk.
+
+**Failures are typed, and the abort-clean line is sharp.** Every code except one is raised *before* the output directory is even claimed, so it is provably zero-write:
+
+| Code | HTTP | Meaning |
+|---|---|---|
+| *(none)* | 400 | Body validation: a missing/blank `nodeIdA`/`nodeIdB`, or the two ids being equal. Never reaches the engine, so there is no `code` field |
+| `not_found` | 400 | One of the node ids (or its project) is unknown to the store |
+| `cross_project` | 400 | The two nodes belong to different projects |
+| `no_common_ancestor` | 400 | The chains never meet — no shared state to merge against |
+| `no_tree` | 400 | A side has no effective snapshot tree, or its tree is gone from the shadow repo |
+| `conflicts` | 400 | Conflicted files and no `--allow-conflicts`. No worktree was created |
+| `read_failed` | 400 | A path could not be read out of the base/A/B snapshots. A failed read is never silently treated as "that side deleted the file" |
+| `dest_exhausted` | 400 | A unique output worktree directory could not be claimed |
+| `write_failed` | **500** | **The only partial state.** A half-built worktree exists on disk |
+
+`write_failed` is deliberately different in every way. It is the only 500, the only code that leaves anything behind, and the worktree it names is **not deleted** — it holds real merged content, and deleting it would turn combine into a source of data loss. Its body carries `partial: { worktreePath, applied, conflicted, remaining }`, and `soj combine` exits **2** and dumps that whole state to stderr:
+
+| Exit | Meaning |
+|---|---|
+| `0` | Combine completed |
+| `1` | Stopped **before** writing anything — the default preflight, local validation (`nodeIdA === nodeIdB`), any typed 400, or an unreachable daemon |
+| `2` | **`write_failed`** — a half-built worktree exists and was left in place. Inspect it before re-running; nothing else was touched |
+
+A script can never mistake "we stopped before touching anything" for "a partly-merged worktree is sitting on your disk." Routes and response shapes: [API.md](API.md). A real cross-session combine, captured end to end — including the assertion that no transcript appeared — is [DEMO.md §12](DEMO.md).
+
+**Known limits:** the same contents-only caveats as harvest apply (no file modes, symlinks materialized as regular files containing the target path). Combine also never writes to your mainline project at all, in any mode — if you want the merged result in your project, harvest the combine worktree afterwards.
 
 ## 8. Retention & garbage collection (`soj gc`)
 
@@ -194,6 +309,10 @@ soj gc --run                              # actually prune
 **Dry-run is the default on purpose.** Without `--run`, `soj gc` computes and prints exactly what it would do — kept/pruned commit counts and a reclaim-size estimate — without deleting anything. Nothing is mutated until you pass `--run`.
 
 **Concurrency: abort and retry, not a race.** `soj gc` does not need the daemon stopped — it's safe to run while capture is active. If a live daemon lands a new snapshot in the exact window gc is finalizing, gc detects the conflicting write (a compare-and-swap on the shadow repo's head ref) and **aborts the entire run before pruning anything**: the concurrent snapshot is untouched, nothing is lost, and gc prints that it aborted and to re-run it later to complete the job. This is intentionally an abort-and-retry design rather than a lock — gc never blocks capture, and capture never has to wait on gc.
+
+**Synthesized rewind transcripts are swept too.** An exact-node rewind (§6) writes a brand-new transcript file next to your Claude Code sessions, plus a small Sojourn sidecar recording which session and node it came from. The same `soj gc` run also ages those out, under the *same* `--days` cutoff and the *same* dry-run-unless-`--run` gate, and reports them on their own `transcripts` line (kept / swept, plus reclaimed bytes). Only sidecars whose recorded origin session belongs to this project are considered. Retention mirrors the snapshot rule exactly: a rewind transcript whose origin node is a `decision` / `assumption` / `checkpoint`, or carries any flag, is kept regardless of age.
+
+> **Your real session history is never touched.** A `.jsonl` with no Sojourn sidecar is the ordinary shape of every *native* Claude Code session, and the sweep treats that shape as untouchable — as it does any sidecar it cannot parse. Only a transcript paired with a sidecar Sojourn wrote, or an inert sidecar left with no transcript, is ever a candidate. Deletion goes sidecar-first, on purpose: an interrupted delete can only leave an inert orphan sidecar (which the next sweep cleans up), never an unattributed transcript that would ingest as a phantom session. That is the same ordering restore/rewind uses when it *writes* the pair.
 
 `--archive-dir <path>` writes a full `git bundle` of everything about to be touched (not just the pruned range) before any ref is rewritten or object pruned, so a classification bug can never make the backup itself incomplete.
 
@@ -299,6 +418,22 @@ Sojourn: edit_claim_mismatch — claimed src/x.ts:42 edited, snapshot shows no c
 
 This surface is **verified-only, by contract and by a second guard**: the underlying route only ever returns active verified flags, and the hook itself drops any line that mentions "advisory" as defense in depth — an unverified guess can never read as confirmed here. Output is budgeted (max 3 lines plus a `"+n more"` marker on overflow, digest-collapsed) so a flag storm can't flood your terminal. It only fires on `Stop`, and only when the daemon responds within its own short timeout — a slow or unreachable daemon means no lines print, the same silent-and-exit-0 behavior as when the variable is unset. This is purely additive: it never changes the hook's exit code (always 0) or blocks the session either way.
 
+#### Timing: what you see is usually the *previous* turn's state
+
+This surface is fast, not settled, and the difference is worth understanding before you trust it.
+
+The `Stop` hook does two things in one run: it POSTs the event that **triggers** the daemon's re-scan of the transcript, and then it GETs `/api/sessions/:id/turn-flags` to print. That GET has its own 500ms budget (`FLAGS_TIMEOUT_MS`), separate from and in addition to the 500ms POST budget, both sitting inside the hook's 3500ms hard exit. The daemon answers the GET straight out of the nodes it has **already ingested** — there is no wait-for-ingest anywhere in that route. So within 500ms you will usually be reading the session as it stood *before* the turn that just ended.
+
+This is not a bug to be tuned away; it is the direct consequence of the rule that **capture never blocks**. The hook will never stall your session waiting on ingestion, so it can only ever print what's ready.
+
+What that means in practice:
+
+- The lines you see typically reflect the state **before** the turn that just finished. A flag raised by the turn you just watched will usually show up on the *next* one.
+- **Silence is not a clean bill of health.** No lines can mean no flags, or a daemon that was slow, down, or simply hadn't ingested the turn yet — the hook cannot tell you which, and by design won't wait to find out.
+- For the settled picture, run `soj flags` or refresh the web UI. Those read the graph after ingestion, with no timeout racing them.
+
+Treat terminal delivery as a cheap nudge that costs your session nothing, and `soj flags` / the UI as the answer.
+
 ## 13. OpenCode integration
 
 `POST /api/hooks/opencode {sessionId}` makes the daemon pull that session's messages from the local OpenCode server (`OPENCODE_URL`, default `http://localhost:4096`) and ingest them into the same per-project graph — Claude and OpenCode nodes unify by repository. `plugins/opencode/sojourn.ts` forwards session events to that route. Set `SOJOURN_OPENCODE=1` to have the daemon also subscribe to OpenCode's `/event` SSE stream directly (off by default).
@@ -317,7 +452,7 @@ This surface is **verified-only, by contract and by a second guard**: the underl
 | `OPENCODE_URL` | `http://localhost:4096` | Local OpenCode server base URL. |
 | `SOJOURN_OPENCODE` | off | `1` = daemon subscribes to OpenCode's SSE event stream. |
 | `SOJOURN_DAEMON_ENTRY` | auto-resolved | Override the daemon entry script `soj start` spawns. |
-| `SOJOURN_HOOK_FLAGS` | off | `1` = the Claude Code `Stop` hook prints that turn's active verified flags to the terminal (§12). Set in the environment Claude Code itself runs in, not the daemon's. |
+| `SOJOURN_HOOK_FLAGS` | off | `1` = the Claude Code `Stop` hook prints active verified flags to the terminal. Set in the environment Claude Code itself runs in, not the daemon's. Note it shows the **previous** turn's state, and silence is not proof of a clean turn — see §12. |
 
 ## 15. HTTP & WebSocket API
 
@@ -329,10 +464,18 @@ The daemon exposes a full local API (projects, graph, node diffs, flags/run, pre
 - **"daemon is not reachable … Try `soj start`"** — the daemon isn't running (or is on a different `SOJOURN_PORT`).
 - **No projects appear** — the watcher only sees sessions under `CLAUDE_CONFIG_DIR`; check `soj status`, then look at the daemon log output. Snapshots additionally require the project root to still exist on disk.
 - **A node shows no diff / flags stay silent** — expected when that step has no snapshot ground truth (e.g. the very first turn); precision over recall means silence, not guessing.
+- **Hook printed no flags / the wrong turn's flags** — expected, and inherent to the design. The `Stop` hook asks the daemon for flags 500ms after triggering the re-scan and never waits for ingestion, so it usually prints the state as of *before* the turn that just ended, and prints nothing at all if the daemon was slow, down, or not caught up. Do not read that silence as "this turn was clean." Run `soj flags` (or refresh the web UI) for the settled answer. Full explanation in §12.
 - **`soj critic` returns an error** — `ANTHROPIC_API_KEY` must be set in the environment of the *daemon* process, not your shell; restart it after setting.
 - **Stale pidfile after a crash** — `soj start`/`soj stop` detect a recycled PID (process identity check) and clean up automatically; they will never signal a non-Sojourn process.
 - **Restore refused, "snapshot missing or thinned by retention policy"** — the preflight found no valid snapshot for that node (or its ancestors), including the case where `soj gc` pruned it. Nothing was changed; pick a node that carries a snapshot (the UI shows diffs only on such nodes), or re-run without pruning it next time (pin it with a mark, or widen `--days`).
 - **`soj gc` says it aborted** — a live daemon landed a new snapshot in the exact window gc was finalizing; by design gc pruned nothing and left everything as-is. Just re-run `soj gc` (with `--run` if you meant to prune).
 - **`soj gate` exits 3** — the daemon is unreachable, deliberately distinct from exit 0 (pass) and exit 2 (fail): "could not check" is never reported as "clean."
 - **Harvest refuses with `no_manifest`** — the path you gave isn't a Sojourn restore worktree (no readable `.sojourn-restore.json`), or its origin project can't be resolved. Harvest only ever operates on worktrees Sojourn itself created.
+- **Harvest refuses with `stale_base`** — the base tree recorded in that worktree's `.sojourn-restore.json` is no longer in the shadow snapshot repo, so there's no branch point to diff against. Usually a `soj gc --run` that pruned it while the worktree wasn't live enough to pin it. Nothing was written; recover the work by hand (`git diff`, or copy the files) — and pin long-lived worktrees with a mark, or widen `--days`, next time.
+- **Harvest refuses with `read_failed`** — a file in the worktree couldn't be read (permissions, or the worktree moved/vanished mid-run). Like every harvest 400 this is abort-clean: **nothing was written to your project**, even though the apply path can raise it, because it happens during the dry classification pass. Fix the permissions or confirm the worktree still exists, then re-run.
+- **`soj harvest` exited 2** — this is the one that matters: `partial_apply` or `mainline_drift`, meaning your mainline **was** partially written before the failure. stderr lists exactly what applied, what conflicted, what's left, and the safety-snapshot ref taken before the harvest started. Inspect your working tree against that before re-running. Exit 1, by contrast, always means nothing was written.
+- **`soj combine` refuses with `no_common_ancestor`** — the two nodes' ancestor chains never meet, usually because they are roots of unrelated sessions rather than two branches off a shared point. There is no shared state to merge against, so combine refuses instead of guessing a merge base. Nothing was written. Pick nodes that descend from a common ancestor (a restore or rewind of the same node is the usual way two sessions come to share one) — or, if you only want one side's files, use `soj restore` instead. `cross_project` is the same shape of refusal for nodes in two different projects.
+- **`soj combine` reported files under "Unmarkable"** — those are conflicts that could not take text conflict markers (binary content on some side). Node A's content was kept verbatim, and **node B's version of those paths is not in the output worktree at all** — `--allow-conflicts` does not change that, it only affects files that *can* take markers. Retrieve B's side by hand if you need it (`soj restore` node B into its own worktree and copy the file).
+- **`soj combine` exited 2** — `write_failed`: a half-built worktree exists on disk. It is deliberately **not** deleted, because it holds real merged content and removing it would lose work. stderr names the worktree and lists what was applied, what conflicted, and what remained unprocessed. Inspect that directory before re-running; nothing outside it was touched. Exit 1, by contrast, always means nothing was written anywhere.
+- **The combined worktree has no conversation / `claude --resume` doesn't offer one** — working as intended. Combine emits **files only**; no transcript is synthesized and neither source session is continued. Start a fresh session with the combine worktree as your cwd — Sojourn's worktree aliasing links it back to node A on its own. See §7.
 - **Everything broke, where's my data?** — the DB and snapshots live under `~/.sojourn`; your project tree and `.git` are never written to by capture, restore, or gc. Harvest is the one exception, and only after its own safety snapshot. Safety snapshots taken before every restore/harvest/gc are in the shadow repo (`refs/sojourn/head` and `refs/sojourn/safety` history).
