@@ -12,7 +12,7 @@ Sojourn records everything your agentic coding CLI does — every prompt, tool c
 - HTTP/WS API: [docs/API.md](docs/API.md).
 - Claude Code plugin details: [plugins/claude/README.md](plugins/claude/README.md).
 
-> **Install status:** Sojourn is not published to npm yet. You install it from this repository — clone, build, link. Everything below assumes that.
+> **Install:** `npm i -g @sojourn/cli` — puts `soj` on your PATH. Requires Node ≥ 20.
 
 ## What's in v1.2.0
 
@@ -44,18 +44,32 @@ Each feature below carries the exact command or surface. Every command is real a
 
 ## Quick start
 
-### 1. Build and start the daemon
+### 1. Install and start the daemon
 
 ```bash
-git clone <this-repo> sojourn
+npm i -g @sojourn/cli    # puts `soj` on your PATH
+soj start                # starts the daemon detached, waits for health
+soj open                 # web UI at http://localhost:4177
+```
+
+<details>
+<summary>Or build from source (contributors)</summary>
+
+```bash
+git clone https://github.com/vivekgade1/sojourn.git
 cd sojourn
 npm install
 npm run build                   # tsc for all packages + web UI + plugin hook bundle
 npm link -w @sojourn/cli        # puts `soj` on your PATH
                                 # (or skip linking and run: node packages/cli/dist/main.js)
-soj start                       # starts the daemon detached, waits for health
-soj open                        # web UI at http://localhost:4177
+soj start
 ```
+
+Note that a global `npm i -g @sojourn/cli` and a linked dev build both provide `soj`
+— whichever ran last wins. Re-run `npm link -w @sojourn/cli` to point back at your
+working copy.
+
+</details>
 
 That's it for capture. The daemon passively watches `~/.claude/projects/**/*.jsonl` (honors `CLAUDE_CONFIG_DIR`) and ingests every Claude Code session on the machine — transcripts already on disk and new activity as it happens. Capture never blocks, modifies, or slows your agent session; if the daemon is down, your CLIs are completely unaffected. Runtime state lives in `~/.sojourn` (`SOJOURN_HOME` to override; `SOJOURN_PORT` for the port, default 4177).
 
@@ -361,7 +375,7 @@ If you want zero moving parts, use the native checkpoints. Sojourn earns its dae
 
 ## Honest limits
 
-- **Not on npm yet.** Install is from this repository (clone, build, link). No launchd/system autostart either — `soj start` is manual.
+- **No autostart.** `soj start` is manual — there is no launchd/systemd unit. The daemon does not survive a reboot on its own.
 - **OpenCode support is not live-verified.** The adapter was written against OpenCode's documented API and is not yet live-integration-tested; every module carries that header, and everything fails soft. See [docs/USAGE.md §13](docs/USAGE.md).
 - **Combine merges files, never conversations.** `soj combine` produces a worktree and nothing else — no merged transcript is synthesized, because inventing an interleaving of two real conversations is exactly the kind of guess Sojourn refuses to make. You start a fresh session in the output worktree. The same contents-only caveats as harvest apply (no file modes, symlinks materialized as regular files), and a binary path that both sides changed is reported as an **unmarkable** conflict where node A's content is kept and B's side is simply not present.
 - **Harvest transfers file *contents* only** — file-mode changes (e.g. the executable bit) aren't preserved, symlinked branch entries are materialized as regular files containing the target path, and patch mode emits git's ordinary "Binary files differ" stub for binary paths rather than a binary-aware patch.

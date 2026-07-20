@@ -12,14 +12,20 @@ Everything runs on `localhost`. No account, no upload, no telemetry.
 
 ## 1. Install & first run
 
-From this repository:
+```bash
+npm i -g @sojourn/cli    # makes `soj` available on your PATH (Node >= 20)
+soj start                # starts the daemon (detached), waits for health
+soj open                 # opens the web UI at http://localhost:4177
+```
+
+Building from source instead (contributors):
 
 ```bash
+git clone https://github.com/vivekgade1/sojourn.git
+cd sojourn
 npm install
 npm run build
-npm link -w @sojourn/cli        # makes `soj` available on your PATH
-soj start                       # starts the daemon (detached), waits for health
-soj open                        # opens the web UI at http://localhost:4177
+npm link -w @sojourn/cli        # points `soj` at your working copy
 ```
 
 That's it. The daemon now passively watches `~/.claude/projects/**/*.jsonl` and ingests every Claude Code session on this machine — past files already on disk and new activity as it happens. **Capture never blocks, modifies, or slows your agent session**; if the daemon is down, your CLIs are completely unaffected.
@@ -388,7 +394,7 @@ The plugin is a **self-contained bundle** — it does not assume you're working 
 **In-repo dev checkout** — you have (or are working in) a full clone of the `sojourn` repo:
 
 ```bash
-git clone <this-repo> sojourn
+git clone https://github.com/vivekgade1/sojourn.git
 cd sojourn
 npm install
 npm run build            # tsc for all packages + web + build:plugin (regenerates the hook bundle)

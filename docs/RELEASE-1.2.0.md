@@ -1,7 +1,10 @@
 # Sojourn v1.2.0 — Release Notes
 
-**Status:** release candidate on branch `V1.2.0`. Not published to npm; install from
-this repository (clone, build, link). See [../README.md](../README.md#quick-start).
+**Status:** released. Published to npm as `@sojourn/*` and tagged `v1.2.0`.
+
+```bash
+npm i -g @sojourn/cli
+```
 
 **Requires:** Node ≥ 20. macOS and Linux. Local-only — the daemon binds
 `127.0.0.1` and nothing leaves your machine.
@@ -318,8 +321,8 @@ These are real and unresolved. Read this section as carefully as the feature lis
   normally wins the race against its own cause. This is inherent to "capture never
   blocks". Never read hook silence as a clean bill of health; run `soj flags` or
   refresh the web UI for the settled picture.
-- **Not published to npm**, and there is no launchd/systemd autostart. Both are
-  deliberate scope decisions, not oversights.
+- **No launchd/systemd autostart.** `soj start` is manual and the daemon does not
+  survive a reboot on its own. A deliberate scope decision, not an oversight.
 - **Multi-batch turns** can hold more than one digest row per kind, and up to N×
   the per-turn budget across N debounce segments.
 - **Digest auto-resolve is anchored to one node**, so in a narrow case (an
