@@ -14,6 +14,10 @@ Sojourn records everything your agentic coding CLI does — every prompt, tool c
 
 > **Install:** `npm i -g @sojourn/cli` — puts `soj` on your PATH. Requires Node ≥ 20.
 
+![A verified flag caught in the Inspector: the agent claimed an import of a package that does not exist on PyPI](docs/images/04-inspector-flags.png)
+
+*The whole point, in one screen: the agent claimed an import of `totally_unreal_pkg_zx91`; PyPI returned 404 for it. The flag is **verified** — a deterministic check with evidence, not an opinion — and you can restore to just before that node. (All screenshots are from the demo's synthetic sessions.)*
+
 ## What's in v1.2.0
 
 v1.2.0 is the complete V1 + V2 feature set, hardened for daily use. Everything runs locally against one daemon; nothing leaves your machine. Full release notes — including what changed, how it was verified, and upgrade steps — are in [docs/RELEASE-1.2.0.md](docs/RELEASE-1.2.0.md). At a glance:
@@ -155,10 +159,22 @@ Every prompt, assistant message, tool call, tool result, and user mark becomes a
 
 `soj open` gives you two views: the **map view** (turn-level waypoints with flag badges, decision pennants, a minimap, and search) and the **graph view** (the raw node tree with lineage highlighting and a clickable path breadcrumb). Both open on the **latest session only** — a multi-select **session filter** lets you union in more or show all, so a repo with hundreds of turns across many sessions stays fast and legible. Search, the decision/flagged lenses, and the filters all compose.
 
+![Map view: each session is a dotted trail, each waypoint one turn sized by how much work happened](docs/images/01-map-view.png)
+
+*Map view — 196 steps across 10 sessions. Each trail is a session, each waypoint one turn sized by the work in it; the red badge is a verified flag, the orange pennant a decision.*
+
+![Graph view: the node tree, with three sessions branching from one fork point](docs/images/02-graph-view.png)
+
+*Graph view — the raw node tree. Here three sessions branch from a single fork point, and the pink cards are the checkpoints written by `soj harvest` and `soj combine`.*
+
 Two navigation aids make restore actionable at a glance:
 
 - **Restore-point highlighting** — every node carries whether it can actually be restored (its snapshot, or the nearest ancestor's, still exists). Restorable nodes are marked; nodes whose snapshot was thinned by GC or never captured are muted, and their restore button is disabled up front with a tooltip — no more clicking into a dead-end "snapshot no longer valid" dialog.
 - **"Restorable" filter** — a toolbar toggle that isolates just the actionable nodes (where restore can be performed) in a distinct action color palette, in both the map and graph.
+
+![The Restorable filter isolating only the nodes that can actually be restored](docs/images/05-restorable-lens.png)
+
+*The Restorable lens. Nodes you can actually restore to are painted in the action palette; everything else recedes, so "where can I go back to?" is answered by looking rather than by clicking.*
 
 The UI reconnects on its own if the daemon restarts, refetches so you never see a stale graph, and shows a clear "daemon unreachable — run `soj start`" banner while it's down. Mark moments worth finding later:
 
