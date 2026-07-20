@@ -7,6 +7,7 @@ import express, { type Express, type NextFunction, type Request, type Response }
 import type {
   ChronoNode,
   CheckContext,
+  CombineDeps,
   CriticLLM,
   FlagEngine,
   GraphStore,
@@ -20,14 +21,19 @@ import type {
 } from "@sojourn/core";
 import {
   applyBudgets,
+  combine as coreCombine,
+  combinePreflight as coreCombinePreflight,
   getSessionHealth,
   harvest as coreHarvest,
   harvestPreflight as coreHarvestPreflight,
   runCritic,
+  SojournCombineError,
   SojournHarvestError,
   SojournRestoreError,
+  worktreesDir as defaultWorktreesDir,
 } from "@sojourn/core";
 import { executeRewind, planRewind, SojournRewindError } from "@sojourn/adapter-claude";
+import type { SojournRewindErrorCode } from "@sojourn/adapter-claude";
 import type { ClaudeRewindPlan } from "@sojourn/adapter-claude";
 import { readRestoreManifest, resolveTurnBaseTree, type EventsSink } from "./ingest.js";
 import type { FetchJson } from "@sojourn/core";
@@ -80,6 +86,26 @@ export interface ServerDeps {
     preflight: typeof coreHarvestPreflight;
     harvest: typeof coreHarvest;
   };
+  /**
+   * Combine engine entry points. Injected so tests can exercise the route's
+   * typed error mapping (notably the `write_failed`/`.partial` 500, which is
+   * not reproducible on demand through the real engine); defaults to
+   * @sojourn/core's real combine/combinePreflight.
+   */
+  combineEngine?: {
+    preflight: typeof coreCombinePreflight;
+    combine: typeof coreCombine;
+  };
+  /**
+   * Root under which combine checks out its merged output worktree. MUST be
+   * the same root `RestoreEngine` restores single nodes into, so combine
+   * outputs and restore outputs are one namespace (and one thing for the CLI
+   * / `soj gc` to reason about). wire.ts passes the same `worktreesDir()`
+   * value it hands `RestoreEngine`; optional here purely so existing test
+   * fixtures that build a `ServerDeps` by hand keep compiling — it then falls
+   * back to core's `worktreesDir()`.
+   */
+  worktreesDir?: string;
 }
 
 /** Decodes a `:id` route param — node ids contain `:` (e.g. `claude:uuid`)
@@ -357,9 +383,33 @@ function resolveHarvestContext(deps: ServerDeps, worktreePath: string): HarvestC
   };
 }
 
+/** Typed status mapping for `POST /api/nodes/:id/rewind`.
+ *
+ * Both collision codes are refusals-to-clobber, not daemon faults:
+ * `executeRewind` only ever creates NEW files. Since the provenance sidecar
+ * is now written FIRST (so a crash can never leave an unattributed transcript
+ * — V2 must-fix I3), a leftover sidecar is the *first* path that can collide,
+ * which makes `sidecar_exists` the ordinary collision rather than an exotic
+ * one. Mapping it to 500 would both misreport a clean refusal as a server
+ * error and log it as one.
+ *
+ * Exported for direct coverage: a natural collision is not reproducible
+ * through the route (`newSessionId` is a fresh UUID per call). */
+export function rewindErrorStatus(code: SojournRewindErrorCode): number {
+  return code === "transcript_exists" || code === "sidecar_exists" ? 409 : 500;
+}
+
 /** Typed error mapping for the harvest routes: 400 for pre-write refusals
- * (no_manifest/stale_base/conflicts/patch_incomplete), 500 — with the
- * honest `.partial` payload — for mid-apply failures. */
+ * (no_manifest/stale_base/conflicts/patch_incomplete/read_failed), 500 —
+ * with the honest `.partial` payload — for mid-apply failures
+ * (partial_apply/mainline_drift).
+ *
+ * `read_failed` is a 400 even though it is raised from apply
+ * (harvestEngine.ts:811) as well as preflight (:714). Both sites wrap the
+ * same `classifyAll` pass, which is a dry-run over temp files — so a read
+ * failure always aborts with ZERO mainline writes and no `.partial` payload
+ * to report. Abort-clean, hence the pre-write 400 default branch below is
+ * correct for it. */
 function handleHarvestError(err: unknown, res: Response): void {
   if (err instanceof SojournHarvestError) {
     const body: Record<string, unknown> = {
@@ -377,6 +427,64 @@ function handleHarvestError(err: unknown, res: Response): void {
   }
   logError("[sojourn] harvest route failed:", err);
   res.status(500).json({ error: "Internal error" });
+}
+
+/** Typed error mapping for the combine routes — the same split harvest uses,
+ * but with a sharper line, because combine's abort-clean guarantee is
+ * stronger than harvest's.
+ *
+ * Every code EXCEPT `write_failed` is raised BEFORE the output worktree
+ * directory is claimed (combineEngine.ts: the conflicts check and all of
+ * `resolveAndClassify` run ahead of `claimDest`), so those are provably
+ * zero-write refusals -> 400. `write_failed` is the ONLY code that can leave
+ * a half-built worktree on disk; it is the only 500, and it carries
+ * `.partial` (the claimed path plus applied/conflicted/remaining), which is
+ * echoed verbatim so the caller can see exactly what exists.
+ *
+ * Note `not_found` maps to 400, not 404: these are body-supplied node ids on
+ * a static path, and both ids plus their project must resolve for the request
+ * to mean anything — it is a bad request, not a missing resource. */
+function handleCombineError(err: unknown, res: Response): void {
+  if (err instanceof SojournCombineError) {
+    const body: Record<string, unknown> = {
+      error: err.message,
+      code: err.code,
+      files: err.files,
+    };
+    if (err.partial) body.partial = err.partial;
+    const status = err.code === "write_failed" ? 500 : 400;
+    if (status >= 500) {
+      logError("[sojourn] combine failed mid-write:", err);
+    }
+    res.status(status).json(body);
+    return;
+  }
+  logError("[sojourn] combine route failed:", err);
+  res.status(500).json({ error: "Internal error" });
+}
+
+type CombineIds =
+  | { ok: true; nodeIdA: string; nodeIdB: string }
+  | { ok: false; error: string };
+
+/** Body validation shared by both combine routes. Mirrors the harvest routes'
+ * body-validation 400s exactly: plain `{ error }` with NO `code` field — a
+ * `code` means "the engine typed this refusal", and these never reach it. */
+function readCombineIds(body: unknown): CombineIds {
+  const b = (body ?? {}) as { nodeIdA?: unknown; nodeIdB?: unknown };
+  if (typeof b.nodeIdA !== "string" || b.nodeIdA.length === 0) {
+    return { ok: false, error: "Body must include a non-empty string `nodeIdA` field" };
+  }
+  if (typeof b.nodeIdB !== "string" || b.nodeIdB.length === 0) {
+    return { ok: false, error: "Body must include a non-empty string `nodeIdB` field" };
+  }
+  if (b.nodeIdA === b.nodeIdB) {
+    return {
+      ok: false,
+      error: `Cannot combine a node with itself: \`nodeIdA\` and \`nodeIdB\` are both ${b.nodeIdA}`,
+    };
+  }
+  return { ok: true, nodeIdA: b.nodeIdA, nodeIdB: b.nodeIdB };
 }
 
 export function createApp(deps: ServerDeps): Express {
@@ -427,6 +535,90 @@ export function createApp(deps: ServerDeps): Express {
       // hottest route in the app. Match the file's other async routes: 500 JSON.
       logError(`[sojourn] graph route failed for project ${id}:`, err);
       res.status(500).json({ error: "Failed to load project graph" });
+    }
+  });
+
+  // ——— combine routes ———
+  //
+  // REGISTRATION ORDER IS LOAD-BEARING. These are STATIC paths whose node ids
+  // travel in the BODY (no `:id` param, so no encodeNodeId anywhere), and
+  // Express matches in registration order: `/api/nodes/:id/preflight` (below)
+  // would happily match `/api/nodes/combine/preflight` with id="combine" and
+  // hand the request to the RESTORE engine. So they are declared HERE, ahead
+  // of the whole `/api/nodes/:id/...` family, rather than down beside the
+  // harvest routes they otherwise mirror. `test/apiV2.test.ts` pins this with
+  // an explicit shadowing test — moving these below the `:id` routes breaks
+  // it loudly instead of silently.
+  const combineFns = deps.combineEngine ?? {
+    preflight: coreCombinePreflight,
+    combine: coreCombine,
+  };
+  const combineDeps: CombineDeps = {
+    store: deps.store,
+    snapshotterFor: deps.snapshotterFor,
+    // Single source of truth with RestoreEngine's worktrees root (wire.ts
+    // passes the one `worktreesDir()` value it also gives RestoreEngine).
+    worktreesDir: deps.worktreesDir ?? defaultWorktreesDir(),
+  };
+
+  // PURE: unlike harvest's preflight (which snapshots the live worktree),
+  // this writes nothing anywhere — not the project, not the shadow object
+  // database, not `worktreesDir`. Base/A/B are pre-existing trees; the only
+  // filesystem activity is short-lived `os.tmpdir()` scratch for
+  // `git merge-file -p` dry runs. Safe to call as often as the UI likes.
+  app.post("/api/nodes/combine/preflight", async (req: Request, res: Response) => {
+    const ids = readCombineIds(req.body);
+    if (!ids.ok) {
+      res.status(400).json({ error: ids.error });
+      return;
+    }
+    try {
+      res.json(await combineFns.preflight(combineDeps, ids.nodeIdA, ids.nodeIdB));
+    } catch (err) {
+      handleCombineError(err, res);
+    }
+  });
+
+  app.post("/api/nodes/combine", async (req: Request, res: Response) => {
+    const ids = readCombineIds(req.body);
+    if (!ids.ok) {
+      res.status(400).json({ error: ids.error });
+      return;
+    }
+    // Literal boolean only — a truthy string like "false" must never opt a
+    // caller into writing conflict markers (same rule as harvest's).
+    const allowConflicts = (req.body ?? {}).allowConflicts === true;
+
+    try {
+      const result = await combineFns.combine(combineDeps, ids.nodeIdA, ids.nodeIdB, {
+        allowConflicts,
+      });
+
+      // Graph closure, exactly as the harvest route does it: combine()
+      // inserted the checkpoint node straight through the store, so announce
+      // it the way the ingest pipeline would. `combineNodeId` is legitimately
+      // null in ordinary cases (no store, zero files written, origin node
+      // unknown) — that is NOT an error and never changes the 200.
+      if (result.combineNodeId !== null) {
+        const combineNode = deps.store.getNode(result.combineNodeId);
+        if (combineNode) {
+          try {
+            deps.events.broadcast({ type: "node_added", node: combineNode });
+            deps.events.broadcast({ type: "project_updated", projectId: combineNode.projectId });
+          } catch (err) {
+            logError("[sojourn] combine: failed to broadcast combine node:", err);
+          }
+        }
+      }
+
+      // Echoed whole and verbatim — including `unmarkable` (conflicts that
+      // could NOT take markers, where A's content was kept as-is; distinct
+      // from `conflicted`, which WERE marked) and `warnings` (never empty:
+      // it always carries the "start a fresh session, no transcript is
+      // synthesized" notice). Dropping either would misreport what happened.
+      res.json(result);
+    } catch (err) {
+      handleCombineError(err, res);
     }
   });
 
@@ -672,7 +864,7 @@ export function createApp(deps: ServerDeps): Express {
       res.json(publicRewindPlan(executed));
     } catch (err) {
       if (err instanceof SojournRewindError) {
-        const status = err.code === "transcript_exists" ? 409 : 500;
+        const status = rewindErrorStatus(err.code);
         if (status >= 500) {
           logError(`[sojourn] rewind failed for node ${id}:`, err);
         }

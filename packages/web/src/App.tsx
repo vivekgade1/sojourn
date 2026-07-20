@@ -39,6 +39,14 @@ export function App() {
   const [nodes, setNodes] = useState<ChronoNode[]>([]);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [selectedTurnId, setSelectedTurnId] = useState<string | null>(null);
+  // The node marked as the combine partner. Deliberately App-level and
+  // deliberately independent of BOTH `selectedNodeId` and the session filter:
+  // combine's whole reason to exist is pairing nodes from two DIFFERENT
+  // sessions, so the mark has to outlive changing the selection and changing
+  // which sessions are shown. Nothing below ever clears it except the user's
+  // own Clear button and a project switch (a cross-project pair is a server
+  // 400, so carrying the mark across projects could only ever mislead).
+  const [markedNodeId, setMarkedNodeId] = useState<string | null>(null);
   const [view, setView] = useState<ViewMode>("map");
   const [decisionLens, setDecisionLens] = useState(false);
   const [flaggedOnly, setFlaggedOnly] = useState(false);
@@ -70,6 +78,15 @@ export function App() {
   // failed, and whether the socket has ever been open.
   const fetchFailedRef = useRef(false);
   const everConnectedRef = useRef(false);
+
+  // Sessions this project has already shown the user. A session that appears
+  // while an EXPLICIT selection is active would otherwise be silently dropped
+  // by effectiveSessionIds' intersection and never be seen — this is what the
+  // nudge banner is measured against. Per-project, exactly like the storage
+  // key: seeded/reset on project change, and re-seeded whenever the selection
+  // changes or the nudge is acted on/dismissed. State, not a ref, so the memo
+  // below recomputes when it moves; the set is tiny.
+  const [knownSessionIds, setKnownSessionIds] = useState<Set<string>>(new Set());
 
   function noteFetchOutcome(failed: boolean) {
     fetchFailedRef.current = failed;
@@ -120,6 +137,9 @@ export function App() {
   // the project changes (null → default latest-only).
   useEffect(() => {
     setStoredSessionIds(selectedProjectId ? loadSessionSelection(selectedProjectId) : null);
+    // The nudge is per-project too: clear the known set so the incoming
+    // project's first non-empty session list re-seeds it (see below).
+    setKnownSessionIds(new Set());
   }, [selectedProjectId]);
 
   // Full re-sync after the daemon comes back: projects + the current graph.
@@ -221,6 +241,40 @@ export function App() {
     [storedSessionIds, sessionOptions],
   );
 
+  // Which project the loaded `nodes` actually belong to. During a project
+  // switch the previous project's nodes are still in state until the new
+  // graph resolves, so this guards the seed below from latching onto the
+  // OUTGOING project's sessions and then calling the incoming project's real
+  // sessions "new".
+  const nodesProjectId = nodes.length > 0 ? nodes[0].projectId : null;
+  const seededProjectRef = useRef<string | null>(null);
+
+  // Seed the known set from the FIRST NON-EMPTY option list for a project.
+  // Seeding from the initial empty set would make every session "new" on
+  // page load and fire the banner about the user's own historical sessions.
+  useEffect(() => {
+    if (!selectedProjectId) return;
+    if (seededProjectRef.current === selectedProjectId) return;
+    if (sessionOptions.length === 0) return;
+    if (nodesProjectId !== selectedProjectId) return;
+    seededProjectRef.current = selectedProjectId;
+    setKnownSessionIds(new Set(sessionOptions.map((s) => s.sessionId)));
+  }, [selectedProjectId, sessionOptions, nodesProjectId]);
+
+  // Sessions that appeared AFTER the user last looked, and that the current
+  // explicit selection is hiding. effectiveSessionIds intersects the stored
+  // selection with what exists, so these are dropped silently — the banner is
+  // the only place they surface. We deliberately do NOT auto-include them:
+  // the session filter is a perf posture (hidden sessions are never laid
+  // out), so widening the layout input must stay the user's call.
+  const newHiddenSessionIds = useMemo(
+    () =>
+      sessionOptions
+        .map((s) => s.sessionId)
+        .filter((id) => !selectedSessionIds.has(id) && !knownSessionIds.has(id)),
+    [sessionOptions, selectedSessionIds, knownSessionIds],
+  );
+
   const sessionNodes = useMemo(
     () => nodes.filter((n) => selectedSessionIds.has(n.sessionId)),
     [nodes, selectedSessionIds],
@@ -235,6 +289,19 @@ export function App() {
     setStoredSessionIds(ids);
     const projectId = selectedProjectIdRef.current;
     if (projectId) saveSessionSelection(projectId, ids);
+    // The user has just been through the full session list, so nothing
+    // currently listed is "new" any more.
+    setKnownSessionIds(new Set(sessionOptions.map((s) => s.sessionId)));
+  }
+
+  /** Widen the selection to include the new sessions (persists, as always). */
+  function includeNewSessions() {
+    handleSessionSelectionChange([...selectedSessionIds, ...newHiddenSessionIds]);
+  }
+
+  /** Acknowledge without changing the selection — they stay hidden. */
+  function dismissNewSessions() {
+    setKnownSessionIds((prev) => new Set([...prev, ...newHiddenSessionIds]));
   }
 
   // Graph view REMOVES filtered-out nodes. The map instead keeps every turn
@@ -325,6 +392,14 @@ export function App() {
     [nodes, selectedNodeId],
   );
 
+  // Resolved against ALL loaded nodes, never `sessionNodes` — the marked node
+  // is usually in a session the filter is currently hiding, and it must stay
+  // resolvable (and combinable) while hidden.
+  const markedNode = useMemo(
+    () => nodes.find((n) => n.id === markedNodeId) ?? null,
+    [nodes, markedNodeId],
+  );
+
   const selectedPath = useMemo(() => {
     if (!selectedNodeId) return [];
     const byId = new Map(nodes.map((n) => [n.id, n]));
@@ -368,6 +443,9 @@ export function App() {
           setSelectedProjectId(id);
           setSelectedTurnId(null);
           setSelectedNodeId(null);
+          // Combine refuses a cross-project pair (400 `cross_project`), so a
+          // mark that survived a project switch could only mislead.
+          setMarkedNodeId(null);
         }}
         view={view}
         onSetView={setView}
@@ -401,6 +479,48 @@ export function App() {
             onClick={() => setBannerDismissed(true)}
           >
             ×
+          </button>
+        </div>
+      )}
+      {/* Guarded on an EXPLICIT stored selection: on the default path
+          (stored === null) effectiveSessionIds re-defaults to the newest
+          session, so a new session is shown automatically and there is
+          nothing to nudge about. */}
+      {storedSessionIds !== null && newHiddenSessionIds.length > 0 && (
+        <div className="session-banner" data-testid="new-sessions-banner" role="alert">
+          <span className="session-banner-text">
+            {newHiddenSessionIds.length === 1
+              ? "1 new session isn't shown — your session filter is hiding it."
+              : `${newHiddenSessionIds.length} new sessions aren't shown — your session filter is hiding them.`}
+          </span>
+          <button className="session-banner-action" onClick={includeNewSessions}>
+            {newHiddenSessionIds.length === 1 ? "Show it" : "Show them"}
+          </button>
+          <button
+            className="daemon-banner-dismiss"
+            aria-label="Dismiss"
+            onClick={dismissNewSessions}
+          >
+            ×
+          </button>
+        </div>
+      )}
+      {/* Persistent because the mark's usefulness IS its persistence: it sits
+          here while the user changes selection and session filter to go find
+          the second node. Dismissing it means un-marking — there is no
+          "hide but keep" state, which would leave an invisible mark armed. */}
+      {markedNode && (
+        <div className="session-banner" data-testid="marked-node-banner">
+          <span className="session-banner-text">
+            Marked for combine: <strong>{markedNode.label ?? markedNode.summary}</strong> — now
+            select any other node, in any session, and choose “Combine with marked node” in its
+            inspector. Combine merges files only; it never merges the conversation.
+          </span>
+          <button
+            className="session-banner-action"
+            onClick={() => setMarkedNodeId(null)}
+          >
+            Clear
           </button>
         </div>
       )}
@@ -443,6 +563,8 @@ export function App() {
           onFlagsUpdated={handleFlagsUpdated}
           path={selectedPath}
           onSelectNode={selectAndFocus}
+          markedNode={markedNode}
+          onMarkForCombine={setMarkedNodeId}
         />
       </div>
     </div>

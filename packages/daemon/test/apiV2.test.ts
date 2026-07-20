@@ -10,10 +10,12 @@ import {
   ShadowSnapshotter,
   FlagEngine,
   RestoreEngine,
+  SojournCombineError,
   SojournHarvestError,
 } from "@sojourn/core";
 import type {
   ChronoNode,
+  CombinePreflight,
   FetchJson,
   Flag,
   HarvestPreflight,
@@ -21,7 +23,7 @@ import type {
   SnapshotterLike,
 } from "@sojourn/core";
 import { parseSessionJsonl } from "@sojourn/adapter-claude";
-import { createApp, type ServerDeps } from "../src/server.js";
+import { createApp, rewindErrorStatus, type ServerDeps } from "../src/server.js";
 import { ingestBatch, type IngestDeps } from "../src/ingest.js";
 import { TranscriptIndex } from "../src/transcripts.js";
 import type { SojournEvent } from "../src/events.js";
@@ -121,6 +123,10 @@ describe("daemon HTTP API (V2 wiring)", () => {
       snapshotterFor,
       flagEngine,
       restoreEngine,
+      // Same root RestoreEngine got (wire.ts resolves it once and shares it):
+      // combine writes its merged output worktree here, so this must point at
+      // the test's temp dir and never at the real ~/.sojourn/worktrees.
+      worktreesDir: worktreesRoot,
       events: sink,
       version: "test-version",
       fetchJson,
@@ -515,6 +521,86 @@ describe("daemon HTTP API (V2 wiring)", () => {
         .post(`/api/nodes/${encodeURIComponent("opencode:oc-2")}/rewind`)
         .send();
       expect(wrongCli.status).toBe(400);
+    });
+
+    // Regression (origin-session integrity): the parser keys tool nodes on the
+    // tool_use BLOCK id, so a synthesized transcript that reused those ids
+    // projected tool nodes whose ids collided with the ORIGIN session's — and
+    // the store's upsert MOVED them onto the new session. The origin lost its
+    // own tool nodes, its ancestor chains broke, and a SECOND exact rewind of
+    // the origin was then falsely refused ("ancestor chain incomplete").
+    // This drives the real route and then ingests the result as the watcher
+    // would, which is the only way the theft becomes observable.
+    it("leaves the ORIGIN session's tool nodes on the origin after a rewind is ingested", async () => {
+      await ingestFixture();
+      await registerFixtureTranscript();
+
+      const toolNodesOfSession = (sessionId: string) =>
+        store
+          .getSessionNodes(sessionId)
+          .filter((n) => n.kind === "tool_use" || n.kind === "tool_result");
+
+      const before = toolNodesOfSession("session-abc").map((n) => n.id).sort();
+      expect(before.length).toBeGreaterThan(0);
+
+      const res = await request(app)
+        .post(`/api/nodes/${encodeURIComponent(FIXTURE_TIP)}/rewind`)
+        .send();
+      expect(res.status).toBe(200);
+      expect(res.body.mode).toBe("exact");
+
+      // Ingest the synthesized transcript exactly as the watcher would.
+      const written = fs.readFileSync(res.body.transcriptPath, "utf8");
+      const batch = parseSessionJsonl(res.body.transcriptPath, written)!;
+      batch.project.root = projectRoot;
+      await ingestBatch(ingestDeps, batch);
+
+      // THE invariant: the origin keeps every tool node it had.
+      const after = toolNodesOfSession("session-abc").map((n) => n.id).sort();
+      expect(after).toEqual(before);
+
+      // ...and the synthesized session owns a disjoint set of its own.
+      const synth = toolNodesOfSession(res.body.newSessionId).map((n) => n.id);
+      expect(synth.length).toBeGreaterThan(0);
+      for (const id of synth) expect(before).not.toContain(id);
+    });
+
+    it("does not poison a SECOND exact rewind of the origin session", async () => {
+      await ingestFixture();
+      await registerFixtureTranscript();
+
+      const first = await request(app)
+        .post(`/api/nodes/${encodeURIComponent(FIXTURE_TIP)}/rewind`)
+        .send();
+      expect(first.status).toBe(200);
+
+      const written = fs.readFileSync(first.body.transcriptPath, "utf8");
+      const batch = parseSessionJsonl(first.body.transcriptPath, written)!;
+      batch.project.root = projectRoot;
+      await ingestBatch(ingestDeps, batch);
+
+      // With ids stolen, the origin's chain was orphaned and this planned as
+      // a refusal (mode "tip" with refusedReason) instead of "exact".
+      const second = await request(app)
+        .post(`/api/nodes/${encodeURIComponent(FIXTURE_TIP)}/rewind-plan`)
+        .send();
+      expect(second.status).toBe(200);
+      expect(second.body.refusedReason).toBeNull();
+      expect(second.body.mode).toBe("exact");
+    });
+
+    // Regression: `sidecar_exists` was added when the sidecar moved to being
+    // written FIRST, but the route's status ternary only special-cased
+    // `transcript_exists` — so the new code fell through to 500 and was
+    // logError'd as a daemon fault. Both are refusals-to-clobber; both are 409.
+    // Asserted directly because a natural collision is unreproducible through
+    // the route (`newSessionId` is a fresh UUID on every call).
+    it("maps BOTH collision codes to 409, and genuine failures to 500", () => {
+      expect(rewindErrorStatus("transcript_exists")).toBe(409);
+      expect(rewindErrorStatus("sidecar_exists")).toBe(409);
+      expect(rewindErrorStatus("write_failed")).toBe(500);
+      expect(rewindErrorStatus("validation_mismatch")).toBe(500);
+      expect(rewindErrorStatus("plan_invalid")).toBe(500);
     });
   });
 
@@ -1041,6 +1127,304 @@ describe("daemon HTTP API (V2 wiring)", () => {
         remaining: ["x.txt"],
         safetySnapshotRef: "deadbeef",
       });
+    });
+  });
+
+  describe("combine routes", () => {
+    /** Puts the project root into an exact state. `null` deletes. */
+    async function writeState(files: Record<string, string | null>): Promise<void> {
+      for (const [rel, content] of Object.entries(files)) {
+        const abs = path.join(projectRoot, rel);
+        if (content === null) {
+          await fsp.rm(abs, { force: true });
+          continue;
+        }
+        await fsp.mkdir(path.dirname(abs), { recursive: true });
+        await fsp.writeFile(abs, content, "utf8");
+      }
+    }
+
+    /** Ingests a one-turn session hanging off `parentId` with the project root
+     * already in the wanted state, and returns its snapshotted tip. */
+    async function seedTip(
+      sess: string,
+      parentId: string | null,
+      ts: string,
+    ): Promise<ChronoNode> {
+      const p = mkNode(`${sess}-p`, parentId, "prompt", sess, `${ts}:00.000Z`, "go");
+      const a = mkNode(`${sess}-a`, `${sess}-p`, "assistant", sess, `${ts}:01.000Z`, {
+        type: "text",
+        text: sess,
+      });
+      await ingestBatch(ingestDeps, {
+        project: { root: projectRoot, name: "combine" },
+        session: { id: sess, cli: "claude" },
+        nodes: [p, a],
+      });
+      const tip = store.getNode(`claude:${sess}-a`)!;
+      expect(tip.snapshotRef).not.toBeNull();
+      return tip;
+    }
+
+    /**
+     * One common ancestor, then TWO SEPARATE SESSIONS forking off it, each
+     * snapshotted from a different project-root state — the real shape combine
+     * exists for (merging file states across sessions). `sideB` describes B's
+     * divergence; A always edits shared.txt's FIRST line and adds a-only.txt.
+     */
+    async function seedForkedSessions(sideB: Record<string, string | null>): Promise<{
+      base: ChronoNode;
+      a: ChronoNode;
+      b: ChronoNode;
+    }> {
+      await writeState({ "shared.txt": "l1\nl2\nl3\n" });
+      const base = await seedTip("s-cmb-base", null, "2026-02-01T00:00");
+
+      await writeState({ "shared.txt": "A1\nl2\nl3\n", "a-only.txt": "from A\n" });
+      const a = await seedTip("s-cmb-a", "s-cmb-base-a", "2026-02-02T00:00");
+
+      // Back to the base state before laying down B's divergence, so B's tree
+      // is a genuine sibling of A's rather than A's state plus more.
+      await writeState({ "shared.txt": "l1\nl2\nl3\n", "a-only.txt": null, ...sideB });
+      const b = await seedTip("s-cmb-b", "s-cmb-base-a", "2026-02-03T00:00");
+
+      expect(a.sessionId).not.toBe(b.sessionId);
+      return { base, a, b };
+    }
+
+    const CLEAN_SIDE_B = { "shared.txt": "l1\nl2\nB3\n", "b-only.txt": "from B\n" };
+    const CONFLICT_SIDE_B = { "shared.txt": "B1\nl2\nl3\n" };
+
+    it("preflight reports per-file statuses and base/A/B trees for nodes in DIFFERENT sessions", async () => {
+      const { base, a, b } = await seedForkedSessions(CLEAN_SIDE_B);
+
+      const res = await request(app)
+        .post("/api/nodes/combine/preflight")
+        .send({ nodeIdA: a.id, nodeIdB: b.id });
+
+      expect(res.status).toBe(200);
+      expect(res.body.nodeIdA).toBe(a.id);
+      expect(res.body.nodeIdB).toBe(b.id);
+      expect(res.body.baseNodeId).toBe(base.id);
+      expect(res.body.baseTree).toBe(base.snapshotRef);
+      expect(res.body.treeA).toBe(a.snapshotRef);
+      expect(res.body.treeB).toBe(b.snapshotRef);
+
+      // Only paths B moved need any action on A's materialized tree.
+      const files = [...res.body.files].sort((x: { path: string }, y: { path: string }) =>
+        x.path.localeCompare(y.path),
+      );
+      expect(files).toEqual([
+        { path: "b-only.txt", status: "clean" },
+        { path: "shared.txt", status: "clean" },
+      ]);
+
+      // Always-present honesty notice.
+      expect(res.body.warnings.join(" ")).toContain(
+        "No conversation transcript is synthesized",
+      );
+
+      // PURE: preflight claims no output directory and writes nothing.
+      expect(fs.readdirSync(worktreesRoot)).toEqual([]);
+    });
+
+    it("a clean combine writes the merged worktree, returns combineNodeId, and broadcasts", async () => {
+      const { a, b } = await seedForkedSessions(CLEAN_SIDE_B);
+
+      const res = await request(app)
+        .post("/api/nodes/combine")
+        .send({ nodeIdA: a.id, nodeIdB: b.id });
+
+      expect(res.status).toBe(200);
+      expect([...res.body.applied].sort()).toEqual(["b-only.txt", "shared.txt"]);
+      expect(res.body.conflicted).toEqual([]);
+      expect(res.body.unmarkable).toEqual([]);
+      expect(res.body.nodeIdA).toBe(a.id);
+      expect(res.body.nodeIdB).toBe(b.id);
+
+      // The output worktree lives under the SAME root RestoreEngine uses.
+      const wt: string = res.body.worktreePath;
+      expect(wt.startsWith(worktreesRoot)).toBe(true);
+      // Both sides' edits are really there: A's line-1 edit, B's line-3 edit,
+      // A's own file (never touched), B's new file.
+      expect(fs.readFileSync(path.join(wt, "shared.txt"), "utf8")).toBe("A1\nl2\nB3\n");
+      expect(fs.readFileSync(path.join(wt, "a-only.txt"), "utf8")).toBe("from A\n");
+      expect(fs.readFileSync(path.join(wt, "b-only.txt"), "utf8")).toBe("from B\n");
+
+      expect(res.body.combineNodeId).toBeTruthy();
+      const added = sink.events.filter(
+        (e): e is Extract<SojournEvent, { type: "node_added" }> => e.type === "node_added",
+      );
+      expect(added.some((e) => e.node.id === res.body.combineNodeId)).toBe(true);
+      const updated = sink.events.filter(
+        (e): e is Extract<SojournEvent, { type: "project_updated" }> =>
+          e.type === "project_updated",
+      );
+      expect(updated.some((e) => e.projectId === a.projectId)).toBe(true);
+    });
+
+    it("the inserted combine node is parented to A and records B as meta.mergedFrom", async () => {
+      const { a, b } = await seedForkedSessions(CLEAN_SIDE_B);
+
+      const res = await request(app)
+        .post("/api/nodes/combine")
+        .send({ nodeIdA: a.id, nodeIdB: b.id });
+      expect(res.status).toBe(200);
+
+      // The graph stays a TREE: parentId is single and is A. The second
+      // ancestor rides along as provenance only.
+      const node = store.getNode(res.body.combineNodeId)!;
+      expect(node.kind).toBe("checkpoint");
+      expect(node.parentId).toBe(a.id);
+      expect(node.meta.mergedFrom).toBe(b.id);
+      expect(node.projectId).toBe(a.projectId);
+    });
+
+    it("conflicts abort clean (400, typed code, ZERO writes) unless allowConflicts writes markers", async () => {
+      const { a, b } = await seedForkedSessions(CONFLICT_SIDE_B);
+
+      const refused = await request(app)
+        .post("/api/nodes/combine")
+        .send({ nodeIdA: a.id, nodeIdB: b.id });
+      expect(refused.status).toBe(400);
+      expect(refused.body.code).toBe("conflicts");
+      expect(refused.body.files).toEqual(["shared.txt"]);
+      // Provably zero-write: no output directory was ever claimed.
+      expect(fs.readdirSync(worktreesRoot)).toEqual([]);
+      expect(refused.body.partial).toBeUndefined();
+
+      const marked = await request(app)
+        .post("/api/nodes/combine")
+        .send({ nodeIdA: a.id, nodeIdB: b.id, allowConflicts: true });
+      expect(marked.status).toBe(200);
+      expect(marked.body.conflicted).toEqual(["shared.txt"]);
+      expect(marked.body.unmarkable).toEqual([]);
+      expect(fs.readFileSync(path.join(marked.body.worktreePath, "shared.txt"), "utf8")).toContain(
+        "<<<<<<<",
+      );
+    });
+
+    it("400s on cross-project nodes with code cross_project", async () => {
+      const { a } = await seedForkedSessions(CLEAN_SIDE_B);
+
+      const otherRoot = fs.mkdtempSync(path.join(os.tmpdir(), "sojourn-apiv2-otherproj-"));
+      tempDirs.push(otherRoot);
+      const other = store.upsertProject(otherRoot, "other");
+      store.upsertSession({ id: "s-cmb-other", projectId: other.id, cli: "claude" });
+      const foreign = mkNode(
+        "cmb-foreign",
+        null,
+        "assistant",
+        "s-cmb-other",
+        "2026-02-04T00:00:00.000Z",
+        { type: "text", text: "elsewhere" },
+      );
+      store.upsertNode({ ...foreign, projectId: other.id });
+
+      const res = await request(app)
+        .post("/api/nodes/combine")
+        .send({ nodeIdA: a.id, nodeIdB: "claude:cmb-foreign" });
+      expect(res.status).toBe(400);
+      expect(res.body.code).toBe("cross_project");
+      expect(fs.readdirSync(worktreesRoot)).toEqual([]);
+    });
+
+    it("400s (no code) on body validation: same node twice, missing/blank nodeIdA", async () => {
+      const { a } = await seedForkedSessions(CLEAN_SIDE_B);
+
+      const same = await request(app)
+        .post("/api/nodes/combine")
+        .send({ nodeIdA: a.id, nodeIdB: a.id });
+      expect(same.status).toBe(400);
+      expect(same.body.code).toBeUndefined();
+      expect(same.body.error).toContain("itself");
+
+      const missing = await request(app)
+        .post("/api/nodes/combine")
+        .send({ nodeIdB: a.id });
+      expect(missing.status).toBe(400);
+      expect(missing.body.code).toBeUndefined();
+      expect(missing.body.error).toContain("nodeIdA");
+
+      const blank = await request(app)
+        .post("/api/nodes/combine/preflight")
+        .send({ nodeIdA: "", nodeIdB: a.id });
+      expect(blank.status).toBe(400);
+      expect(blank.body.code).toBeUndefined();
+
+      const missingB = await request(app)
+        .post("/api/nodes/combine/preflight")
+        .send({ nodeIdA: a.id });
+      expect(missingB.status).toBe(400);
+      expect(missingB.body.error).toContain("nodeIdB");
+    });
+
+    it("maps write_failed -> 500 WITH the honest .partial payload (abort-clean codes stay 400)", async () => {
+      const partialState = {
+        worktreePath: "/tmp/combine-half-built",
+        applied: ["b-only.txt"],
+        conflicted: [],
+        remaining: ["shared.txt"],
+      };
+
+      const stubApp = createApp({
+        ...baseDeps,
+        combineEngine: {
+          preflight: async (): Promise<CombinePreflight> => {
+            throw new SojournCombineError("no shared state", "no_common_ancestor");
+          },
+          combine: async () => {
+            throw new SojournCombineError(
+              "failed while populating at shared.txt",
+              "write_failed",
+              ["shared.txt"],
+              partialState,
+            );
+          },
+        },
+      });
+
+      const clean = await request(stubApp)
+        .post("/api/nodes/combine/preflight")
+        .send({ nodeIdA: "claude:x", nodeIdB: "claude:y" });
+      expect(clean.status).toBe(400);
+      expect(clean.body.code).toBe("no_common_ancestor");
+      expect(clean.body.partial).toBeUndefined();
+
+      const failed = await request(stubApp)
+        .post("/api/nodes/combine")
+        .send({ nodeIdA: "claude:x", nodeIdB: "claude:y" });
+      expect(failed.status).toBe(500);
+      expect(failed.body.code).toBe("write_failed");
+      expect(failed.body.files).toEqual(["shared.txt"]);
+      expect(failed.body.partial).toEqual(partialState);
+    });
+
+    it("/api/nodes/combine/* is NOT shadowed by the /api/nodes/:id/* routes", async () => {
+      // Registration order proof. If the combine routes were declared after
+      // `/api/nodes/:id/preflight`, this request would reach the RESTORE
+      // engine with id="combine" and 404 as an unknown node. Instead it must
+      // reach COMBINE, which types its refusal as a 400 + code.
+      const res = await request(app)
+        .post("/api/nodes/combine/preflight")
+        .send({ nodeIdA: "claude:nope-a", nodeIdB: "claude:nope-b" });
+      expect(res.status).toBe(400);
+      expect(res.body.code).toBe("not_found");
+
+      // Contrast: a genuine `:id` preflight for an unknown node still 404s
+      // through the restore engine — the two routes are both live.
+      const restore = await request(app)
+        .post(`/api/nodes/${encodeURIComponent("claude:nope-a")}/preflight`)
+        .send({});
+      expect(restore.status).toBe(404);
+      expect(restore.body.code).toBeUndefined();
+
+      // And the collection route itself resolves to combine, not to a node id.
+      const bare = await request(app)
+        .post("/api/nodes/combine")
+        .send({ nodeIdA: "claude:nope-a", nodeIdB: "claude:nope-b" });
+      expect(bare.status).toBe(400);
+      expect(bare.body.code).toBe("not_found");
     });
   });
 });

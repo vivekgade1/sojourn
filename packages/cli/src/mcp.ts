@@ -13,7 +13,9 @@
 //   fine — they are erased at compile time.
 
 import crypto from "node:crypto";
+import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
@@ -28,7 +30,64 @@ import {
 } from "./searchFormat.js";
 
 const SERVER_NAME = "sojourn";
-const SERVER_VERSION = "0.1.0";
+
+const CLI_PACKAGE_NAME = "@sojourn/cli";
+/** Reported when the CLI's package.json genuinely cannot be located. */
+export const UNKNOWN_VERSION = "0.0.0-unknown";
+
+/**
+ * The CLI package's real version, reported to MCP clients in `serverInfo`.
+ *
+ * Read from packages/cli/package.json rather than hardcoded, so a released
+ * `soj` never advertises a stale version. `import.meta.url` keeps this
+ * ESM-pure (no `require`), and works from BOTH the built
+ * `packages/cli/dist/mcp.js` and the source `packages/cli/src/mcp.ts` under
+ * vitest.
+ *
+ * Walks UP rather than assuming a fixed `../package.json`, and only accepts a
+ * package.json whose `name` is `@sojourn/cli` — so it can never silently
+ * report some unrelated package's version if this module is relocated or
+ * bundled somewhere else on disk. NOTE: this is the CLI package's version,
+ * deliberately NOT the repo root's.
+ *
+ * Fails soft: an unlocatable package.json (e.g. mcp.test.ts's standalone
+ * esbuild bundle in a tmpdir) yields UNKNOWN_VERSION instead of throwing —
+ * an honest sentinel must never stop the stdio server from starting.
+ */
+export function readServerVersion(fromUrl: string = import.meta.url): string {
+  let dir: string;
+  try {
+    dir = path.dirname(fileURLToPath(fromUrl));
+  } catch {
+    return UNKNOWN_VERSION;
+  }
+  // Bounded walk: package roots are never deep relative to the module.
+  for (let i = 0; i < 10; i++) {
+    try {
+      const parsed: unknown = JSON.parse(
+        fs.readFileSync(path.join(dir, "package.json"), "utf8"),
+      );
+      if (parsed && typeof parsed === "object") {
+        const pkg = parsed as { name?: unknown; version?: unknown };
+        if (
+          pkg.name === CLI_PACKAGE_NAME &&
+          typeof pkg.version === "string" &&
+          pkg.version.length > 0
+        ) {
+          return pkg.version;
+        }
+      }
+    } catch {
+      // no package.json here (or unreadable) — keep walking up
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) break; // filesystem root
+    dir = parent;
+  }
+  return UNKNOWN_VERSION;
+}
+
+const SERVER_VERSION = readServerVersion();
 
 export interface McpServerOptions {
   /** daemon base URL; default resolves like the other soj commands: http://localhost:$SOJOURN_PORT (4177). */

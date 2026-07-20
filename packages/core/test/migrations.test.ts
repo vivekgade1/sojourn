@@ -64,10 +64,10 @@ function userVersion(db: BetterSqlite3.Database): number {
 
 describe("runMigrations via GraphStore", () => {
   describe("fresh database", () => {
-    it("lands at user_version 3", () => {
+    it("lands at user_version 4", () => {
       const store = new GraphStore(":memory:");
       try {
-        expect(userVersion(rawDb(store))).toBe(3);
+        expect(userVersion(rawDb(store))).toBe(4);
       } finally {
         store.close();
       }
@@ -133,6 +133,63 @@ describe("runMigrations via GraphStore", () => {
         expect(stored.meta.rewindOf).toBe("claude:origin");
         // absent stays absent — no null leaking into meta
         expect(store.getNode("claude:origin")!.meta.rewindOf).toBeUndefined();
+      } finally {
+        store.close();
+      }
+    });
+
+    it("v4: adds nodes.merged_from, and meta.mergedFrom round-trips through upsertNode/getNode", () => {
+      const store = new GraphStore(":memory:");
+      try {
+        const cols = (rawDb(store).prepare("PRAGMA table_info(nodes)").all() as Array<{
+          name: string;
+        }>).map((c) => c.name);
+        expect(cols).toContain("merged_from");
+
+        store.upsertProject("/repo/mg", "MG");
+        const projectId = store.getProjects()[0].id;
+        const base = {
+          kind: "assistant" as const,
+          cli: "claude" as const,
+          projectId,
+          snapshotRef: null,
+          label: null,
+          summary: "",
+          content: {},
+        };
+        store.upsertNode({
+          ...base,
+          id: "claude:side-a",
+          parentId: null,
+          sessionId: "s-a",
+          timestamp: "2026-01-01T00:00:00.000Z",
+          meta: { nativeUuid: "side-a" },
+        });
+        store.upsertNode({
+          ...base,
+          id: "claude:side-b",
+          parentId: null,
+          sessionId: "s-b",
+          timestamp: "2026-01-01T00:00:00.000Z",
+          meta: { nativeUuid: "side-b" },
+        });
+        store.upsertNode({
+          ...base,
+          id: "claude:combined",
+          kind: "checkpoint",
+          parentId: "claude:side-a",
+          sessionId: "s-a",
+          timestamp: "2026-01-02T00:00:00.000Z",
+          meta: { nativeUuid: "combined", mergedFrom: "claude:side-b" },
+        });
+
+        const stored = store.getNode("claude:combined")!;
+        expect(stored.meta.mergedFrom).toBe("claude:side-b");
+        // the graph stays a TREE: parentId remains the single structural edge
+        expect(stored.parentId).toBe("claude:side-a");
+        // absent stays absent — no null leaking into meta
+        expect(store.getNode("claude:side-a")!.meta.mergedFrom).toBeUndefined();
+        expect("mergedFrom" in store.getNode("claude:side-a")!.meta).toBe(false);
       } finally {
         store.close();
       }
@@ -235,7 +292,7 @@ describe("runMigrations via GraphStore", () => {
       try {
         const db = rawDb(store);
 
-        expect(userVersion(db)).toBe(3);
+        expect(userVersion(db)).toBe(4);
         expect((db.prepare("SELECT COUNT(*) c FROM projects").get() as { c: number }).c).toBe(2);
         expect((db.prepare("SELECT COUNT(*) c FROM sessions").get() as { c: number }).c).toBe(1);
         expect((db.prepare("SELECT COUNT(*) c FROM nodes").get() as { c: number }).c).toBe(3);
@@ -264,17 +321,94 @@ describe("runMigrations via GraphStore", () => {
     });
   });
 
+  describe("upgrading a v3 database to v4", () => {
+    it("adds merged_from as NULL on existing rows, leaving every other column intact", () => {
+      const dbPath = tmpDbPath();
+
+      // Build a genuine v3 database: V1 base schema + only the migrations
+      // that existed before v4, then populate it.
+      const seed = new Database(dbPath);
+      seed.exec(V1_DDL);
+      runMigrations(seed, MIGRATIONS.filter((m) => m.version <= 3));
+      expect(userVersion(seed)).toBe(3);
+      seed.exec(`
+        INSERT INTO projects (id, root, name) VALUES ('proj-v3', '/repo/v3', 'V3');
+        INSERT INTO sessions (id, project_id, cli, title) VALUES ('s-v3', 'proj-v3', 'claude', 'T');
+        INSERT INTO nodes (id, parent_id, kind, cli, session_id, project_id, timestamp,
+                           snapshot_ref, label, summary, content, native_uuid, forked_from, rewind_of)
+        VALUES ('claude:v3a', NULL, 'prompt', 'claude', 's-v3', 'proj-v3',
+                '2026-01-01T00:00:00.000Z', 'tree-aaa', 'kept label', 'kept summary',
+                '{"k":1}', 'v3a', 'claude:forked', 'claude:rewound');
+      `);
+      seed.close();
+
+      const store = new GraphStore(dbPath);
+      try {
+        const db = rawDb(store);
+        expect(userVersion(db)).toBe(4);
+
+        const cols = (db.prepare("PRAGMA table_info(nodes)").all() as Array<{
+          name: string;
+        }>).map((c) => c.name);
+        expect(cols).toContain("merged_from");
+
+        // pre-existing row survives untouched, new column reads NULL
+        const row = db.prepare("SELECT * FROM nodes WHERE id = 'claude:v3a'").get() as Record<
+          string,
+          unknown
+        >;
+        expect(row.merged_from).toBeNull();
+        expect(row.label).toBe("kept label");
+        expect(row.summary).toBe("kept summary");
+        expect(row.snapshot_ref).toBe("tree-aaa");
+        expect(row.forked_from).toBe("claude:forked");
+        expect(row.rewind_of).toBe("claude:rewound");
+
+        // and it hydrates through GraphStore with mergedFrom simply absent
+        const node = store.getNode("claude:v3a")!;
+        expect(node.meta.forkedFrom).toBe("claude:forked");
+        expect(node.meta.rewindOf).toBe("claude:rewound");
+        expect("mergedFrom" in node.meta).toBe(false);
+      } finally {
+        store.close();
+      }
+    });
+
+    it("is idempotent across a re-open of the upgraded database", () => {
+      const dbPath = tmpDbPath();
+      const seed = new Database(dbPath);
+      seed.exec(V1_DDL);
+      runMigrations(seed, MIGRATIONS.filter((m) => m.version <= 3));
+      seed.close();
+
+      const first = new GraphStore(dbPath);
+      expect(userVersion(rawDb(first))).toBe(4);
+      first.close();
+
+      // A second open must not attempt to re-add merged_from (which would
+      // throw "duplicate column name").
+      expect(() => {
+        const second = new GraphStore(dbPath);
+        try {
+          expect(userVersion(rawDb(second))).toBe(4);
+        } finally {
+          second.close();
+        }
+      }).not.toThrow();
+    });
+  });
+
   describe("reopen idempotence", () => {
-    it("reopening an already-migrated database is a no-op and stays at version 3", () => {
+    it("reopening an already-migrated database is a no-op and stays at version 4", () => {
       const dbPath = tmpDbPath();
 
       const first = new GraphStore(dbPath);
-      expect(userVersion(rawDb(first))).toBe(3);
+      expect(userVersion(rawDb(first))).toBe(4);
       first.close();
 
       const second = new GraphStore(dbPath);
       try {
-        expect(userVersion(rawDb(second))).toBe(3);
+        expect(userVersion(rawDb(second))).toBe(4);
         expect(() => second.getProjects()).not.toThrow();
       } finally {
         second.close();
@@ -288,7 +422,7 @@ describe("runMigrations via GraphStore", () => {
       seed.close();
 
       const first = new GraphStore(dbPath);
-      expect(userVersion(rawDb(first))).toBe(3);
+      expect(userVersion(rawDb(first))).toBe(4);
       first.close();
 
       // A second open must not attempt to re-add suppressed_count (which
@@ -426,16 +560,16 @@ describe("runMigrations failure handling", () => {
 });
 
 describe("MIGRATIONS", () => {
-  it("is the ordered list runMigrations uses by default, currently reaching version 3", () => {
-    expect(MIGRATIONS.map((m) => m.version)).toEqual([2, 3]);
+  it("is the ordered list runMigrations uses by default, currently reaching version 4", () => {
+    expect(MIGRATIONS.map((m) => m.version)).toEqual([2, 3, 4]);
   });
 
   it("running the real list twice in a row is idempotent", () => {
     const db = new Database(":memory:");
     db.exec(V1_DDL);
     runMigrations(db);
-    expect(userVersion(db)).toBe(3);
+    expect(userVersion(db)).toBe(4);
     expect(() => runMigrations(db)).not.toThrow();
-    expect(userVersion(db)).toBe(3);
+    expect(userVersion(db)).toBe(4);
   });
 });

@@ -103,6 +103,45 @@ describe("daemon logger", () => {
     expect(fs.existsSync(path.join(home, "daemon.log.2"))).toBe(false);
   });
 
+  it("rotation preserves the inode, so a detached child's inherited stdout fd keeps writing to the live log", () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    initDaemonLogger();
+    const logFile = path.join(home, "daemon.log");
+    fs.writeFileSync(logFile, "x".repeat(MAX_LOG_BYTES + 1), "utf8");
+
+    // Stand in for the CLI's detached spawn: an O_APPEND fd handed to the
+    // child as stdout/stderr, bound to the INODE, not the path.
+    const inodeBefore = fs.statSync(logFile).ino;
+    const childFd = fs.openSync(logFile, "a");
+    try {
+      logInfo("fresh after rotation"); // triggers rotation
+      expect(fs.statSync(logFile).ino).toBe(inodeBefore);
+
+      // A rename would have moved this inode to daemon.log.1; a SECOND
+      // rotation would then unlink it and the raw crash output below would
+      // vanish into a deleted file.
+      fs.writeSync(childFd, "V8 OOM banner from the child\n");
+      // The child's raw output landed in the LIVE log, not a stale inode.
+      expect(fs.readFileSync(logFile, "utf8")).toContain("V8 OOM banner from the child");
+
+      // Append (don't clobber) so the banner is still present when the
+      // second rotation copies this generation aside.
+      fs.appendFileSync(logFile, "y".repeat(MAX_LOG_BYTES + 1), "utf8");
+      logInfo("second rotation");
+      fs.writeSync(childFd, "post-second-rotation child output\n");
+
+      expect(fs.statSync(logFile).ino).toBe(inodeBefore);
+      const live = fs.readFileSync(logFile, "utf8");
+      expect(live).toContain("post-second-rotation child output");
+      // The first banner survived into the retained generation.
+      expect(fs.readFileSync(path.join(home, "daemon.log.1"), "utf8")).toContain(
+        "V8 OOM banner from the child",
+      );
+    } finally {
+      fs.closeSync(childFd);
+    }
+  });
+
   it("never throws when the log destination is unwritable", () => {
     vi.spyOn(console, "log").mockImplementation(() => {});
     initDaemonLogger();

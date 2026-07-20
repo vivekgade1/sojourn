@@ -35,3 +35,60 @@ export function findEffectiveTree(
 
   return { treeHash: null, sourceNodeId: node.id };
 }
+
+/**
+ * Walks `parentId` upward from `node`, yielding the node itself first and
+ * then each ancestor, stopping at the root, at a missing parent, or at a
+ * cycle. Cycle guard is identical to `findEffectiveTree`'s (a `seen` set
+ * checked before each hop) — a corrupt parent chain must terminate, never
+ * spin.
+ */
+function* ancestorChain(store: GraphStore, node: ChronoNode): Generator<ChronoNode> {
+  const seen = new Set<string>([node.id]);
+  let current = node;
+  yield current;
+  while (current.parentId !== null) {
+    if (seen.has(current.parentId)) break; // guard against cycles
+    const parent = store.getNode(current.parentId);
+    if (!parent) break;
+    seen.add(parent.id);
+    current = parent;
+    yield current;
+  }
+}
+
+/**
+ * Nearest common ancestor of two nodes in the `parentId` tree, used by
+ * combine as the MERGE BASE for its three-way merge.
+ *
+ * "Ancestor" is meant in the ancestor-OR-SELF sense: if `b` is a descendant
+ * of `a` (or the two are the same node), `a` itself is returned. That is the
+ * correct merge base — a's tree is genuinely the last state both sides
+ * shared, and the merge degenerates to "apply b's changes", which is what
+ * you want.
+ *
+ * Returns `null` when the two chains never meet — different roots, or a
+ * parent chain broken by a missing/cyclic link. Callers MUST treat null as
+ * a refusal (there is no honest base to merge against), never as "use the
+ * root".
+ *
+ * Deliberately returns the ancestor NODE, not a tree: resolving it to a
+ * snapshot is `findEffectiveTree`'s job and must go through that one shared
+ * definition, so combine's notion of "the base tree" can never drift from
+ * restore's and gc's.
+ */
+export function findNearestCommonAncestor(
+  store: GraphStore,
+  a: ChronoNode,
+  b: ChronoNode,
+): ChronoNode | null {
+  const ancestorsOfA = new Map<string, ChronoNode>();
+  for (const n of ancestorChain(store, a)) {
+    ancestorsOfA.set(n.id, n);
+  }
+  for (const n of ancestorChain(store, b)) {
+    const hit = ancestorsOfA.get(n.id);
+    if (hit) return hit;
+  }
+  return null;
+}

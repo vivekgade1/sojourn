@@ -4,6 +4,7 @@ import { readFileSync, writeFileSync, existsSync, unlinkSync } from "node:fs";
 import { mkdirSync } from "node:fs";
 import { execFile as execFileCb } from "node:child_process";
 import { promisify } from "node:util";
+import { daemonLogPath } from "@sojourn/core";
 
 const execFile = promisify(execFileCb);
 
@@ -34,10 +35,9 @@ export function pidfilePath(sojournHome: string): string {
 }
 
 /** The daemon's log file: both the daemon's own logger and the CLI's spawn
- * piping (child stdout/stderr) append here. */
-export function daemonLogPath(sojournHome: string): string {
-  return join(sojournHome, "daemon.log");
-}
+ * piping (child stdout/stderr) append here. Defined in @sojourn/core so this
+ * derivation exists once; re-exported for the CLI's existing importers. */
+export { daemonLogPath };
 
 /** Last `n` non-empty lines of $SOJOURN_HOME/daemon.log; [] when the file
  * is missing or unreadable (forensics helpers must never throw). */

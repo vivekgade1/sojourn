@@ -693,6 +693,82 @@ button {
   word-break: break-all;
 }
 
+/* Harvest — the restore's inverse, reachable only from a restore result. */
+
+.harvest-flow {
+  margin-top: 10px;
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+}
+
+.harvest-files {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+  margin: 8px 0;
+}
+
+.harvest-files th,
+.harvest-files td {
+  text-align: left;
+  padding: 3px 6px;
+  border-bottom: 1px solid var(--border);
+  word-break: break-all;
+}
+
+.harvest-files th {
+  color: var(--text-dim);
+  font-weight: 600;
+}
+
+.harvest-status-conflict {
+  color: var(--verified-red);
+  font-weight: 600;
+}
+
+.harvest-status-identical {
+  color: var(--text-dim);
+}
+
+.harvest-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 12px;
+  font-size: 12px;
+}
+
+.harvest-controls label {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+}
+
+/* Mid-apply failure: the mainline WAS written to. Loud on purpose. */
+.harvest-partial {
+  margin-top: 8px;
+  padding: 8px;
+  font-size: 11px;
+  border: 1px solid var(--verified-red);
+  border-radius: 4px;
+  color: var(--text);
+}
+
+.harvest-partial-label {
+  margin-top: 6px;
+  color: var(--text-dim);
+}
+
+.harvest-partial code {
+  display: block;
+  background: var(--panel-alt);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 6px;
+  margin-top: 4px;
+  word-break: break-all;
+}
+
 /* Graph canvas (d3) */
 
 .graph-svg {
@@ -1485,6 +1561,35 @@ button {
   color: var(--text);
 }
 
+/* New-sessions nudge — same shape as the daemon banner, quieter accent:
+   informational, not an outage. Offers the widening action rather than
+   taking it, because hidden sessions are never laid out. */
+
+.session-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 16px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  border-left: 4px solid var(--advisory-amber);
+  color: var(--text);
+  font-size: 12px;
+}
+
+.session-banner-action {
+  background: var(--panel-alt);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 4px;
+  padding: 3px 10px;
+  font-size: 12px;
+}
+
+.session-banner-action:hover {
+  border-color: var(--advisory-amber);
+}
+
 /* Session filter — toolbar popover (Glacier: panel surfaces, token colors). */
 
 .session-filter {
@@ -1590,4 +1695,18 @@ button {
   color: var(--text-dim);
   padding: 6px;
   font-size: 11px;
+}
+
+/* Combine: the identity block at the top of the preflight modal — A, B, and
+   the resolved merge base. Ids are long, so they wrap rather than overflow. */
+.combine-ids {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 8px 0;
+  font-size: 12px;
+}
+
+.combine-ids code {
+  word-break: break-all;
 }

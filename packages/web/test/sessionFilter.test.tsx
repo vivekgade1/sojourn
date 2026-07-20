@@ -178,6 +178,90 @@ describe("App / session filter — persistence", () => {
   });
 });
 
+describe("App / session filter — the 'new sessions hidden' nudge", () => {
+  // Session D arrives live, over the WS, after an explicit selection is in
+  // place. effectiveSessionIds intersects the stored ids with what exists, so
+  // D is dropped silently — the banner is the only thing that surfaces it.
+  const sessionD = makeSession("sD", "2026-07-03T10:00:00.000Z", ["prompt", "assistant"]);
+
+  function pushNodes(nodes: ChronoNode[]) {
+    const ws = FakeWebSocket.instances.at(-1)!;
+    for (const node of nodes) {
+      ws.emit("message", { data: JSON.stringify({ type: "node_added", node }) });
+    }
+  }
+
+  async function renderWithExplicitSelection() {
+    await renderApp([...sessionA, ...sessionB]);
+    await waitFor(() => expect(waypointCount()).toBe(3));
+    // Explicitly select BOTH sessions — this is the state that hides new ones.
+    openFilter();
+    fireEvent.click(screen.getByRole("checkbox", { name: /2 turns · claude/ }));
+    await waitFor(() => expect(waypointCount()).toBe(5));
+    // Close the popover so its rows don't collide with banner queries.
+    fireEvent.click(screen.getByTestId("session-filter-button"));
+  }
+
+  it("does not fire on first mount — historical unselected sessions are not 'new'", async () => {
+    // A+B+C exist, but only B is selected (the default). C and A are old, not new.
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(["sB"]));
+    await renderApp([...sessionA, ...sessionB, ...sessionC]);
+    await waitFor(() => expect(waypointCount()).toBe(3));
+
+    expect(screen.queryByTestId("new-sessions-banner")).toBeNull();
+  });
+
+  it("does not fire on the DEFAULT path — effectiveSessionIds already re-picks the newest", async () => {
+    await renderApp([...sessionA, ...sessionB]);
+    await waitFor(() => expect(waypointCount()).toBe(3));
+    // No stored selection: storedSessionIds === null.
+    expect(localStorage.getItem(STORAGE_KEY)).toBeNull();
+
+    pushNodes(sessionD);
+    // The new session becomes the newest and is shown automatically.
+    await waitFor(() => expect(waypointCount()).toBe(1));
+    expect(screen.queryByTestId("new-sessions-banner")).toBeNull();
+  });
+
+  it("nudges (without changing the layout input) when an explicit selection hides a new session", async () => {
+    await renderWithExplicitSelection();
+
+    pushNodes(sessionD);
+
+    const banner = await screen.findByTestId("new-sessions-banner");
+    expect(banner.textContent).toMatch(/1 new session/i);
+    // The whole point of the nudge over auto-include: nothing extra was laid out.
+    expect(waypointCount()).toBe(5);
+  });
+
+  it("the include action widens the selection AND persists the new id", async () => {
+    await renderWithExplicitSelection();
+    pushNodes(sessionD);
+    await screen.findByTestId("new-sessions-banner");
+
+    fireEvent.click(screen.getByRole("button", { name: /show it/i }));
+
+    // sD's single turn joins the 5 already on the map.
+    await waitFor(() => expect(waypointCount()).toBe(6));
+    const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "[]") as string[];
+    expect(new Set(stored)).toEqual(new Set(["sA", "sB", "sD"]));
+    expect(screen.queryByTestId("new-sessions-banner")).toBeNull();
+  });
+
+  it("dismiss acknowledges without touching the selection, and does not come back", async () => {
+    await renderWithExplicitSelection();
+    pushNodes(sessionD);
+    await screen.findByTestId("new-sessions-banner");
+
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+
+    await waitFor(() => expect(screen.queryByTestId("new-sessions-banner")).toBeNull());
+    expect(waypointCount()).toBe(5);
+    const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "[]") as string[];
+    expect(new Set(stored)).toEqual(new Set(["sA", "sB"]));
+  });
+});
+
 describe("App / session filter — search scopes to selected sessions", () => {
   it("search only matches within the selected sessions", async () => {
     const needleNodes = sessionA.map((n, i) =>

@@ -2,11 +2,21 @@ export { parseSessionJsonl } from "./parser.js";
 export { claudeProjectsDir, watchGlob } from "./transcriptLocator.js";
 export { buildResumeCommand } from "./driver.js";
 export type { BuildResumeCommandOptions } from "./driver.js";
-export { planRewind, executeRewind, rewindSidecarPathFor, SojournRewindError } from "./rewind.js";
+export {
+  planRewind,
+  executeRewind,
+  rewindSidecarPathFor,
+  listRewindSidecars,
+  SojournRewindError,
+} from "./rewind.js";
 export type {
   ClaudeRewindPlan,
+  ExecuteRewindDeps,
   PlanRewindInput,
+  RewindFs,
   RewindSidecar,
+  RewindSidecarEntry,
+  RewindSidecarPairStatus,
   SojournRewindErrorCode,
 } from "./rewind.js";
 

@@ -3,7 +3,9 @@
  *
  * Appends timestamped `<iso> [level] message` lines to
  * `$SOJOURN_HOME/daemon.log`, rotating to `daemon.log.1` (one generation
- * kept) once the file exceeds {@link MAX_LOG_BYTES}.
+ * kept) once the file exceeds {@link MAX_LOG_BYTES}. Rotation is
+ * copy-then-truncate, NOT rename: the detached daemon's stdout/stderr is an
+ * inherited fd on this same inode (see {@link appendToFile}).
  *
  * Two-mode design:
  *  - UNINITIALIZED (library/test use — anything that imports daemon modules
@@ -23,7 +25,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { inspect } from "node:util";
-import { sojournHome } from "@sojourn/core";
+import { daemonLogPath } from "@sojourn/core";
 
 export const MAX_LOG_BYTES = 5 * 1024 * 1024;
 
@@ -35,10 +37,11 @@ interface LoggerState {
 
 const state: LoggerState = { filePath: null, mirror: true };
 
-/** `$SOJOURN_HOME/daemon.log`, resolved at call time (env-sensitive for tests). */
-export function daemonLogPath(): string {
-  return path.join(sojournHome(), "daemon.log");
-}
+/** `$SOJOURN_HOME/daemon.log`, resolved at call time (env-sensitive for tests).
+ * Defined in @sojourn/core so the CLI can share it without depending on the
+ * daemon; re-exported here because this module is its natural home for
+ * daemon-side callers. */
+export { daemonLogPath };
 
 /**
  * Enables the file sink. Called exactly once, first thing, by the daemon
@@ -83,9 +86,25 @@ function appendToFile(line: string): void {
     try {
       const st = fs.statSync(filePath);
       if (st.size >= MAX_LOG_BYTES) {
-        // Size-cap rotation: current file becomes the (single) previous
-        // generation, replacing any older one, and a fresh file starts.
-        fs.renameSync(filePath, `${filePath}.1`);
+        // Size-cap rotation: contents are COPIED to the (single) previous
+        // generation, replacing any older one, then the live file is
+        // truncated in place — one generation kept, same as a rename would.
+        //
+        // Copy+truncate rather than rename, because we do NOT own the only
+        // handle on this file. When the CLI starts the daemon detached it
+        // opens daemon.log with O_APPEND and hands that fd to the child as
+        // stdout AND stderr, so raw process output (V8 OOM banners, native
+        // aborts, anything printed before/around the logger) is written
+        // through an fd bound to the INODE, not the path. `rename` would
+        // move that inode to daemon.log.1 — splitting structured lines and
+        // raw crash output across two files — and the NEXT rotation would
+        // overwrite daemon.log.1, unlinking the inode the child's fd still
+        // points at, so the crash banner this log exists to capture would
+        // be written to a deleted file and lost. Truncating keeps the inode
+        // alive and shared; O_APPEND recomputes the offset on every write,
+        // so the child resumes at the new end with no sparse gap.
+        fs.copyFileSync(filePath, `${filePath}.1`);
+        fs.truncateSync(filePath, 0);
       }
     } catch {
       // missing file (first write) or unstat-able: just try the append

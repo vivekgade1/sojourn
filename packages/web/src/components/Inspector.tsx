@@ -1,6 +1,18 @@
 import { useState } from "react";
-import { api } from "../api";
-import type { Annotation, ChronoNode, RestorePreflight, RestoreResult, StoredFlag } from "../types";
+import { api, ApiError, isCombinePartial, isHarvestPartial } from "../api";
+import type {
+  Annotation,
+  ChronoNode,
+  CombinePartialState,
+  CombinePreflight,
+  CombineResult,
+  HarvestOutcome,
+  HarvestPartialState,
+  HarvestPreflight,
+  RestorePreflight,
+  RestoreResult,
+  StoredFlag,
+} from "../types";
 import { DiffView } from "./DiffView";
 
 export interface InspectorProps {
@@ -13,6 +25,15 @@ export interface InspectorProps {
   path?: ChronoNode[];
   /** Select (and pan to) another node — used by Path breadcrumb clicks. */
   onSelectNode?: (id: string) => void;
+  /**
+   * The node currently marked for combine, if any. Lives in App state (NOT
+   * here) precisely so it survives both a selection change and a session-filter
+   * change — marking in one session and combining into another is the point.
+   * May be a node the session filter is currently hiding.
+   */
+  markedNode?: ChronoNode | null;
+  /** Mark the inspected node as the combine partner. */
+  onMarkForCombine?: (nodeId: string) => void;
 }
 
 /**
@@ -321,6 +342,639 @@ function RestoreFlow({
               ))}
             </ul>
           )}
+          {/* The restore's own worktreePath is the only place the web UI ever
+              learns a worktree exists, so the harvest entry point belongs
+              here and nowhere else. */}
+          <HarvestFlow worktreePath={result.worktreePath} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Recovery detail for a 500 (`partial_apply` / `mainline_drift`). This is NOT
+ * a generic failure: the mainline WAS written to. The only useful thing to
+ * show is exactly what landed, what never will, and the snapshot that holds
+ * the pre-harvest state.
+ */
+function HarvestPartialReport({ partial }: { partial: HarvestPartialState }) {
+  return (
+    <div className="harvest-partial" data-testid="harvest-partial">
+      <strong>Your project was modified before this failed.</strong>
+      <div>
+        {partial.applied.length} file(s) were written to your project, and{" "}
+        {partial.remaining.length} were never processed. Nothing here is automatically
+        undone.
+      </div>
+      {partial.applied.length > 0 && (
+        <>
+          <div className="harvest-partial-label">Applied to your project:</div>
+          <ul className="modal-warnings" data-testid="harvest-partial-applied">
+            {partial.applied.map((p) => (
+              <li key={p}>{p}</li>
+            ))}
+          </ul>
+        </>
+      )}
+      {partial.conflicted.length > 0 && (
+        <>
+          <div className="harvest-partial-label">Conflicted:</div>
+          <ul className="modal-warnings">
+            {partial.conflicted.map((p) => (
+              <li key={p}>{p}</li>
+            ))}
+          </ul>
+        </>
+      )}
+      {partial.remaining.length > 0 && (
+        <>
+          <div className="harvest-partial-label">Never processed:</div>
+          <ul className="modal-warnings" data-testid="harvest-partial-remaining">
+            {partial.remaining.map((p) => (
+              <li key={p}>{p}</li>
+            ))}
+          </ul>
+        </>
+      )}
+      <div className="harvest-partial-label">
+        Recover your project from this pre-harvest snapshot:
+      </div>
+      <code data-testid="harvest-partial-snapshot">{partial.safetySnapshotRef}</code>
+    </div>
+  );
+}
+
+/**
+ * Harvest: bring a restored worktree's changes back into the mainline project.
+ *
+ * Lives inside the restore RESULT block because `worktreePath` is the only
+ * place the web UI ever learns a worktree exists — there is no other context
+ * in the app that knows one.
+ */
+function HarvestFlow({ worktreePath }: { worktreePath: string }) {
+  const [preflight, setPreflight] = useState<HarvestPreflight | null>(null);
+  // The worktree path captured when preflight was requested — the ONLY value
+  // ever passed to api.harvest, never the live prop, so confirming can't act
+  // on a different worktree than the one whose files the user reviewed.
+  const [preflightPath, setPreflightPath] = useState<string | null>(null);
+  const [result, setResult] = useState<HarvestOutcome | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  // Kept alongside `error` so a mid-apply 500 can render its recovery detail
+  // instead of a bare message. Null for every other failure.
+  const [partial, setPartial] = useState<HarvestPartialState | null>(null);
+  const [mode, setMode] = useState<"apply" | "patch">("apply");
+  const [allowConflicts, setAllowConflicts] = useState(false);
+
+  function noteError(e: unknown) {
+    setError(e instanceof Error ? e.message : String(e));
+    // `code`/`partial` are optional even on a 400 — a plain input-validation
+    // rejection carries neither. Only a genuine mid-apply failure has partial,
+    // and only a HARVEST-shaped one belongs in this report.
+    const p = e instanceof ApiError ? e.partial : null;
+    setPartial(p && isHarvestPartial(p) ? p : null);
+  }
+
+  async function startPreflight() {
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    setPartial(null);
+    try {
+      const pf = await api.harvestPreflight(worktreePath);
+      setPreflight(pf);
+      setPreflightPath(worktreePath);
+    } catch (e) {
+      noteError(e);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function closeModal() {
+    setPreflight(null);
+    setPreflightPath(null);
+  }
+
+  async function confirmHarvest() {
+    if (busy) return;
+    if (!preflightPath) return;
+    setBusy(true);
+    setError(null);
+    setPartial(null);
+    try {
+      const res = await api.harvest(preflightPath, mode, allowConflicts);
+      setResult(res);
+      closeModal();
+    } catch (e) {
+      noteError(e);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const conflictCount = preflight?.files.filter((f) => f.status === "conflict").length ?? 0;
+  // Mirrors the server's own refusal (harvestEngine.ts: apply-mode aborts
+  // clean when any file conflicts unless allowConflicts). Patch mode returns
+  // before that check ever runs — it never touches the mainline — so
+  // conflicts must NOT block it.
+  const confirmBlocked = mode === "apply" && conflictCount > 0 && !allowConflicts;
+
+  return (
+    <div className="harvest-flow" data-testid="harvest-flow">
+      <button className="restore-btn" onClick={startPreflight} disabled={busy}>
+        {busy ? "Checking…" : "Harvest changes into project"}
+      </button>
+      {error && (
+        <div className="flag-evidence" data-testid="harvest-error">
+          {error}
+        </div>
+      )}
+      {partial && <HarvestPartialReport partial={partial} />}
+
+      {preflight && (
+        <div className="modal-overlay" role="dialog" aria-modal="true">
+          <div className="modal">
+            <h3>Confirm harvest</h3>
+            <p>
+              This copies the worktree's changed files back into your project at its real
+              location. A safety snapshot of your project is always taken first.
+            </p>
+
+            {preflight.mainlineDirty && (
+              <div className="flag-evidence" data-testid="harvest-mainline-dirty">
+                Your project has changed on files this harvest would touch. Those changes
+                are what the conflicts below are against.
+              </div>
+            )}
+
+            {preflight.files.length === 0 ? (
+              <p className="inspector-meta">No changed files to harvest.</p>
+            ) : (
+              <table className="harvest-files" data-testid="harvest-files">
+                <thead>
+                  <tr>
+                    <th>File</th>
+                    <th>Status</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {preflight.files.map((f) => (
+                    <tr key={f.path} data-testid="harvest-file-row">
+                      <td>{f.path}</td>
+                      <td className={`harvest-status harvest-status-${f.status}`}>
+                        {f.status}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+
+            {preflight.warnings.length > 0 && (
+              <ul className="modal-warnings" data-testid="harvest-preflight-warnings">
+                {preflight.warnings.map((w, i) => (
+                  <li key={i}>{w}</li>
+                ))}
+              </ul>
+            )}
+
+            <div className="harvest-controls">
+              <label>
+                <input
+                  type="radio"
+                  name="harvest-mode"
+                  checked={mode === "apply"}
+                  onChange={() => setMode("apply")}
+                />
+                Apply — write the files into the project
+              </label>
+              <label>
+                <input
+                  type="radio"
+                  name="harvest-mode"
+                  checked={mode === "patch"}
+                  onChange={() => setMode("patch")}
+                />
+                Patch — write a .patch file in the worktree, leave the project untouched
+              </label>
+              {mode === "apply" && conflictCount > 0 && (
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={allowConflicts}
+                    onChange={(e) => setAllowConflicts(e.target.checked)}
+                  />
+                  Harvest anyway with {conflictCount} conflict(s) — writes conflict markers
+                  where it can, and reports the files it could not mark (those are left
+                  untouched)
+                </label>
+              )}
+            </div>
+
+            <p className="inspector-meta">
+              The worktree is re-read when you confirm, so a change made to it since this
+              check will be included.
+            </p>
+
+            <div className="modal-actions">
+              <button className="modal-cancel" onClick={closeModal}>
+                Cancel
+              </button>
+              <button
+                className="modal-confirm"
+                onClick={confirmHarvest}
+                disabled={confirmBlocked || busy}
+              >
+                {busy ? "Harvesting…" : "Confirm harvest"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {result && (
+        <div className="restore-result" data-testid="harvest-result">
+          {/* Patch and apply outcomes are structurally different: a successful
+              patch run leaves every array empty by design, so reporting counts
+              there would read as "nothing happened". Branch on patchPath. */}
+          {result.patchPath !== null ? (
+            <>
+              <div>Patch written (your project was not modified):</div>
+              <code data-testid="harvest-patch-path">{result.patchPath}</code>
+            </>
+          ) : (
+            <>
+              <div data-testid="harvest-counts">
+                {result.applied.length} applied · {result.conflicted.length} conflicted ·{" "}
+                {result.skippedIdentical.length} already identical
+              </div>
+              {result.applied.length > 0 && (
+                <ul className="modal-warnings">
+                  {result.applied.map((p) => (
+                    <li key={p}>{p}</li>
+                  ))}
+                </ul>
+              )}
+              {result.conflicted.length > 0 && (
+                <>
+                  <div style={{ marginTop: 6 }}>
+                    Conflicted — see the notes below for which of these carry conflict
+                    markers and which were left untouched:
+                  </div>
+                  <ul className="modal-warnings">
+                    {result.conflicted.map((p) => (
+                      <li key={p}>{p}</li>
+                    ))}
+                  </ul>
+                </>
+              )}
+            </>
+          )}
+          <div style={{ marginTop: 6 }}>Safety snapshot of your project before harvest:</div>
+          <code>{result.safetySnapshotRef}</code>
+          {/* Rendered verbatim, always: `conflicted` is actively misleading
+              without them, since the marked-up/untouched distinction lives
+              ONLY here. */}
+          {result.warnings.length > 0 && (
+            <ul className="modal-warnings" data-testid="harvest-result-warnings">
+              {result.warnings.map((w, i) => (
+                <li key={i}>{w}</li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * The one thing a user can most easily get wrong about combine, stated in the
+ * same words everywhere it appears (preflight modal AND result). Combine emits
+ * FILES; it never fabricates a merged conversation. Rendered unconditionally —
+ * it is not a warning that can be absent.
+ */
+const COMBINE_FRESH_SESSION_NOTICE =
+  "Files only — no conversation is combined. Sojourn does not synthesize a merged " +
+  "transcript, so neither original session is continued: you start a genuinely fresh " +
+  "session in the new worktree.";
+
+/** A named list of paths — the result's groups, each rendered distinctly. */
+function PathGroup({
+  label,
+  paths,
+  testId,
+}: {
+  label: string;
+  paths: string[];
+  testId: string;
+}) {
+  if (paths.length === 0) return null;
+  return (
+    <>
+      <div className="harvest-partial-label">{label}</div>
+      <ul className="modal-warnings" data-testid={testId}>
+        {paths.map((p) => (
+          <li key={p}>{p}</li>
+        ))}
+      </ul>
+    </>
+  );
+}
+
+/**
+ * Recovery detail for a combine 500 (`write_failed`). NOT a bare error: the
+ * worktree exists and holds real merged content, and is deliberately not
+ * deleted. Nothing outside it was ever touched — which is why there is no
+ * safety snapshot here, unlike harvest's partial report.
+ */
+function CombinePartialReport({ partial }: { partial: CombinePartialState }) {
+  return (
+    <div className="harvest-partial" data-testid="combine-partial">
+      <strong>Your worktree was partially built — here is exactly what landed, and where.</strong>
+      <div>
+        Writing stopped part-way. The worktree below was kept on purpose: it holds real
+        merged content. Nothing outside it was modified.
+      </div>
+      <div className="harvest-partial-label">Partially built worktree:</div>
+      <code data-testid="combine-partial-worktree">{partial.worktreePath}</code>
+      <PathGroup
+        label="Merged in before the failure:"
+        paths={partial.applied}
+        testId="combine-partial-applied"
+      />
+      <PathGroup
+        label="Written with conflict markers:"
+        paths={partial.conflicted}
+        testId="combine-partial-conflicted"
+      />
+      <PathGroup
+        label="Never processed — these are missing from the worktree:"
+        paths={partial.remaining}
+        testId="combine-partial-remaining"
+      />
+    </div>
+  );
+}
+
+/**
+ * Combine: merge the FILE STATES of the inspected node and the marked node
+ * into one new worktree.
+ *
+ * The inspected node is side A and the marked node is side B — which matters
+ * twice: the combine node is parented to A (the graph stays a tree; B is
+ * recorded as provenance in `meta.mergedFrom`), and on an UNMARKABLE conflict
+ * A's content is the one kept verbatim. The modal says so.
+ */
+function CombineFlow({ nodeA, nodeB }: { nodeA: ChronoNode; nodeB: ChronoNode }) {
+  const [preflight, setPreflight] = useState<CombinePreflight | null>(null);
+  // The exact PAIR captured when preflight was requested. These — never the
+  // live props — are what confirm acts on, so a selection or mark change while
+  // the modal is open can't combine a different pair than the one whose file
+  // table the user actually reviewed.
+  const [pair, setPair] = useState<{ a: string; b: string } | null>(null);
+  const [result, setResult] = useState<CombineResult | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [partial, setPartial] = useState<CombinePartialState | null>(null);
+  const [allowConflicts, setAllowConflicts] = useState(false);
+
+  function noteError(e: unknown) {
+    setError(e instanceof Error ? e.message : String(e));
+    // Only combine's `write_failed` carries a partial, and only a
+    // combine-SHAPED one may be rendered here. Every abort-clean 400
+    // (no_common_ancestor, conflicts, cross_project, …) has none — and those
+    // provably wrote zero bytes, so there is nothing to recover.
+    const p = e instanceof ApiError ? e.partial : null;
+    setPartial(p && isCombinePartial(p) ? p : null);
+  }
+
+  async function startPreflight() {
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    setPartial(null);
+    try {
+      const pf = await api.combinePreflight(nodeA.id, nodeB.id);
+      setPreflight(pf);
+      setPair({ a: nodeA.id, b: nodeB.id });
+      setAllowConflicts(false);
+    } catch (e) {
+      noteError(e);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function closeModal() {
+    setPreflight(null);
+    setPair(null);
+  }
+
+  async function confirmCombine() {
+    if (busy) return;
+    if (!pair) return;
+    setBusy(true);
+    setError(null);
+    setPartial(null);
+    try {
+      const res = await api.combine(pair.a, pair.b, allowConflicts);
+      setResult(res);
+      closeModal();
+    } catch (e) {
+      noteError(e);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const conflicts = preflight?.files.filter((f) => f.status === "conflict") ?? [];
+  const unmarkableCount = conflicts.filter((f) => f.unmarkable).length;
+  // Mirrors the server's own refusal: combine aborts clean (400 `conflicts`,
+  // zero bytes written) when any file conflicts unless allowConflicts is set.
+  const confirmBlocked = conflicts.length > 0 && !allowConflicts;
+
+  return (
+    <div className="inspector-section" data-testid="combine-flow">
+      <h3>Combine</h3>
+      <button className="restore-btn" onClick={startPreflight} disabled={busy}>
+        {busy ? "Checking…" : "Combine with marked node"}
+      </button>
+      <div className="inspector-meta" data-testid="combine-partner">
+        Marked partner: {nodeB.label ?? nodeB.summary} ({nodeB.id})
+      </div>
+      {error && (
+        <div className="flag-evidence" data-testid="combine-error">
+          {error}
+        </div>
+      )}
+      {partial && <CombinePartialReport partial={partial} />}
+
+      {preflight && (
+        <div className="modal-overlay" role="dialog" aria-modal="true">
+          <div className="modal">
+            <h3>Confirm combine</h3>
+            <p>
+              This merges the FILE STATES of these two nodes into one new worktree. Neither
+              node, session, or your project is modified.
+            </p>
+
+            <div className="combine-ids" data-testid="combine-ids">
+              <div>
+                <strong>A (this node)</strong> — <code>{preflight.nodeIdA}</code>
+              </div>
+              <div>
+                <strong>B (marked node)</strong> — <code>{preflight.nodeIdB}</code>
+              </div>
+              <div>
+                <strong>Merge base</strong> — <code data-testid="combine-base-node">
+                  {preflight.baseNodeId}
+                </code>
+                <span className="inspector-meta">
+                  {" "}
+                  the nearest common ancestor of A and B; every difference below is measured
+                  against it.
+                </span>
+              </div>
+            </div>
+
+            <div className="flag-evidence" data-testid="combine-fresh-session-notice">
+              {COMBINE_FRESH_SESSION_NOTICE}
+            </div>
+
+            {preflight.files.length === 0 ? (
+              <p className="inspector-meta">
+                These two nodes have no differing files — combining them would produce a copy
+                of A.
+              </p>
+            ) : (
+              <table className="harvest-files" data-testid="combine-files">
+                <thead>
+                  <tr>
+                    <th>File</th>
+                    <th>Status</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {preflight.files.map((f) => (
+                    <tr key={f.path} data-testid="combine-file-row">
+                      <td>{f.path}</td>
+                      <td className={`harvest-status harvest-status-${f.status}`}>
+                        {f.status}
+                        {f.unmarkable ? " (cannot take conflict markers)" : ""}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+
+            {preflight.warnings.length > 0 && (
+              <ul className="modal-warnings" data-testid="combine-preflight-warnings">
+                {preflight.warnings.map((w, i) => (
+                  <li key={i}>{w}</li>
+                ))}
+              </ul>
+            )}
+
+            {/* Shown ONLY when there is something to allow. With zero conflicts
+                the checkbox would be a meaningless choice, and its absence is
+                what tells the user the merge is clean. */}
+            {conflicts.length > 0 && (
+              <div className="harvest-controls">
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={allowConflicts}
+                    onChange={(e) => setAllowConflicts(e.target.checked)}
+                  />
+                  Combine anyway with {conflicts.length} conflict(s) — the worktree is written
+                  with conflict markers where it can
+                  {unmarkableCount > 0
+                    ? `, and ${unmarkableCount} file(s) cannot take markers at all, so A's content is kept as-is there`
+                    : ""}
+                  .
+                </label>
+              </div>
+            )}
+
+            <div className="modal-actions">
+              <button className="modal-cancel" onClick={closeModal}>
+                Cancel
+              </button>
+              <button
+                className="modal-confirm"
+                onClick={confirmCombine}
+                disabled={confirmBlocked || busy}
+              >
+                {busy ? "Combining…" : "Confirm combine"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {result && (
+        <div className="restore-result" data-testid="combine-result">
+          <div>Combined worktree:</div>
+          <code data-testid="combine-worktree">{result.worktreePath}</code>
+
+          {/* Repeated verbatim at the result, where the user is about to go and
+              use the worktree — this is the moment they might expect to
+              "resume" a merged conversation. There isn't one. */}
+          <div className="flag-evidence" data-testid="combine-fresh-session-notice">
+            {COMBINE_FRESH_SESSION_NOTICE}
+          </div>
+
+          <div className="inspector-meta" data-testid="combine-result-ids">
+            A {result.nodeIdA} · B {result.nodeIdB} · base {result.baseNodeId}
+          </div>
+
+          <PathGroup
+            label="Merged in cleanly from B:"
+            paths={result.applied}
+            testId="combine-applied"
+          />
+          {/* `unmarkable` is a SUBSET of `conflicted` — the engine pushes those
+              paths into both, because "conflicted" means conflicted, not
+              marked. Subtract before rendering: listing a binary conflict under
+              "written with conflict markers" would be false (nothing was
+              written into it; A's content was kept), and it would appear in
+              two groups at once. */}
+          <PathGroup
+            label="Written with conflict markers — resolve these by hand:"
+            paths={result.conflicted.filter((p) => !result.unmarkable.includes(p))}
+            testId="combine-conflicted"
+          />
+          <PathGroup
+            label="Could not take conflict markers — A's content kept as-is, B's side is NOT in these files:"
+            paths={result.unmarkable}
+            testId="combine-unmarkable"
+          />
+          <PathGroup
+            label="Already identical — nothing to do:"
+            paths={result.skippedIdentical}
+            testId="combine-skipped-identical"
+          />
+
+          {/* null is an ordinary outcome, not a failure — so it is simply not
+              mentioned rather than reported as a missing value. */}
+          {result.combineNodeId !== null && (
+            <>
+              <div className="harvest-partial-label">Recorded as combine node:</div>
+              <code data-testid="combine-node-id">{result.combineNodeId}</code>
+            </>
+          )}
+
+          {result.warnings.length > 0 && (
+            <ul className="modal-warnings" data-testid="combine-result-warnings">
+              {result.warnings.map((w, i) => (
+                <li key={i}>{w}</li>
+              ))}
+            </ul>
+          )}
         </div>
       )}
     </div>
@@ -334,6 +988,8 @@ function InspectorContent({
   onFlagsUpdated,
   path,
   onSelectNode,
+  markedNode,
+  onMarkForCombine,
 }: InspectorProps & { node: ChronoNode }) {
   const [payloadOpen, setPayloadOpen] = useState(false);
   const [criticBusy, setCriticBusy] = useState(false);
@@ -469,6 +1125,27 @@ function InspectorContent({
         buttonLabel="Restore at this node"
         modalDescription="Restores the working tree to this node's snapshot (or the nearest earlier snapshot if this step didn't take one), into a new worktree."
       />
+
+      {/* Two-step mark-then-combine. Step one is offered whenever this node
+          isn't already the marked one; step two appears only once a DIFFERENT
+          node is marked (combining a node with itself is a server 400, so it
+          is never offered). The mark itself lives in App state. */}
+      {onMarkForCombine && markedNode?.id !== node.id && (
+        <div className="inspector-section" data-testid="combine-mark-section">
+          <h3>Combine</h3>
+          <button className="restore-btn" onClick={() => onMarkForCombine(node.id)}>
+            Mark for combine
+          </button>
+          <div className="inspector-meta">
+            {markedNode
+              ? "Replaces the currently marked node."
+              : "Then select another node — in any session — to combine it with."}
+          </div>
+        </div>
+      )}
+      {markedNode && markedNode.id !== node.id && (
+        <CombineFlow key={`${node.id}|${markedNode.id}`} nodeA={node} nodeB={markedNode} />
+      )}
     </div>
   );
 }
@@ -480,6 +1157,8 @@ export function Inspector({
   onFlagsUpdated,
   path,
   onSelectNode,
+  markedNode,
+  onMarkForCombine,
 }: InspectorProps) {
   if (!node) {
     return <div className="inspector-empty">Select a node to inspect it.</div>;
@@ -498,6 +1177,8 @@ export function Inspector({
       onFlagsUpdated={onFlagsUpdated}
       path={path}
       onSelectNode={onSelectNode}
+      markedNode={markedNode}
+      onMarkForCombine={onMarkForCombine}
     />
   );
 }

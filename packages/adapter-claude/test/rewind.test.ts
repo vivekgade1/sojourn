@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import realFs, { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -8,6 +8,8 @@ import {
   parseSessionJsonl,
   planRewind,
   executeRewind,
+  listRewindSidecars,
+  rewindSidecarPathFor,
   SojournRewindError,
 } from "../src/index.js";
 import type { ClaudeRewindPlan } from "../src/index.js";
@@ -28,6 +30,52 @@ function nodesOf(raw: string): ChronoNode[] {
   const batch = parseSessionJsonl("/tmp/fake/session-abc.jsonl", raw);
   expect(batch).not.toBeNull();
   return batch!.nodes;
+}
+
+/** Tolerant line parse: the raw fixture deliberately contains a malformed
+ * line (the parser skips those), so helpers that run over BOTH the fixture
+ * and synthesized output must not choke on it. */
+function looseJsonLinesOf(content: string): Record<string, unknown>[] {
+  const out: Record<string, unknown>[] = [];
+  for (const line of content.split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed.length === 0) continue;
+    try {
+      const rec = JSON.parse(trimmed) as unknown;
+      if (typeof rec === "object" && rec !== null) out.push(rec as Record<string, unknown>);
+    } catch {
+      // skip, exactly as the parser does
+    }
+  }
+  return out;
+}
+
+/** Every `tool_use` block id in a transcript, in file order. */
+function toolUseIdsOf(content: string): string[] {
+  const ids: string[] = [];
+  for (const rec of looseJsonLinesOf(content)) {
+    const message = rec.message as Record<string, unknown> | undefined;
+    const blocks = Array.isArray(message?.content) ? message!.content : [];
+    for (const b of blocks as Record<string, unknown>[]) {
+      if (b?.type === "tool_use" && typeof b.id === "string") ids.push(b.id);
+    }
+  }
+  return ids;
+}
+
+/** Every `tool_result.tool_use_id` reference in a transcript, in file order. */
+function toolResultRefsOf(content: string): string[] {
+  const refs: string[] = [];
+  for (const rec of looseJsonLinesOf(content)) {
+    const message = rec.message as Record<string, unknown> | undefined;
+    const blocks = Array.isArray(message?.content) ? message!.content : [];
+    for (const b of blocks as Record<string, unknown>[]) {
+      if (b?.type === "tool_result" && typeof b.tool_use_id === "string") {
+        refs.push(b.tool_use_id);
+      }
+    }
+  }
+  return refs;
 }
 
 function jsonLinesOf(content: string): Record<string, unknown>[] {
@@ -415,6 +463,85 @@ describe("executeRewind", () => {
     }
   });
 
+  // ORDER is the invariant, not just presence. The daemon's watcher only
+  // reacts to `.jsonl`, so the sidecar must be durable BEFORE the transcript
+  // becomes observable — otherwise a crash in between leaves an unattributed
+  // transcript the watcher ingests as a disconnected phantom session carrying
+  // false verified flags (V2 must-fix I3). Asserted via a recording fs seam,
+  // NOT mtimes: sub-millisecond writes tie on APFS.
+  it("renames the sidecar into place BEFORE the transcript", async () => {
+    const plan = planFixture();
+    const renames: string[] = [];
+    await executeRewind(plan, fixtureRaw.split("\n"), {
+      fs: {
+        rename: async (from: Parameters<typeof realFs.rename>[0], to: Parameters<typeof realFs.rename>[1]) => {
+          renames.push(String(to));
+          return realFs.rename(from, to);
+        },
+      },
+    });
+
+    const sidecarPath = rewindSidecarPathFor(plan.transcriptPath!);
+    const sidecarAt = renames.indexOf(sidecarPath);
+    const transcriptAt = renames.indexOf(plan.transcriptPath!);
+    expect(sidecarAt).toBeGreaterThanOrEqual(0);
+    expect(transcriptAt).toBeGreaterThanOrEqual(0);
+    expect(sidecarAt).toBeLessThan(transcriptAt);
+  });
+
+  // The crash the ordering exists to survive. If the transcript write dies
+  // after the sidecar landed, neither file may survive: no phantom `.jsonl`,
+  // and no orphan sidecar for a future gc sweep to reason about either.
+  it("leaves NO transcript and NO orphan sidecar when the transcript write fails", async () => {
+    const plan = planFixture();
+    const boom = new Error("simulated ENOSPC mid-transcript-write");
+    await expect(
+      executeRewind(plan, fixtureRaw.split("\n"), {
+        fs: {
+          writeFile: (async (target: unknown, ...rest: unknown[]) => {
+            // Let the sidecar's tmp write through; blow up the transcript's.
+            if (String(target).startsWith(plan.transcriptPath!)) throw boom;
+            return (realFs.writeFile as (...a: unknown[]) => Promise<void>)(target, ...rest);
+          }) as typeof realFs.writeFile,
+        },
+      }),
+    ).rejects.toMatchObject({ name: "SojournRewindError", code: "write_failed" });
+
+    expect(existsSync(plan.transcriptPath!)).toBe(false);
+    expect(existsSync(rewindSidecarPathFor(plan.transcriptPath!))).toBe(false);
+    // No tmp debris of either kind.
+    expect(readdirSync(projectsSubdir)).toEqual([]);
+  });
+
+  it("deletes the sidecar too when round-trip validation fails", async () => {
+    const plan = planFixture();
+    plan.expectedKinds = [...plan.expectedKinds, "prompt"];
+    await expect(executeRewind(plan, fixtureRaw.split("\n"))).rejects.toMatchObject({
+      name: "SojournRewindError",
+      code: "validation_mismatch",
+    });
+    expect(existsSync(plan.transcriptPath!)).toBe(false);
+    expect(existsSync(rewindSidecarPathFor(plan.transcriptPath!))).toBe(false);
+    expect(readdirSync(projectsSubdir)).toEqual([]);
+  });
+
+  // "NEW files only" is a CHECKED property for both members of the pair, not
+  // a comment. The sidecar is now written first, so it is also the first
+  // thing that can collide.
+  it("refuses with sidecar_exists rather than clobbering an existing sidecar", async () => {
+    const plan = planFixture();
+    const sidecarPath = rewindSidecarPathFor(plan.transcriptPath!);
+    await writeFile(sidecarPath, "pre-existing sidecar\n", "utf8");
+
+    await expect(executeRewind(plan, fixtureRaw.split("\n"))).rejects.toMatchObject({
+      name: "SojournRewindError",
+      code: "sidecar_exists",
+    });
+    expect(await readFile(sidecarPath, "utf8")).toBe("pre-existing sidecar\n");
+    // And it refused before writing anything else.
+    expect(existsSync(plan.transcriptPath!)).toBe(false);
+  });
+
   it("writes NO sidecar for a tip-mode plan (execute is a no-op)", async () => {
     const nodes = nodesOf(fixtureRaw).filter(
       (n) => n.id !== "claude:44444444-4444-4444-4444-444444444444",
@@ -452,7 +579,92 @@ describe("executeRewind", () => {
       "tool_use",
       "tool_use",
     ]);
-    expect(content).toContain("toolu_read_002");
+    // The sibling block survives — identified by its payload rather than its
+    // id, because tool block ids are deliberately FRESHENED (see below).
+    expect(content).toContain("/repo/project/src/router.ts");
+    // ...and the ORIGINAL ids must not survive: reusing them would make the
+    // synthesized session's tool nodes collide with the origin's and steal
+    // them on upsert.
+    expect(content).not.toContain("toolu_read_001");
+    expect(content).not.toContain("toolu_read_002");
+  });
+
+  // Regression: the parser keys tool nodes on the tool_use BLOCK id, not the
+  // line uuid. Reusing block ids made the synthesized session project tool
+  // nodes whose ids collided with the origin's, so the store's upsert MOVED
+  // them onto the new session — breaking the origin's ancestor chains and
+  // causing a LATER exact rewind of the origin to be falsely refused with
+  // "ancestor chain incomplete (orphaned parentage)".
+  describe("tool block id freshening (origin-session integrity)", () => {
+    it("assigns fresh tool_use ids that collide with neither the original nor each other", async () => {
+      const plan = planFixture({ targetNodeId: TIP_TARGET });
+      await executeRewind(plan, fixtureRaw.split("\n"));
+      const content = await readFile(plan.transcriptPath!, "utf8");
+
+      const originalIds = toolUseIdsOf(fixtureRaw);
+      const freshIds = toolUseIdsOf(content);
+      expect(originalIds.length).toBeGreaterThan(0);
+      expect(freshIds.length).toBe(originalIds.length);
+
+      // Disjoint from the origin's ids...
+      for (const id of freshIds) expect(originalIds).not.toContain(id);
+      // ...and unique among themselves.
+      expect(new Set(freshIds).size).toBe(freshIds.length);
+      // Shape preserved: still recognizably tool ids.
+      for (const id of freshIds) expect(id.startsWith("toolu_")).toBe(true);
+    });
+
+    it("remaps tool_result.tool_use_id through the SAME map, preserving the parent edge", async () => {
+      const plan = planFixture({ targetNodeId: TIP_TARGET });
+      await executeRewind(plan, fixtureRaw.split("\n"));
+      const content = await readFile(plan.transcriptPath!, "utf8");
+
+      const resultRefs = toolResultRefsOf(content);
+      const freshIds = toolUseIdsOf(content);
+      expect(resultRefs.length).toBeGreaterThan(0);
+      // Every tool_result points at a tool_use DEFINED IN THIS FILE. A
+      // half-remap would leave these pointing at the origin's nodes.
+      for (const ref of resultRefs) expect(freshIds).toContain(ref);
+
+      // And the projected tree still resolves those edges: every tool_result
+      // node's parent is a tool_use node in the same batch.
+      const batch = parseSessionJsonl(plan.transcriptPath!, content)!;
+      const byId = new Map(batch.nodes.map((n) => [n.id, n]));
+      const results = batch.nodes.filter((n) => n.kind === "tool_result");
+      expect(results.length).toBeGreaterThan(0);
+      for (const r of results) {
+        expect(r.parentId).not.toBeNull();
+        expect(byId.get(r.parentId!)?.kind).toBe("tool_use");
+      }
+    });
+
+    it("projects tool node ids that are disjoint from the ORIGIN session's", async () => {
+      const plan = planFixture({ targetNodeId: TIP_TARGET });
+      await executeRewind(plan, fixtureRaw.split("\n"));
+      const content = await readFile(plan.transcriptPath!, "utf8");
+
+      const originToolNodeIds = nodesOf(fixtureRaw)
+        .filter((n) => n.kind === "tool_use" || n.kind === "tool_result")
+        .map((n) => n.id);
+      const synthToolNodeIds = parseSessionJsonl(plan.transcriptPath!, content)!
+        .nodes.filter((n) => n.kind === "tool_use" || n.kind === "tool_result")
+        .map((n) => n.id);
+
+      expect(originToolNodeIds.length).toBeGreaterThan(0);
+      expect(synthToolNodeIds.length).toBe(originToolNodeIds.length);
+      // THE invariant: zero overlap. Any shared id is a node the upsert steals.
+      for (const id of synthToolNodeIds) expect(originToolNodeIds).not.toContain(id);
+    });
+
+    it("does not mutate the caller's raw lines", async () => {
+      const rawLines = fixtureRaw.split("\n");
+      const before = rawLines.join("\n");
+      const plan = planFixture({ targetNodeId: TIP_TARGET });
+      await executeRewind(plan, rawLines);
+      // The rewrite spreads records shallowly; remapping must deep-copy or it
+      // would corrupt the array the caller still holds.
+      expect(rawLines.join("\n")).toBe(before);
+    });
   });
 
   it("splices parentUuid across a skipped system line to the previous included line", async () => {
@@ -657,5 +869,96 @@ describe("executeRewind", () => {
       SojournRewindError,
     );
     expect(await readFile(plan.transcriptPath!, "utf8")).toBe("pre-existing\n");
+  });
+});
+
+// Enumeration seam for a future `soj gc` retention sweep. It must see BOTH
+// directions of breakage, because only one of them is now structurally
+// possible for a synthesized rewind.
+describe("listRewindSidecars", () => {
+  it("pairs a synthesized transcript with its sidecar (happy path)", async () => {
+    const plan = planFixture();
+    await executeRewind(plan, fixtureRaw.split("\n"));
+
+    const entries = await listRewindSidecars(projectsSubdir);
+    expect(entries).toHaveLength(1);
+    expect(entries[0].status).toBe("paired");
+    expect(entries[0].transcriptPath).toBe(plan.transcriptPath);
+    expect(entries[0].sidecarPath).toBe(rewindSidecarPathFor(plan.transcriptPath!));
+    expect(entries[0].sidecar).not.toBeNull();
+    expect(entries[0].sidecar!.originSessionId).toBe("session-abc");
+    expect(entries[0].sidecar!.originNodeId).toBe(TIP_TARGET);
+    expect(entries[0].sidecar!.lineUuids).toHaveLength(5);
+  });
+
+  it("returns [] for a directory that does not exist (fails soft, never throws)", async () => {
+    await expect(
+      listRewindSidecars(path.join(projectsSubdir, "no-such-dir")),
+    ).resolves.toEqual([]);
+  });
+
+  it("reports an orphan sidecar (the only residue the write order can leave)", async () => {
+    const sidecarPath = path.join(projectsSubdir, "abc.sojourn-rewind.json");
+    await writeFile(
+      sidecarPath,
+      JSON.stringify({ originSessionId: "s", originNodeId: "n", lineUuids: ["u1"] }),
+      "utf8",
+    );
+    const entries = await listRewindSidecars(projectsSubdir);
+    expect(entries).toHaveLength(1);
+    expect(entries[0].status).toBe("orphan_sidecar");
+    expect(entries[0].transcriptPath).toBe(path.join(projectsSubdir, "abc.jsonl"));
+    expect(entries[0].sidecar!.originNodeId).toBe("n");
+  });
+
+  it("reports the reverse case: a .jsonl with no sibling sidecar", async () => {
+    // Impossible for a SYNTHESIZED transcript (the sidecar is renamed into
+    // place first) — but the ordinary shape of every native Claude session,
+    // so a gc sweep must be able to see it and must not treat it as garbage.
+    await writeFile(path.join(projectsSubdir, "native.jsonl"), "{}\n", "utf8");
+    const entries = await listRewindSidecars(projectsSubdir);
+    expect(entries).toHaveLength(1);
+    expect(entries[0].status).toBe("orphan_transcript");
+    expect(entries[0].sidecar).toBeNull();
+    expect(entries[0].sidecarPath).toBe(
+      path.join(projectsSubdir, "native.sojourn-rewind.json"),
+    );
+  });
+
+  it("fails soft on malformed sidecar JSON and on a wrong-shaped sidecar", async () => {
+    await writeFile(path.join(projectsSubdir, "bad.sojourn-rewind.json"), "{not json", "utf8");
+    await writeFile(path.join(projectsSubdir, "bad.jsonl"), "{}\n", "utf8");
+    // Right JSON, wrong shape (lineUuids not an array of strings).
+    await writeFile(
+      path.join(projectsSubdir, "shape.sojourn-rewind.json"),
+      JSON.stringify({ originSessionId: "s", originNodeId: "n", lineUuids: [1, 2] }),
+      "utf8",
+    );
+
+    const entries = await listRewindSidecars(projectsSubdir);
+    expect(entries.map((e) => e.status)).toEqual(["unreadable_sidecar", "unreadable_sidecar"]);
+    for (const e of entries) expect(e.sidecar).toBeNull();
+  });
+
+  it("enumerates a mixed directory deterministically, sorted by transcript path", async () => {
+    const plan = planFixture();
+    await executeRewind(plan, fixtureRaw.split("\n"));
+    await writeFile(path.join(projectsSubdir, "aaa.jsonl"), "{}\n", "utf8");
+    await writeFile(
+      path.join(projectsSubdir, "zzz.sojourn-rewind.json"),
+      JSON.stringify({ originSessionId: "s", originNodeId: "n", lineUuids: [] }),
+      "utf8",
+    );
+
+    const entries = await listRewindSidecars(projectsSubdir);
+    const sorted = [...entries].sort((a, b) => a.transcriptPath.localeCompare(b.transcriptPath));
+    expect(entries.map((e) => e.transcriptPath)).toEqual(sorted.map((e) => e.transcriptPath));
+    expect(entries.find((e) => e.transcriptPath.endsWith("aaa.jsonl"))!.status).toBe(
+      "orphan_transcript",
+    );
+    expect(entries.find((e) => e.transcriptPath.endsWith("zzz.jsonl"))!.status).toBe(
+      "orphan_sidecar",
+    );
+    expect(entries.find((e) => e.transcriptPath === plan.transcriptPath)!.status).toBe("paired");
   });
 });

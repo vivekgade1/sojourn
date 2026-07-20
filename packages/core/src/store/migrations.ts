@@ -105,11 +105,26 @@ const V3_MIGRATION: Migration = {
 };
 
 /**
+ * v4: adds `nodes.merged_from` — the combine-provenance edge. A combine
+ * node is parented (`parent_id`) to node A and records node B here. This
+ * is METADATA, not a graph edge: the graph remains a tree and no traversal
+ * follows `merged_from` (mirroring how `rewind_of` and `forked_from` are
+ * recorded but never walked).
+ */
+const V4_MIGRATION: Migration = {
+  version: 4,
+  description: "add nodes.merged_from (combine second-ancestor provenance edge)",
+  up(db) {
+    db.exec(`ALTER TABLE nodes ADD COLUMN merged_from TEXT`);
+  },
+};
+
+/**
  * Ordered migration list. Keep ascending by `version` with no gaps or
  * duplicates — `runMigrations` sorts defensively but does not validate
  * contiguity.
  */
-export const MIGRATIONS: readonly Migration[] = [V2_MIGRATION, V3_MIGRATION];
+export const MIGRATIONS: readonly Migration[] = [V2_MIGRATION, V3_MIGRATION, V4_MIGRATION];
 
 function currentVersion(db: BetterSqlite3.Database): number {
   return db.pragma("user_version", { simple: true }) as number;

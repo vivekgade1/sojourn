@@ -64,7 +64,22 @@ export interface ChronoNode {
   content: unknown;
   flags?: StoredFlag[];
   annotations?: Annotation[];
-  meta: { nativeUuid: string; forkedFrom?: string; rewindOf?: string };
+  meta: {
+    nativeUuid: string;
+    forkedFrom?: string;
+    rewindOf?: string;
+    /**
+     * PROVENANCE ONLY — the second ancestor of a combine node.
+     *
+     * `parentId` stays a single nullable string and the graph stays a TREE:
+     * a combine node is parented to node A in the normal way, and this
+     * field records that node B's file state was merged in as well. Nothing
+     * in the graph walks `mergedFrom` as an edge — `findEffectiveTree`,
+     * `collectPins`, rewind's ancestor walk and the web layout all remain
+     * strictly `parentId`-based.
+     */
+    mergedFrom?: string;
+  };
 }
 
 export interface Project {
@@ -142,6 +157,50 @@ export interface HarvestResult {
   safetySnapshotRef: string;
   patchPath: string | null;
   mergeNodeId: string | null;
+}
+
+/** Per-file outcome of combining node A's and node B's file states against
+ * their nearest common ancestor. Same vocabulary as `HarvestPreflight.files`
+ * so the two merges read identically to a consumer. */
+export interface CombineFileStatus {
+  path: string;
+  status: "clean" | "conflict" | "identical";
+  /** true when this conflict can never take text conflict markers (binary
+   * content on either side) — even under `allowConflicts` it is reported and
+   * node A's content is kept verbatim. */
+  unmarkable?: boolean;
+}
+
+export interface CombinePreflight {
+  nodeIdA: string;
+  nodeIdB: string;
+  /** node whose effective tree is the merge base (nearest common ancestor) */
+  baseNodeId: string;
+  baseTree: string;
+  treeA: string;
+  treeB: string;
+  files: CombineFileStatus[];
+  warnings: string[];
+}
+
+export interface CombineResult {
+  worktreePath: string;
+  nodeIdA: string;
+  nodeIdB: string;
+  baseNodeId: string;
+  baseTree: string;
+  treeA: string;
+  treeB: string;
+  /** paths where B's side was merged in cleanly */
+  applied: string[];
+  /** paths written WITH conflict markers (allowConflicts mode only) */
+  conflicted: string[];
+  /** conflicts that could not take markers — A's content kept as-is */
+  unmarkable: string[];
+  skippedIdentical: string[];
+  /** id of the inserted combine checkpoint node, or null if not recorded */
+  combineNodeId: string | null;
+  warnings: string[];
 }
 
 export interface RewindPlan {

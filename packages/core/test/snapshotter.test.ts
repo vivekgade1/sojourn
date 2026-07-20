@@ -3,7 +3,7 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { ShadowSnapshotter } from "../src/snapshot/index.js";
+import { ShadowSnapshotter, SojournSnapshotError } from "../src/snapshot/index.js";
 import { runGit } from "../src/snapshot/git.js";
 
 describe("ShadowSnapshotter", () => {
@@ -61,6 +61,8 @@ describe("ShadowSnapshotter", () => {
       ".ssh/",
       "*.secret",
       "*.pfx",
+      ".sojourn-restore.json",
+      ".sojourn-harvest.patch",
     ]) {
       expect(excludeContents).toContain(entry);
     }
@@ -105,6 +107,76 @@ describe("ShadowSnapshotter", () => {
     ]) {
       expect(files).not.toContain(secretPath);
     }
+  });
+
+  it("never captures sojourn's own restore/harvest artifacts, at the root or nested in a restore worktree", async () => {
+    // Restoring a worktree-session node materializes a .sojourn-harvest.patch
+    // that is STALE the moment the working tree moves on; snapshotting it
+    // would let a user `git apply` it believing it fresh. Every real consumer
+    // reads these off the live filesystem, never out of a snapshot.
+    await fsp.writeFile(
+      path.join(projectRoot, ".sojourn-restore.json"),
+      '{"nodeId":"claude:abc"}',
+    );
+    await fsp.writeFile(
+      path.join(projectRoot, ".sojourn-harvest.patch"),
+      "diff --git a/x b/x\n",
+    );
+    // Nested too — the entries are bare basenames, NOT "/"-anchored, so a
+    // restore worktree checked out under the project root is covered.
+    await fsp.mkdir(path.join(projectRoot, "worktrees", "claude-node-1"), {
+      recursive: true,
+    });
+    await fsp.writeFile(
+      path.join(projectRoot, "worktrees", "claude-node-1", ".sojourn-restore.json"),
+      '{"nodeId":"claude:def"}',
+    );
+    await fsp.writeFile(
+      path.join(projectRoot, "worktrees", "claude-node-1", ".sojourn-harvest.patch"),
+      "diff --git a/y b/y\n",
+    );
+    await fsp.writeFile(path.join(projectRoot, "real.txt"), "tracked");
+
+    const tree = await snapshotter.snapshot();
+    const files = await snapshotter.listFiles(tree);
+
+    expect(files).toContain("real.txt");
+    for (const artifact of [
+      ".sojourn-restore.json",
+      ".sojourn-harvest.patch",
+      "worktrees/claude-node-1/.sojourn-restore.json",
+      "worktrees/claude-node-1/.sojourn-harvest.patch",
+    ]) {
+      expect(files).not.toContain(artifact);
+    }
+  });
+
+  it("init() sweeps the orphaned pre-upgrade 'sojourn-index' while leaving every live index file alone", async () => {
+    // Pre-C1 shadow dirs carry a bare `sojourn-index` that nothing references
+    // anymore. The predicate must be EXACT-MATCH: a `sojourn-index*` glob
+    // would also delete the live per-root indices mid-snapshot.
+    await fsp.writeFile(path.join(shadowDir, "sojourn-index"), "legacy");
+    await fsp.writeFile(path.join(shadowDir, "sojourn-index-deadbeef"), "live per-root");
+    await fsp.writeFile(path.join(shadowDir, "safety-index-0123456789abcdef"), "live temp");
+    await fsp.writeFile(path.join(shadowDir, "sojourn-gc-index"), "live gc");
+
+    await snapshotter.init();
+
+    expect(fs.existsSync(path.join(shadowDir, "sojourn-index"))).toBe(false);
+    expect(fs.existsSync(path.join(shadowDir, "sojourn-index-deadbeef"))).toBe(true);
+    expect(fs.existsSync(path.join(shadowDir, "safety-index-0123456789abcdef"))).toBe(true);
+    expect(fs.existsSync(path.join(shadowDir, "sojourn-gc-index"))).toBe(true);
+
+    // Idempotent: a second init() on a shadow dir with no legacy index is a
+    // no-op, not a failure.
+    await snapshotter.init();
+    expect(fs.existsSync(path.join(shadowDir, "sojourn-index"))).toBe(false);
+
+    // And snapshotting still works afterwards (the live index is intact).
+    await fsp.writeFile(path.join(projectRoot, "a.txt"), "after-sweep");
+    expect(await snapshotter.readFile(await snapshotter.snapshot(), "a.txt")).toBe(
+      "after-sweep",
+    );
   });
 
   it("produces different tree hashes when file contents change", async () => {
@@ -353,6 +425,51 @@ describe("ShadowSnapshotter", () => {
       expect(strayIndexes).toHaveLength(0);
     } finally {
       fs.rmSync(dest, { recursive: true, force: true });
+    }
+  });
+
+  it("throws a typed SojournSnapshotError (code 'cas_exhausted', carrying the unrecorded tree) when the head CAS never lands", async () => {
+    await fsp.writeFile(path.join(projectRoot, "a.txt"), "never-recorded");
+
+    // Force EVERY update-ref to fail without shrinking MAX_HEAD_CAS_ATTEMPTS:
+    // git acquires refs/sojourn/head.lock with O_CREAT|O_EXCL, so a
+    // pre-existing lock file makes the ref write fail deterministically on
+    // every attempt — exactly the shape of the real race (head kept moving),
+    // and rev-parse still works so each retry re-reads and re-parents.
+    await fsp.mkdir(path.join(shadowDir, "refs", "sojourn"), { recursive: true });
+    await fsp.writeFile(path.join(shadowDir, "refs", "sojourn", "head.lock"), "");
+
+    try {
+      const err = await snapshotter.snapshot().catch((e: unknown) => e);
+
+      // Typed, so consumers can switch on `code` instead of substring-matching
+      // the message — and still a real Error subclass, so generic catch sites
+      // (daemon ingest's runSerialized) keep working unchanged.
+      expect(err).toBeInstanceOf(SojournSnapshotError);
+      expect(err).toBeInstanceOf(Error);
+      const snapErr = err as SojournSnapshotError;
+      expect(snapErr.name).toBe("SojournSnapshotError");
+      expect(snapErr.code).toBe("cas_exhausted");
+      expect(snapErr.attempts).toBe(5);
+
+      // It names the tree that WAS computed (and is a real object in the
+      // shadow repo) but never became reachable from refs/sojourn/head.
+      expect(snapErr.treeHash).toMatch(/^[0-9a-f]{40}$/);
+      expect(await snapshotter.hasTree(snapErr.treeHash)).toBe(true);
+      expect(snapErr.message).toBe(
+        `snapshot: refs/sojourn/head kept moving; gave up after 5 CAS attempts (tree ${snapErr.treeHash} was NOT recorded)`,
+      );
+
+      // ...genuinely NOT recorded: the head ref never came into existence.
+      await expect(
+        runGit(["rev-parse", "--verify", "refs/sojourn/head"], {
+          GIT_DIR: shadowDir,
+          GIT_WORK_TREE: projectRoot,
+          GIT_INDEX_FILE: path.join(shadowDir, "verify-index"),
+        }),
+      ).rejects.toThrow();
+    } finally {
+      await fsp.rm(path.join(shadowDir, "refs", "sojourn", "head.lock"), { force: true });
     }
   });
 

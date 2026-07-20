@@ -10,9 +10,14 @@ import type {
   StoredFlag,
   RestorePreflight,
   RestoreResult,
+  HarvestPreflight,
+  HarvestResult,
+  CombinePreflight,
+  CombineResult,
   SearchHit,
   SessionHealth,
 } from "@sojourn/core";
+import { claudeProjectsDir, listRewindSidecars } from "@sojourn/adapter-claude";
 import { DaemonClient, encodeNodeId } from "./client.js";
 import { activeFlags, excerpt, filterDecisionHits, gistOf } from "./searchFormat.js";
 import {
@@ -430,6 +435,254 @@ export function buildProgram(deps: ProgramDeps): Command {
     );
 
   program
+    .command("harvest [worktreePath]")
+    .description(
+      "carry a restored worktree's changes back to the mainline (dry preflight by default). " +
+        "Run it from inside the restored worktree, or pass its path.",
+    )
+    .option("--yes", "skip the preflight and perform the harvest", false)
+    .option("--mode <mode>", "apply|patch — write files directly, or emit a patch file", "apply")
+    .option(
+      "--allow-conflicts",
+      "write conflict markers into conflicting files instead of aborting (apply mode only)",
+      false,
+    )
+    .action(
+      withDaemonErrorHandling(
+        deps,
+        async (
+          worktreeArg: string | undefined,
+          opts: { yes: boolean; mode: string; allowConflicts: boolean },
+        ) => {
+          if (opts.mode !== "apply" && opts.mode !== "patch") {
+            deps.stderr(`error: --mode must be one of apply|patch (got "${opts.mode}")`);
+            deps.exit(1);
+            return;
+          }
+          // The daemon SILENTLY ignores allowConflicts in patch mode
+          // (harvestEngine.ts). Refusing here is the honest surface: a flag
+          // that looks accepted but does nothing is a lie to the user.
+          if (opts.allowConflicts && opts.mode === "patch") {
+            deps.stderr(
+              "error: --allow-conflicts applies to --mode apply only (a patch never writes conflict markers into the mainline).",
+            );
+            deps.exit(1);
+            return;
+          }
+          // Resolve BEFORE sending: the daemon reads .sojourn-restore.json
+          // from this literal path, so a relative path would break it.
+          const worktreePath = path.resolve(deps.cwd, worktreeArg ?? ".");
+
+          if (!opts.yes) {
+            const res = await client.post<HarvestPreflight>(
+              "/api/worktrees/harvest/preflight",
+              { worktreePath },
+            );
+            if (res.status !== 200) {
+              reportHarvestError(deps, res.status, res.body);
+              return;
+            }
+            const preflight = res.body;
+            deps.stdout(`Worktree: ${preflight.worktreePath}`);
+            deps.stdout(`Origin node: ${preflight.originNodeId}`);
+            // `mainlineDirty` means the MAINLINE MOVED on a path this harvest
+            // touches — NOT "your whole tree is dirty". Label it honestly.
+            deps.stdout(
+              preflight.mainlineDirty
+                ? "Mainline: dirty (moved on a path this harvest touches)"
+                : "Mainline: clean (unchanged on the paths this harvest touches)",
+            );
+            const files = [...preflight.files].sort(
+              (a, b) => harvestStatusRank(a.status) - harvestStatusRank(b.status),
+            );
+            if (files.length > 0) {
+              deps.stdout(renderTable(["status", "file"], files.map((f) => [f.status, f.path])));
+            }
+            const counts = { clean: 0, conflict: 0, identical: 0 };
+            for (const f of preflight.files) counts[f.status]++;
+            deps.stdout(
+              `${counts.clean} clean, ${counts.conflict} conflict, ${counts.identical} identical`,
+            );
+            if (preflight.warnings.length > 0) {
+              deps.stdout("Preflight warnings:");
+              for (const warning of preflight.warnings) deps.stdout(`  - ${warning}`);
+            }
+            deps.stdout("Re-run with --yes to confirm the harvest.");
+            deps.exit(1);
+            return;
+          }
+
+          const res = await client.post<HarvestResult & { warnings: string[] }>(
+            "/api/worktrees/harvest",
+            {
+              worktreePath,
+              mode: opts.mode,
+              // The daemon tests `body.allowConflicts === true` — must be a
+              // real boolean, never a string.
+              allowConflicts: opts.allowConflicts === true,
+            },
+          );
+          if (res.status !== 200) {
+            reportHarvestError(deps, res.status, res.body);
+            return;
+          }
+          const result = res.body;
+          // Patch mode NEVER populates applied/conflicted/skippedIdentical —
+          // printing "0 files applied" for a successful patch run is wrong.
+          if (result.patchPath !== null) {
+            deps.stdout(`Patch: ${result.patchPath}`);
+            deps.stdout(`Safety snapshot: ${result.safetySnapshotRef}`);
+          } else {
+            deps.stdout(`Applied (${result.applied.length}):`);
+            for (const file of result.applied) deps.stdout(`  ${file}`);
+            if (result.conflicted.length > 0) {
+              deps.stdout(`Conflicted (${result.conflicted.length}):`);
+              for (const file of result.conflicted) deps.stdout(`  ${file}`);
+            }
+            deps.stdout(`Skipped (identical, ${result.skippedIdentical.length})`);
+            deps.stdout(`Safety snapshot: ${result.safetySnapshotRef}`);
+          }
+          if (result.mergeNodeId !== null) {
+            deps.stdout(`Merge node: ${result.mergeNodeId}`);
+          }
+          for (const warning of result.warnings ?? []) {
+            deps.stdout(`Warning: ${warning}`);
+          }
+        },
+      ),
+    );
+
+  program
+    .command("combine <nodeIdA> <nodeIdB>")
+    .description(
+      "merge the FILE STATES of two nodes (usually from different sessions) into one new " +
+        "worktree, recording both ancestors (dry preflight by default). " +
+        "NO TRANSCRIPT IS SYNTHESIZED — combine emits files only; start a fresh session " +
+        "in the resulting worktree.",
+    )
+    .option("--yes", "skip the preflight and perform the combine", false)
+    .option(
+      "--allow-conflicts",
+      "write conflict markers into conflicting files instead of aborting",
+      false,
+    )
+    .action(
+      withDaemonErrorHandling(
+        deps,
+        async (
+          nodeIdA: string,
+          nodeIdB: string,
+          opts: { yes: boolean; allowConflicts: boolean },
+        ) => {
+          // Cheap local guard so the obvious mistake costs zero round-trips.
+          // (The daemon rejects it too, with the same 400.)
+          if (nodeIdA === nodeIdB) {
+            deps.stderr(
+              `error: cannot combine a node with itself — nodeIdA and nodeIdB are both ${nodeIdA}`,
+            );
+            deps.exit(1);
+            return;
+          }
+
+          // Ids travel in the BODY of a STATIC path — there is no `:id`
+          // segment here, so encodeNodeId must NOT be applied.
+          if (!opts.yes) {
+            // combinePreflight is genuinely pure: it snapshots nothing and
+            // writes nothing, in the project or the shadow repo.
+            const res = await client.post<CombinePreflight>("/api/nodes/combine/preflight", {
+              nodeIdA,
+              nodeIdB,
+            });
+            if (res.status !== 200) {
+              reportCombineError(deps, res.body);
+              return;
+            }
+            const preflight = res.body;
+            deps.stdout(`Node A: ${preflight.nodeIdA}`);
+            deps.stdout(`Node B: ${preflight.nodeIdB}`);
+            deps.stdout(`Merge base: ${preflight.baseNodeId}`);
+            deps.stdout(`Trees: base ${preflight.baseTree} | A ${preflight.treeA} | B ${preflight.treeB}`);
+            const files = [...preflight.files].sort(
+              (a, b) => harvestStatusRank(a.status) - harvestStatusRank(b.status),
+            );
+            if (files.length > 0) {
+              deps.stdout(
+                renderTable(
+                  ["status", "file"],
+                  files.map((f) => [
+                    // An unmarkable conflict can never take conflict markers —
+                    // even under --allow-conflicts A's content is kept as-is.
+                    // Labelling it "conflict" alone would overpromise.
+                    f.unmarkable === true ? `${f.status} (unmarkable)` : f.status,
+                    f.path,
+                  ]),
+                ),
+              );
+            }
+            const counts = { clean: 0, conflict: 0, identical: 0 };
+            for (const f of preflight.files) counts[f.status]++;
+            deps.stdout(
+              `${counts.clean} clean, ${counts.conflict} conflict, ${counts.identical} identical`,
+            );
+            // `warnings` is never empty — it always carries the
+            // "no transcript is synthesized" notice. Echo it verbatim.
+            if (preflight.warnings.length > 0) {
+              deps.stdout("Preflight warnings:");
+              for (const warning of preflight.warnings) deps.stdout(`  - ${warning}`);
+            }
+            deps.stdout("Re-run with --yes to confirm the combine.");
+            deps.exit(1);
+            return;
+          }
+
+          const res = await client.post<CombineResult>("/api/nodes/combine", {
+            nodeIdA,
+            nodeIdB,
+            // The daemon tests `body.allowConflicts === true` — must be a
+            // real boolean, never a string.
+            allowConflicts: opts.allowConflicts === true,
+          });
+          if (res.status !== 200) {
+            reportCombineError(deps, res.body);
+            return;
+          }
+          const result = res.body;
+          // The worktree IS the product of a combine — lead with it.
+          deps.stdout(`Worktree: ${result.worktreePath}`);
+          deps.stdout(`Merge base: ${result.baseNodeId}`);
+          deps.stdout(`Applied (${result.applied.length}):`);
+          for (const file of result.applied) deps.stdout(`  ${file}`);
+          // `unmarkable` is a SUBSET of `conflicted` (the engine pushes those
+          // paths into both — conflicted means "conflicted", not "marked").
+          // Subtract before printing, or a binary conflict would be listed
+          // twice, the first time under a label that is false for it: nothing
+          // was marked in that file, A's content was kept verbatim.
+          const unmarkableSet = new Set(result.unmarkable);
+          const marked = result.conflicted.filter((p) => !unmarkableSet.has(p));
+          if (marked.length > 0) {
+            deps.stdout(`Conflicted — written with conflict markers (${marked.length}):`);
+            for (const file of marked) deps.stdout(`  ${file}`);
+          }
+          if (result.unmarkable.length > 0) {
+            deps.stdout(
+              `Unmarkable — conflicts that could not take markers, A's content kept (${result.unmarkable.length}):`,
+            );
+            for (const file of result.unmarkable) deps.stdout(`  ${file}`);
+          }
+          deps.stdout(`Skipped (identical, ${result.skippedIdentical.length})`);
+          // null is a legitimate outcome (no store / zero files written /
+          // unknown origin node), NOT an error.
+          if (result.combineNodeId !== null) {
+            deps.stdout(`Combine node: ${result.combineNodeId}`);
+          }
+          for (const warning of result.warnings ?? []) {
+            deps.stdout(`Warning: ${warning}`);
+          }
+        },
+      ),
+    );
+
+  program
     .command("gc")
     .description(
       "prune old snapshot history from a project's shadow repo (dry-run by default). " +
@@ -490,6 +743,14 @@ export function buildProgram(deps: ProgramDeps): Command {
             { keepDays, pins, dryRun: !opts.run, archiveDir: opts.archiveDir },
           );
 
+          // Synthesized rewind transcripts get the same age + pin + --run
+          // gating as the shadow prune. Never runs ahead of it, and on a dry
+          // run performs no filesystem writes at all.
+          const sweep = await sweepSynthesizedTranscripts(store, projectId, {
+            keepDays,
+            dryRun: !opts.run,
+          });
+
           deps.stdout(`project: ${project.name} (${project.id})`);
           deps.stdout(`keep window: ${keepDays} day(s)   pinned trees: ${pins.size}`);
           deps.stdout(
@@ -502,7 +763,18 @@ export function buildProgram(deps: ProgramDeps): Command {
             ),
           );
           deps.stdout(
-            `reclaim${result.dryRun ? "able (estimate)" : "ed"}: ${formatBytes(result.reclaimedBytes)}`,
+            renderTable(
+              ["", "transcripts"],
+              [
+                ["kept", String(sweep.keptPinned + sweep.keptYoung)],
+                ["swept", String(sweep.sweptPairs + sweep.sweptOrphanSidecars)],
+              ],
+            ),
+          );
+          deps.stdout(
+            `reclaim${result.dryRun ? "able (estimate)" : "ed"}: ${formatBytes(result.reclaimedBytes)}` +
+              ` (snapshots) + ${formatBytes(sweep.bytes)} (synthesized transcripts:` +
+              ` ${sweep.sweptPairs} pair(s), ${sweep.sweptOrphanSidecars} orphan sidecar(s))`,
           );
           if (result.archived) {
             deps.stdout(`archived pruned history to: ${result.archived}`);
@@ -788,6 +1060,145 @@ function withDaemonErrorHandling(
   };
 }
 
+/** Preflight table order: the rows that need a decision come first. */
+function harvestStatusRank(status: "clean" | "conflict" | "identical"): number {
+  return status === "conflict" ? 0 : status === "clean" ? 1 : 2;
+}
+
+/** Shape of a harvest route's typed error body (daemon `handleHarvestError`). */
+interface HarvestErrorBody {
+  error?: unknown;
+  /** absent on plain validation 400s (bad/missing worktreePath, bad mode) */
+  code?: unknown;
+  files?: unknown;
+  /** present ONLY for partial_apply / mainline_drift (both 500s) */
+  partial?: {
+    applied?: unknown;
+    conflicted?: unknown;
+    remaining?: unknown;
+    safetySnapshotRef?: unknown;
+  };
+}
+
+/**
+ * Harvest's error surface, including the one exit code that matters most.
+ *
+ * A `partial` payload (only `partial_apply` / `mainline_drift`) means the
+ * MAINLINE WAS PARTIALLY WRITTEN — categorically different from a clean
+ * pre-write refusal. It exits **2** and dumps the full partial state, so a
+ * script can never mistake "we stopped before touching anything" (exit 1)
+ * for "your working tree is now half-harvested" (exit 2).
+ */
+function reportHarvestError(deps: ProgramDeps, _status: number, body: unknown): void {
+  deps.stderr(`error: ${describeError(body)}`);
+
+  const typed: HarvestErrorBody =
+    body && typeof body === "object" ? (body as HarvestErrorBody) : {};
+  const code = typeof typed.code === "string" ? typed.code : null;
+
+  if (typed.partial && typeof typed.partial === "object") {
+    const p = typed.partial;
+    deps.stderr("PARTIAL HARVEST — the mainline was modified before this failure.");
+    deps.stderr(`  applied (${strList(p.applied).length}):`);
+    for (const f of strList(p.applied)) deps.stderr(`    ${f}`);
+    deps.stderr(`  conflicted (${strList(p.conflicted).length}):`);
+    for (const f of strList(p.conflicted)) deps.stderr(`    ${f}`);
+    deps.stderr(`  remaining (${strList(p.remaining).length}):`);
+    for (const f of strList(p.remaining)) deps.stderr(`    ${f}`);
+    deps.stderr(
+      `  safety snapshot: ${typeof p.safetySnapshotRef === "string" ? p.safetySnapshotRef : "(none)"}`,
+    );
+    deps.stderr(
+      "  Inspect the working tree before re-running — the safety snapshot above is the pre-harvest state.",
+    );
+    deps.exit(2);
+    return;
+  }
+
+  const files = strList(typed.files);
+  if (files.length > 0) {
+    deps.stderr("files:");
+    for (const f of files) deps.stderr(`  ${f}`);
+  }
+  if (code === "conflicts") {
+    deps.stderr(
+      "Re-run with --allow-conflicts to write conflict markers, or --mode patch.",
+    );
+  } else if (code === "read_failed") {
+    deps.stderr(
+      "The worktree's files could not be read — nothing was written to the mainline. Check permissions and that the worktree still exists.",
+    );
+  }
+  deps.exit(1);
+}
+
+/** Shape of a combine route's typed error body (daemon `handleCombineError`).
+ * `code` is absent on the plain validation 400s (missing/blank id, A === B). */
+interface CombineErrorBody {
+  error?: unknown;
+  code?: unknown;
+  files?: unknown;
+  /** present ONLY for `write_failed` (the single 500) */
+  partial?: {
+    worktreePath?: unknown;
+    applied?: unknown;
+    conflicted?: unknown;
+    remaining?: unknown;
+  };
+}
+
+/**
+ * Combine's error surface.
+ *
+ * EVERY code except `write_failed` is abort-clean — provably zero bytes
+ * written anywhere — and exits 1. `write_failed` (the only 500) is the sole
+ * code that leaves a half-built worktree on disk, and that worktree is
+ * deliberately NOT deleted: it holds real merged content, so removing it
+ * would turn combine into a source of data loss. It exits **2** and prints
+ * where the worktree is, so a script can never confuse the two.
+ */
+function reportCombineError(deps: ProgramDeps, body: unknown): void {
+  deps.stderr(`error: ${describeError(body)}`);
+
+  const typed: CombineErrorBody = body && typeof body === "object" ? (body as CombineErrorBody) : {};
+  // Never assume `code` is present — plain validation 400s omit it entirely.
+  const code = typeof typed.code === "string" ? typed.code : null;
+
+  const files = strList(typed.files);
+  if (files.length > 0) {
+    deps.stderr("files:");
+    for (const f of files) deps.stderr(`  ${f}`);
+  }
+
+  if (typed.partial && typeof typed.partial === "object") {
+    const p = typed.partial;
+    deps.stderr("PARTIAL COMBINE — a half-built worktree was left on disk (NOT deleted:");
+    deps.stderr("  it holds real merged content, so removing it would lose your work).");
+    deps.stderr(
+      `  worktree: ${typeof p.worktreePath === "string" ? p.worktreePath : "(unknown)"}`,
+    );
+    deps.stderr(`  applied (${strList(p.applied).length}):`);
+    for (const f of strList(p.applied)) deps.stderr(`    ${f}`);
+    deps.stderr(`  conflicted (${strList(p.conflicted).length}):`);
+    for (const f of strList(p.conflicted)) deps.stderr(`    ${f}`);
+    deps.stderr(`  remaining (${strList(p.remaining).length}):`);
+    for (const f of strList(p.remaining)) deps.stderr(`    ${f}`);
+    deps.stderr("  Inspect that worktree before re-running — nothing else was touched.");
+    deps.exit(2);
+    return;
+  }
+
+  if (code === "conflicts") {
+    deps.stderr("Re-run with --allow-conflicts to write conflict markers.");
+  }
+  // Everything reaching here wrote nothing at all.
+  deps.exit(1);
+}
+
+function strList(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((v): v is string => typeof v === "string") : [];
+}
+
 function describeError(body: unknown): string {
   if (body && typeof body === "object" && "error" in body) {
     return String((body as { error: unknown }).error);
@@ -859,6 +1270,161 @@ function scanWorktreeManifestPins(worktreesRoot: string): Set<string> {
     }
   }
   return pins;
+}
+
+// ——— synthesized-transcript retention sweep (review Minor 6) ———————————
+//
+// `soj gc` governed only shadow repos, so the synthesized rewind transcripts
+// `executeRewind` writes into ~/.claude/projects accumulated forever. This
+// sweep gives them the SAME retention story as snapshots: age-gated by
+// --days, pin-gated, and strictly behind --run.
+//
+// It lives in the CLI, not core, because packages/core cannot import
+// packages/adapter-claude and core/src/snapshot/gc.ts is deliberately
+// filesystem-I/O-free — the same division of labor as
+// `scanWorktreeManifestPins` above: the CLI owns the filesystem scan, core
+// stays pure.
+
+/** Node kinds core's `collectPins` treats as pinned waypoints (gc.ts). */
+const PINNED_NODE_KINDS = new Set(["decision", "assumption", "checkpoint"]);
+
+export interface TranscriptSweepResult {
+  /** transcript+sidecar pairs eligible (dry run) or actually deleted */
+  sweptPairs: number;
+  /** inert sidecars with no transcript, eligible or deleted */
+  sweptOrphanSidecars: number;
+  /** pairs skipped because their origin node is a live/pinned waypoint */
+  keptPinned: number;
+  /** pairs skipped because they are younger than the keep window */
+  keptYoung: number;
+  bytes: number;
+}
+
+/**
+ * Sweeps synthesized rewind transcripts belonging to `projectId`.
+ *
+ * SAFETY — the single most important invariant here: `orphan_transcript` is
+ * the ORDINARY shape of every NATIVE Claude session (a `.jsonl` with no
+ * sidecar). Deleting those would destroy the user's real session history.
+ * Only `paired` (synthesized transcript + its sidecar) and `orphan_sidecar`
+ * (inert residue) are EVER candidates; `unreadable_sidecar` is skipped too,
+ * since without a parsed sidecar we cannot prove the pair is ours.
+ */
+async function sweepSynthesizedTranscripts(
+  store: GraphStore,
+  projectId: string,
+  opts: { keepDays: number; dryRun: boolean; now?: number },
+): Promise<TranscriptSweepResult> {
+  const result: TranscriptSweepResult = {
+    sweptPairs: 0,
+    sweptOrphanSidecars: 0,
+    keptPinned: 0,
+    keptYoung: 0,
+    bytes: 0,
+  };
+
+  // Only sessions of THIS project may be swept. A synthesized transcript's
+  // sidecar records the ORIGIN session, which is what ties it to a project —
+  // the new session id is just the transcript's filename.
+  const ownSessionIds = new Set(store.getSessions(projectId).map((s) => s.id));
+  if (ownSessionIds.size === 0) return result;
+
+  // Nodes worth keeping the exact conversation for: the same predicate core's
+  // collectPins uses for snapshot trees, applied to transcripts.
+  const pinnedNodeIds = new Set<string>();
+  for (const node of store.getGraph(projectId)) {
+    if (PINNED_NODE_KINDS.has(node.kind) || (node.flags?.length ?? 0) > 0) {
+      pinnedNodeIds.add(node.id);
+    }
+  }
+
+  const cutoff = (opts.now ?? Date.now()) - opts.keepDays * 86400_000;
+
+  for (const subdir of listClaudeProjectSubdirs()) {
+    for (const entry of await listRewindSidecars(subdir)) {
+      // ────────────────────────────────────────────────────────────────
+      // THE GUARD. Anything not explicitly whitelisted here is untouchable,
+      // and `orphan_transcript` (every native session) can never reach the
+      // deletion code below.
+      if (entry.status !== "paired" && entry.status !== "orphan_sidecar") continue;
+      const sidecar = entry.sidecar;
+      if (sidecar === null) continue;
+      // ────────────────────────────────────────────────────────────────
+
+      if (!ownSessionIds.has(sidecar.originSessionId)) continue;
+
+      if (pinnedNodeIds.has(sidecar.originNodeId)) {
+        result.keptPinned++;
+        continue;
+      }
+
+      const isPair = entry.status === "paired";
+      // Age off the artifact that actually exists on disk.
+      const mtime = fileMtimeMs(isPair ? entry.transcriptPath : entry.sidecarPath);
+      if (mtime === null) continue;
+      if (mtime >= cutoff) {
+        result.keptYoung++;
+        continue;
+      }
+
+      const bytes =
+        fileSizeBytes(entry.sidecarPath) + (isPair ? fileSizeBytes(entry.transcriptPath) : 0);
+
+      if (!opts.dryRun) {
+        // SIDECAR FIRST, mirroring executeRewind's write invariant: a
+        // transcript without its sidecar is exactly the phantom-session
+        // hazard (review I3). If the second unlink fails we are left with an
+        // inert orphan_sidecar, which the next sweep cleans up — never a
+        // sidecar-less synthesized transcript.
+        if (!tryUnlink(entry.sidecarPath)) continue;
+        if (isPair) tryUnlink(entry.transcriptPath);
+      }
+
+      result.bytes += bytes;
+      if (isPair) result.sweptPairs++;
+      else result.sweptOrphanSidecars++;
+    }
+  }
+
+  return result;
+}
+
+/** Immediate subdirectories of ~/.claude/projects (one per encoded repo root). */
+function listClaudeProjectSubdirs(): string[] {
+  const root = claudeProjectsDir();
+  try {
+    return fs
+      .readdirSync(root, { withFileTypes: true })
+      .filter((e) => e.isDirectory())
+      .map((e) => path.join(root, e.name));
+  } catch {
+    return [];
+  }
+}
+
+function fileMtimeMs(file: string): number | null {
+  try {
+    return fs.statSync(file).mtimeMs;
+  } catch {
+    return null;
+  }
+}
+
+function fileSizeBytes(file: string): number {
+  try {
+    return fs.statSync(file).size;
+  } catch {
+    return 0;
+  }
+}
+
+function tryUnlink(file: string): boolean {
+  try {
+    fs.unlinkSync(file);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function renderTable(header: string[], rows: string[][]): string {

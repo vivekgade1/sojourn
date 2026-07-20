@@ -18,16 +18,27 @@ import { parseSessionJsonl } from "./parser.js";
  * we cannot faithfully reconstruct must never be fabricated.
  *
  * `executeRewind` performs the write. It only ever creates NEW files (never
- * mutates an existing transcript), writes atomically (tmp + rename), and
- * round-trip-validates the synthesized transcript through the same parser
- * that produced the graph — deleting the file and throwing if the projection
- * doesn't match the plan.
+ * mutates an existing transcript, and refusing — `transcript_exists` /
+ * `sidecar_exists` — rather than clobbering either member of the pair),
+ * writes atomically (tmp + rename), and round-trip-validates the synthesized
+ * transcript through the same parser that produced the graph — deleting BOTH
+ * files and throwing if the projection doesn't match the plan.
+ *
+ * Write ORDER is load-bearing: the provenance sidecar is written and renamed
+ * into place FIRST, the transcript second. The daemon's watcher only reacts
+ * to `.jsonl`, so by the time a transcript can be observed its sidecar is
+ * already durable. A crash in the window between the two renames leaves at
+ * worst an ORPHAN SIDECAR — inert (nothing ingests a `.json`) and reclaimable
+ * by a gc sweep via `listRewindSidecars` — instead of the far worse orphan
+ * TRANSCRIPT, which the watcher would ingest as a disconnected phantom
+ * session carrying false verified flags (V2 must-fix I3).
  */
 
 /** Stable machine-readable classification for a `SojournRewindError`. */
 export type SojournRewindErrorCode =
   | "plan_invalid"
   | "transcript_exists"
+  | "sidecar_exists"
   | "write_failed"
   | "validation_mismatch";
 
@@ -99,6 +110,124 @@ export function rewindSidecarPathFor(transcriptPath: string): string {
   return transcriptPath.replace(/\.jsonl$/, "") + ".sojourn-rewind.json";
 }
 
+const SIDECAR_SUFFIX = ".sojourn-rewind.json";
+
+/**
+ * How a `<sessionId>.jsonl` / `<sessionId>.sojourn-rewind.json` pair actually
+ * sits on disk:
+ *
+ * - `paired` — both present, sidecar parsed: a healthy synthesized rewind.
+ * - `orphan_sidecar` — sidecar present, transcript missing. This is the ONLY
+ *   residue a crash mid-`executeRewind` can leave now that the sidecar is
+ *   written first, and it is inert: nothing ingests a `.json`. It is exactly
+ *   what a `soj gc` retention sweep should reclaim.
+ * - `unreadable_sidecar` — a `*.sojourn-rewind.json` that could not be read or
+ *   did not parse to the `RewindSidecar` shape. Reported, never thrown on;
+ *   `sidecar` is null. A gc sweep should treat these conservatively (a
+ *   half-written file is not proof the transcript is unowned).
+ * - `orphan_transcript` — a `.jsonl` with no sibling sidecar. For a
+ *   SYNTHESIZED transcript this is expected to be IMPOSSIBLE, because the
+ *   sidecar is renamed into place before the transcript exists at all. In a
+ *   real projects dir it is therefore the ordinary case: every native Claude
+ *   Code session is an `orphan_transcript`. Callers MUST NOT read this status
+ *   as garbage — it means "not a rewind", not "broken".
+ */
+export type RewindSidecarPairStatus =
+  | "paired"
+  | "orphan_sidecar"
+  | "orphan_transcript"
+  | "unreadable_sidecar";
+
+/** One `<sessionId>` pair found by `listRewindSidecars`. */
+export interface RewindSidecarEntry {
+  /** The sibling transcript path, whether or not it exists on disk. */
+  transcriptPath: string;
+  /** The sibling sidecar path, whether or not it exists on disk. */
+  sidecarPath: string;
+  status: RewindSidecarPairStatus;
+  /** Parsed sidecar; null unless `status === "paired"` or `"orphan_sidecar"`. */
+  sidecar: RewindSidecar | null;
+}
+
+/** Structural validation — mirrors the daemon ingest's acceptance check. */
+function asRewindSidecar(value: unknown): RewindSidecar | null {
+  if (typeof value !== "object" || value === null) return null;
+  const rec = value as Record<string, unknown>;
+  if (typeof rec.originSessionId !== "string" || rec.originSessionId.length === 0) return null;
+  if (typeof rec.originNodeId !== "string" || rec.originNodeId.length === 0) return null;
+  if (!Array.isArray(rec.lineUuids)) return null;
+  if (!rec.lineUuids.every((u) => typeof u === "string")) return null;
+  return {
+    originSessionId: rec.originSessionId,
+    originNodeId: rec.originNodeId,
+    lineUuids: rec.lineUuids as string[],
+  };
+}
+
+/**
+ * Enumerates every rewind sidecar AND every transcript in a Claude projects
+ * subdirectory, pairing them by session id so a caller (the future `soj gc`
+ * retention sweep) can see both directions of breakage — see
+ * `RewindSidecarPairStatus` for what each direction means and which one is
+ * structurally impossible.
+ *
+ * Fails soft everywhere: a missing/unreadable directory yields `[]`, and an
+ * unreadable or malformed sidecar becomes an `unreadable_sidecar` entry rather
+ * than an exception. Results are sorted by `transcriptPath` for determinism.
+ */
+export async function listRewindSidecars(
+  projectsSubdir: string,
+): Promise<RewindSidecarEntry[]> {
+  let names: string[];
+  try {
+    names = await fs.readdir(projectsSubdir);
+  } catch {
+    return [];
+  }
+
+  const sidecarBases = new Set<string>();
+  const transcriptBases = new Set<string>();
+  for (const name of names) {
+    if (name.endsWith(SIDECAR_SUFFIX)) {
+      sidecarBases.add(name.slice(0, -SIDECAR_SUFFIX.length));
+    } else if (name.endsWith(".jsonl")) {
+      transcriptBases.add(name.slice(0, -".jsonl".length));
+    }
+  }
+
+  const entries: RewindSidecarEntry[] = [];
+  for (const base of new Set([...sidecarBases, ...transcriptBases])) {
+    const transcriptPath = path.join(projectsSubdir, `${base}.jsonl`);
+    const sidecarPath = path.join(projectsSubdir, `${base}${SIDECAR_SUFFIX}`);
+    const hasTranscript = transcriptBases.has(base);
+
+    if (!sidecarBases.has(base)) {
+      entries.push({ transcriptPath, sidecarPath, status: "orphan_transcript", sidecar: null });
+      continue;
+    }
+
+    let sidecar: RewindSidecar | null = null;
+    try {
+      sidecar = asRewindSidecar(JSON.parse(await fs.readFile(sidecarPath, "utf8")));
+    } catch {
+      sidecar = null;
+    }
+    if (sidecar === null) {
+      entries.push({ transcriptPath, sidecarPath, status: "unreadable_sidecar", sidecar: null });
+      continue;
+    }
+    entries.push({
+      transcriptPath,
+      sidecarPath,
+      status: hasTranscript ? "paired" : "orphan_sidecar",
+      sidecar,
+    });
+  }
+
+  entries.sort((a, b) => (a.transcriptPath < b.transcriptPath ? -1 : a.transcriptPath > b.transcriptPath ? 1 : 0));
+  return entries;
+}
+
 export interface PlanRewindInput {
   /** All known nodes for the session (or at least the target's ancestry). */
   nodes: ChronoNode[];
@@ -138,6 +267,61 @@ function refuse(sessionId: string, targetNodeId: string, reason: string): Claude
 interface ParsedRawLine {
   index: number;
   rec: Record<string, unknown>;
+}
+
+/** Every tool BLOCK id referenced by a record — both the `tool_use.id` that
+ * DEFINES a tool node and the `tool_result.tool_use_id` that REFERS to one.
+ * Collected together because they must be remapped through the same map or
+ * the tool_result -> tool_use parent edge is severed. */
+function toolIdsIn(rec: Record<string, unknown>): string[] {
+  const ids: string[] = [];
+  for (const block of contentBlocksOf(rec)) {
+    if (block.type === "tool_use" && typeof block.id === "string") {
+      ids.push(block.id);
+    } else if (block.type === "tool_result" && typeof block.tool_use_id === "string") {
+      ids.push(block.tool_use_id);
+    }
+  }
+  return ids;
+}
+
+/** A fresh tool block id. Keeps Claude's `toolu_` prefix so a synthesized
+ * transcript stays visually indistinguishable from a native one; the parser
+ * treats the id as an opaque key, so only uniqueness is load-bearing. */
+function freshToolId(): string {
+  return `toolu_${crypto.randomUUID().replace(/-/g, "")}`;
+}
+
+/** Returns a copy of `rec` with every tool block id replaced via `toolIdMap`.
+ * Deep-copies `message.content` (and each block) so the caller's records are
+ * never mutated — the rewrite path spreads records shallowly. Ids absent from
+ * the map are left alone. */
+function remapToolIds(
+  rec: Record<string, unknown>,
+  toolIdMap: Map<string, string>,
+): Record<string, unknown> {
+  const message = rec.message;
+  if (typeof message !== "object" || message === null) return rec;
+  const content = (message as Record<string, unknown>).content;
+  if (!Array.isArray(content)) return rec;
+
+  const remapped = content.map((block) => {
+    if (typeof block !== "object" || block === null) return block;
+    const b = block as Record<string, unknown>;
+    if (b.type === "tool_use" && typeof b.id === "string" && toolIdMap.has(b.id)) {
+      return { ...b, id: toolIdMap.get(b.id)! };
+    }
+    if (
+      b.type === "tool_result" &&
+      typeof b.tool_use_id === "string" &&
+      toolIdMap.has(b.tool_use_id)
+    ) {
+      return { ...b, tool_use_id: toolIdMap.get(b.tool_use_id)! };
+    }
+    return b;
+  });
+
+  return { ...rec, message: { ...(message as Record<string, unknown>), content: remapped } };
 }
 
 /** Best-effort JSON parse of each raw line; malformed lines are skipped
@@ -395,16 +579,54 @@ export function planRewind(input: PlanRewindInput): ClaudeRewindPlan {
  *   `rawLines` (`plan.lineUuids`); drift → `plan_invalid`, no file created.
  * - The original transcript is NEVER touched: this function only receives
  *   its lines and only ever writes `plan.transcriptPath` (+ a tmp sibling).
- * - Write is atomic: content goes to a tmp file (non-.jsonl suffix, so
+ * - Each write is atomic: content goes to a tmp file (non-.jsonl suffix, so
  *   transcript watchers ignore it) then `rename`d into place.
- * - On validation mismatch the file is deleted before throwing — a bad
- *   transcript must never be left behind for `claude --resume` to load.
+ * - The provenance SIDECAR is renamed into place BEFORE the transcript, so no
+ *   observable `.jsonl` ever exists without its provenance. A crash between
+ *   the two renames leaves only an inert orphan sidecar (see the module
+ *   docblock and `listRewindSidecars`).
+ * - On transcript write failure or validation mismatch BOTH files are deleted
+ *   before throwing — a bad transcript must never be left behind for
+ *   `claude --resume` to load, and its now-pointless sidecar must not become
+ *   garbage a gc sweep has to reason about. Cleanup is best-effort and never
+ *   masks the original typed error.
+ * - `deps.fs` is an optional injection seam (defaults to `node:fs/promises`)
+ *   used by tests to assert write ORDER and simulate a crash deterministically;
+ *   production callers pass two positional args as before.
  */
+export type RewindFs = Pick<
+  typeof fs,
+  "writeFile" | "rename" | "rm" | "mkdir" | "access" | "readFile"
+>;
+
+export interface ExecuteRewindDeps {
+  fs?: Partial<RewindFs>;
+}
+
 export async function executeRewind(
   plan: ClaudeRewindPlan,
   rawLines: string[],
+  deps?: ExecuteRewindDeps,
 ): Promise<ClaudeRewindPlan> {
   if (plan.mode !== "exact") return plan;
+
+  const io: RewindFs = {
+    writeFile: fs.writeFile,
+    rename: fs.rename,
+    rm: fs.rm,
+    mkdir: fs.mkdir,
+    access: fs.access,
+    readFile: fs.readFile,
+    ...deps?.fs,
+  };
+  /** Cleanup must never mask the typed error that triggered it. */
+  const bestEffortRm = async (target: string): Promise<void> => {
+    try {
+      await io.rm(target, { force: true });
+    } catch {
+      // ignore
+    }
+  };
 
   if (
     plan.newSessionId === null ||
@@ -468,6 +690,36 @@ export async function executeRewind(
     uuidMap.set(rec.uuid as string, fresh);
   }
 
+  // Tool BLOCK ids must be freshened too, and this is load-bearing for graph
+  // integrity — not cosmetic.
+  //
+  // The parser keys tool nodes on the tool_use block id, NOT the line uuid
+  // (parser.ts: `nativeUuid: block.id` -> `id: nodeIdFor(nativeUuid)`). So a
+  // synthesized transcript that reuses block ids projects tool nodes whose ids
+  // collide with the ORIGIN session's, and the store's upsert MOVES them onto
+  // the new session: the origin loses its own tool nodes, its ancestor chains
+  // break, and a later exact rewind of the origin is then falsely refused with
+  // "ancestor chain incomplete (orphaned parentage)".
+  //
+  // Both sides of the pair are remapped through ONE map so the projected tree
+  // is preserved: a tool_result resolves its parent via `tool_use_id`
+  // (parser.ts), so remapping tool_use.id without its referring tool_result
+  // would sever that edge. Round-trip validation below compares kinds and
+  // parent-index SHAPE positionally, never ids, so a consistent remap passes.
+  const originalToolIds = new Set<string>();
+  for (const { rec } of parseRawLines(rawLines)) {
+    for (const id of toolIdsIn(rec)) originalToolIds.add(id);
+  }
+  const toolIdMap = new Map<string, string>();
+  for (const rec of included) {
+    for (const id of toolIdsIn(rec)) {
+      if (toolIdMap.has(id)) continue;
+      let fresh = freshToolId();
+      while (originalToolIds.has(fresh) || toolIdMap.has(fresh)) fresh = freshToolId();
+      toolIdMap.set(id, fresh);
+    }
+  }
+
   // Rewrite: sessionId → newSessionId; uuid → fresh; parentUuid → the fresh
   // uuid of its original parent line when that line is included, else spliced
   // to the nearest PRECEDING included line (real transcripts chain parentUuid
@@ -479,7 +731,11 @@ export async function executeRewind(
   const newUuidsInOrder: string[] = [];
   for (let k = 0; k < included.length; k++) {
     const rec = included[k];
-    const rewritten: Record<string, unknown> = { ...rec };
+    // remapToolIds deep-copies the message content before touching it: the
+    // spread below is SHALLOW, so mutating nested blocks in place would
+    // corrupt the caller's parsed records (and, via `included`, the very
+    // objects a later iteration reads).
+    const rewritten: Record<string, unknown> = { ...remapToolIds(rec, toolIdMap) };
     const freshUuid = uuidMap.get(rec.uuid as string)!;
     rewritten.uuid = freshUuid;
     rewritten.sessionId = newSessionId;
@@ -497,26 +753,68 @@ export async function executeRewind(
   }
   const content = outLines.join("\n") + "\n";
 
-  // NEW files only: never clobber an existing transcript.
-  await fs.mkdir(path.dirname(transcriptPath), { recursive: true });
-  const alreadyExists = await fs.access(transcriptPath).then(
-    () => true,
-    () => false,
-  );
-  if (alreadyExists) {
+  // NEW files only — for BOTH members of the pair. `mkdir` first: the sidecar
+  // and the transcript are siblings and both need the directory.
+  await io.mkdir(path.dirname(transcriptPath), { recursive: true });
+  const sidecarPath = rewindSidecarPathFor(transcriptPath);
+  const exists = async (target: string): Promise<boolean> =>
+    io.access(target).then(
+      () => true,
+      () => false,
+    );
+  if (await exists(transcriptPath)) {
     throw new SojournRewindError(
       `refusing to overwrite existing transcript at ${transcriptPath}`,
       "transcript_exists",
+    );
+  }
+  if (await exists(sidecarPath)) {
+    throw new SojournRewindError(
+      `refusing to overwrite existing rewind provenance sidecar at ${sidecarPath}`,
+      "sidecar_exists",
+    );
+  }
+
+  // Provenance sidecar (V2 must-fix I3): written FIRST, atomic tmp + rename,
+  // non-.jsonl so transcript watchers never ingest it. The pair is
+  // all-or-nothing, and the ORDER decides which way a crash can break it. A
+  // synthesized transcript WITHOUT its sidecar is the disconnected,
+  // false-flag-prone phantom session the sidecar exists to prevent — so the
+  // sidecar goes down first and the transcript, the only file a watcher
+  // reacts to, appears last. Every field is known here: the transcript path
+  // and session id were minted at plan time and the synthesized line uuids
+  // were finalized by the rewrite loop above, so this is a single complete
+  // write — never a placeholder to be filled in later. (An empty-`lineUuids`
+  // placeholder would VALIDATE in the daemon's ingest and yield an empty T1
+  // skip set, reintroducing exactly the false-verified-flag bug I3 fixed.)
+  const sidecar: RewindSidecar = {
+    originSessionId: plan.sessionId,
+    originNodeId: plan.targetNodeId,
+    lineUuids: newUuidsInOrder,
+  };
+  const sidecarTmp = `${sidecarPath}.tmp-${crypto.randomUUID().slice(0, 8)}`;
+  try {
+    await io.writeFile(sidecarTmp, JSON.stringify(sidecar, null, 2) + "\n", "utf8");
+    await io.rename(sidecarTmp, sidecarPath);
+  } catch (err) {
+    await bestEffortRm(sidecarTmp);
+    throw new SojournRewindError(
+      `failed to write rewind provenance sidecar: ${err instanceof Error ? err.message : String(err)}`,
+      "write_failed",
     );
   }
 
   // Atomic write: tmp + rename (same directory, non-.jsonl suffix).
   const tmpPath = `${transcriptPath}.tmp-${crypto.randomUUID().slice(0, 8)}`;
   try {
-    await fs.writeFile(tmpPath, content, "utf8");
-    await fs.rename(tmpPath, transcriptPath);
+    await io.writeFile(tmpPath, content, "utf8");
+    await io.rename(tmpPath, transcriptPath);
   } catch (err) {
-    await fs.rm(tmpPath, { force: true });
+    // Inverted cleanup: the sidecar is now the file that already landed, and
+    // an orphan sidecar is precisely the garbage a gc sweep would have to
+    // reason about. Take both down.
+    await bestEffortRm(tmpPath);
+    await bestEffortRm(sidecarPath);
     throw new SojournRewindError(
       `failed to write synthesized transcript: ${err instanceof Error ? err.message : String(err)}`,
       "write_failed",
@@ -524,11 +822,12 @@ export async function executeRewind(
   }
 
   // Round-trip validation against the WRITTEN bytes: the synthesized file
-  // must project to exactly the plan's chain projection. On mismatch the
-  // file is deleted — never leave a bad transcript behind.
+  // must project to exactly the plan's chain projection. On mismatch BOTH
+  // files are deleted — never leave a bad transcript behind, and never leave
+  // its sidecar behind to be reclaimed later.
   let failure: string | null = null;
   try {
-    const written = await fs.readFile(transcriptPath, "utf8");
+    const written = await io.readFile(transcriptPath, "utf8");
     const batch = parseSessionJsonl(transcriptPath, written);
     if (!batch) {
       failure = "synthesized transcript parsed to zero nodes";
@@ -556,35 +855,11 @@ export async function executeRewind(
     failure = err instanceof Error ? err.message : String(err);
   }
   if (failure !== null) {
-    await fs.rm(transcriptPath, { force: true });
+    await bestEffortRm(transcriptPath);
+    await bestEffortRm(sidecarPath);
     throw new SojournRewindError(
-      `synthesized transcript failed round-trip validation (${failure}); file deleted`,
+      `synthesized transcript failed round-trip validation (${failure}); transcript and sidecar deleted`,
       "validation_mismatch",
-    );
-  }
-
-  // Provenance sidecar (V2 must-fix I3): written LAST, same atomic tmp +
-  // rename pattern, non-.jsonl so transcript watchers never ingest it. The
-  // pair is all-or-nothing — a synthesized transcript WITHOUT its sidecar
-  // would be exactly the disconnected, false-flag-prone phantom session the
-  // sidecar exists to prevent, so a failed sidecar write deletes the
-  // transcript and fails the rewind typed rather than leaving the phantom.
-  const sidecar: RewindSidecar = {
-    originSessionId: plan.sessionId,
-    originNodeId: plan.targetNodeId,
-    lineUuids: newUuidsInOrder,
-  };
-  const sidecarPath = rewindSidecarPathFor(transcriptPath);
-  const sidecarTmp = `${sidecarPath}.tmp-${crypto.randomUUID().slice(0, 8)}`;
-  try {
-    await fs.writeFile(sidecarTmp, JSON.stringify(sidecar, null, 2) + "\n", "utf8");
-    await fs.rename(sidecarTmp, sidecarPath);
-  } catch (err) {
-    await fs.rm(sidecarTmp, { force: true }).catch(() => {});
-    await fs.rm(transcriptPath, { force: true }).catch(() => {});
-    throw new SojournRewindError(
-      `failed to write rewind provenance sidecar: ${err instanceof Error ? err.message : String(err)}; transcript deleted`,
-      "write_failed",
     );
   }
 

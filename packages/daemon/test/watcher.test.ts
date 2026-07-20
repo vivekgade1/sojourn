@@ -9,7 +9,20 @@ import { startWatcher, type WatcherHandle } from "../src/watcher.js";
 import { TranscriptIndex } from "../src/transcripts.js";
 import type { IngestDeps } from "../src/ingest.js";
 
-/** Polls until `cond()` is true or `ms` elapsed. */
+/** Polls until `cond()` is true or `ms` elapsed.
+ *
+ * KNOWN FLAKE (pre-existing, unfixed): under full-suite load this test
+ * intermittently fails because chokidar never delivers the add event at all.
+ * In isolation the wait resolves in ~400ms; on a saturated machine it can miss
+ * entirely. Raising the deadline to 20s was tried and did NOT help, which is
+ * what rules out "deadline too tight" — the event is lost, not late. Measured
+ * on an untouched v1.2.0 checkout it reproduced in 2 of 3 full runs, so it is
+ * a property of the watcher test setup, not of any recent change.
+ *
+ * If you see this fail, re-run the file in isolation before treating it as a
+ * regression. The real fix is to stop depending on chokidar delivery here —
+ * drive the ingest path directly, or inject a watcher event — rather than to
+ * widen the timeout again. */
 async function waitFor(cond: () => boolean, ms = 5000): Promise<boolean> {
   const deadline = Date.now() + ms;
   while (Date.now() < deadline) {

@@ -617,6 +617,27 @@ export async function ingestBatch(
           // its (kind, tier, source) group — a stable anchor within the
           // segment, and addFlag's digest upsert (count-free evidence)
           // keeps re-runs updating the same row in place.
+          //
+          // KNOWN LIMIT (accepted, not a bug to fix here): a digest is owned
+          // by ONE anchor node, but it stands in for suppressed claims that
+          // may have originated on OTHER nodes in this same segment. Digest
+          // auto-resolve (core/src/flags/engine.ts, the `isDigest` branch)
+          // re-runs the check against the digest's OWN node only and clears
+          // the digest when that node produces no flag of the same
+          // kind+tier. Suppressed claims that live on a sibling node in the
+          // segment therefore cannot hold the digest open: fix the anchor
+          // node's claims and the digest resolves while the siblings' claims
+          // are still bad.
+          //
+          // Precondition, and why this is narrow: it requires an
+          // over-budget flag storm (>budget for one kind+tier+source, so a
+          // digest is emitted at all) SPREAD ACROSS MULTIPLE assistant nodes
+          // within a single same-turn segment, AND the anchor node's own
+          // claims clearing before the siblings'. A storm confined to one
+          // node — the common case — has anchor == every claim's origin and
+          // resolves correctly. Fixing this properly needs per-claim
+          // identities for suppressed flags, which are deliberately not
+          // persisted (that is the whole point of digesting).
           for (const digest of digests) {
             let owner: ChronoNode = segment[segment.length - 1].node;
             for (let i = allFlags.length - 1; i >= 0; i--) {

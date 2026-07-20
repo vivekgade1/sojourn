@@ -129,10 +129,15 @@ export function buildDaemon(): BuiltDaemon {
   const store = new GraphStore(dbPath());
   const snapshotterFor = makeSnapshotterFor();
   const flagEngine = new FlagEngine();
+  // ONE worktrees root for the whole daemon: RestoreEngine checks single
+  // nodes out here, and combine writes its merged output worktree here too.
+  // Resolved once and shared so the two can never drift onto different roots
+  // (which would split the namespace the CLI and `soj gc` reason about).
+  const worktreesRoot = worktreesDir();
   const restoreEngine = new RestoreEngine({
     store,
     snapshotterFor,
-    worktreesDir: worktreesDir(),
+    worktreesDir: worktreesRoot,
   });
   const fetchJson = realFetchJson();
   const version = readOwnVersion();
@@ -186,6 +191,7 @@ export function buildDaemon(): BuiltDaemon {
         snapshotterFor,
         flagEngine,
         restoreEngine,
+        worktreesDir: worktreesRoot,
         events: deps.events,
         version,
         fetchJson,

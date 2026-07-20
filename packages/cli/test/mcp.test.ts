@@ -10,10 +10,10 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { build } from "esbuild";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport, getDefaultEnvironment } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { projectIdFor } from "@sojourn/core";
 import { projectIdForCwd } from "../src/mcp.js";
 import { StubDaemon, closedPort } from "./helpers/stubDaemon.js";
@@ -81,6 +81,26 @@ describe("soj mcp (stdio server)", () => {
     const serverInfo = client.getServerVersion();
     expect(serverInfo?.name).toBe("sojourn");
     expect(serverInfo?.version).toBeTruthy();
+  });
+
+  it("serves the CLI package's real version, not a hardcoded one", async () => {
+    const { readServerVersion, UNKNOWN_VERSION } = await import("../src/mcp.js");
+    const pkg = JSON.parse(
+      readFileSync(resolve(__dirname, "../package.json"), "utf8"),
+    ) as { version: string };
+
+    // Resolved from src/ under vitest and from dist/ when built — both sit
+    // below packages/cli/package.json.
+    expect(readServerVersion()).toBe(pkg.version);
+    expect(readServerVersion()).not.toBe("0.1.0"); // the old hardcoded value
+    expect(readServerVersion()).not.toBe(UNKNOWN_VERSION);
+
+    // A module living somewhere with no @sojourn/cli package.json above it
+    // (mcp.test.ts's own tmpdir bundle) degrades to the honest sentinel
+    // rather than reporting an unrelated package's version.
+    expect(readServerVersion(pathToFileURL(join(bundleDir, "x.mjs")).href)).toBe(
+      UNKNOWN_VERSION,
+    );
   });
 
   it("tools/list exposes exactly the four read-only tools with schemas", async () => {

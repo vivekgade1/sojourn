@@ -75,7 +75,48 @@ const EXCLUDE_ENTRIES = [
   ".ssh/",
   "*.secret",
   "*.pfx",
+  // Sojourn's own on-disk restore/harvest artifacts. Restoring a
+  // worktree-session node would otherwise materialize a STALE
+  // `.sojourn-harvest.patch` into the snapshot, which a user could
+  // `git apply` believing it fresh. Every real consumer reads these from
+  // the LIVE filesystem, never out of a snapshot, so excluding them costs
+  // nothing. Bare basenames (not `/`-anchored) so nested restore worktrees
+  // are matched too.
+  ".sojourn-restore.json",
+  ".sojourn-harvest.patch",
 ];
+
+/** The pre-C1 shared ingest index basename. Snapshots now use a per-root
+ * `sojourn-index-<8 hex>` (see `env` below), so a bare `sojourn-index` in a
+ * shadow dir is a permanently-unreferenced leftover from an older build. */
+const LEGACY_INGEST_INDEX = "sojourn-index";
+
+/** Stable machine-readable classification for a `SojournSnapshotError`,
+ * set at each throw site. Consumers (e.g. the daemon's ingest loop) should
+ * switch on this instead of substring-matching `message` — messages may be
+ * reworded without changing behavior. */
+export type SojournSnapshotErrorCode = "cas_exhausted";
+
+export class SojournSnapshotError extends Error {
+  readonly code: SojournSnapshotErrorCode;
+  /** the tree that WAS computed but never recorded on refs/sojourn/head */
+  readonly treeHash: string;
+  /** how many CAS attempts were made before giving up */
+  readonly attempts: number;
+
+  constructor(
+    message: string,
+    code: SojournSnapshotErrorCode,
+    treeHash: string,
+    attempts: number,
+  ) {
+    super(message);
+    this.name = "SojournSnapshotError";
+    this.code = code;
+    this.treeHash = treeHash;
+    this.attempts = attempts;
+  }
+}
 
 export interface ShadowSnapshotterOptions {
   projectRoot: string;
@@ -136,6 +177,17 @@ export class ShadowSnapshotter implements SnapshotterLike {
       EXCLUDE_ENTRIES.join("\n") + "\n",
       "utf8",
     );
+
+    // Best-effort sweep of the orphaned pre-C1 shared ingest index. Shadow
+    // dirs written by older builds still carry a bare `sojourn-index` that
+    // nothing references anymore; a git index is pure derived cache, so no
+    // staleness check is needed. EXACT-MATCH ONLY — a prefix/glob would also
+    // sweep the LIVE per-root `sojourn-index-<hash>` files (and this runs on
+    // every ingest, so it would sweep them mid-flight). Errors are swallowed:
+    // a read-only/permission-denied shadow dir must never fail a snapshot.
+    await fs
+      .rm(path.join(this.shadowDir, LEGACY_INGEST_INDEX), { force: true })
+      .catch(() => {});
   }
 
   /** Bounded attempts for snapshot()'s CAS head append. Each retry re-reads
@@ -177,8 +229,11 @@ export class ShadowSnapshotter implements SnapshotterLike {
         // unreferenced and gets reaped by git's normal gc grace handling.
       }
     }
-    throw new Error(
+    throw new SojournSnapshotError(
       `snapshot: refs/sojourn/head kept moving; gave up after ${ShadowSnapshotter.MAX_HEAD_CAS_ATTEMPTS} CAS attempts (tree ${tree} was NOT recorded)`,
+      "cas_exhausted",
+      tree,
+      ShadowSnapshotter.MAX_HEAD_CAS_ATTEMPTS,
     );
   }
 

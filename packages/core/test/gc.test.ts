@@ -35,7 +35,10 @@ describe("gcShadowRepo", () => {
     env = {
       GIT_DIR: shadowDir,
       GIT_WORK_TREE: projectRoot,
-      GIT_INDEX_FILE: path.join(shadowDir, "sojourn-index"),
+      // Deliberately NOT the legacy bare "sojourn-index": that name is now
+      // swept by ShadowSnapshotter.init() as a pre-C1 orphan, so a fixture
+      // depending on it would be racing its own cleanup.
+      GIT_INDEX_FILE: path.join(shadowDir, "gc-test-index"),
     };
 
     nowSec = Math.floor(Date.now() / 1000);
